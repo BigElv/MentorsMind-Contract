@@ -88,7 +88,12 @@ function parseAddress(scAddress: any): string {
 
     if (arm.includes("contract")) {
       const contractId = typeof scAddress.contractId === "function" ? scAddress.contractId() : scAddress.contractId;
-      return StrKey.encodeContract(Buffer.from(contractId));
+      const maybeEncodeContract = (StrKey as unknown as { encodeContract?: (bytes: Buffer) => string })
+        .encodeContract;
+      if (typeof maybeEncodeContract === "function") {
+        return maybeEncodeContract(Buffer.from(contractId));
+      }
+      return toStringValue(contractId);
     }
   } catch {
     // Fall through to string conversion.
@@ -152,7 +157,11 @@ function scValToNative(scVal: any): unknown {
 }
 
 function decodeScValXdr(value: string): unknown {
-  const scVal = xdr.ScVal.fromXDR(value, "base64");
+  const ScValCtor = (xdr as unknown as { ScVal?: { fromXDR: (v: string, enc: string) => unknown } }).ScVal;
+  if (!ScValCtor?.fromXDR) {
+    return value;
+  }
+  const scVal = ScValCtor.fromXDR(value, "base64");
   return scValToNative(scVal);
 }
 

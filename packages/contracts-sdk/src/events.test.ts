@@ -1,3 +1,4 @@
+// @ts-ignore workspace TypeScript service may not resolve nested devDependencies.
 import { describe, expect, it, vi } from "vitest";
 import { decodeEvent } from "./events";
 
