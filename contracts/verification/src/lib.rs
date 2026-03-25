@@ -19,6 +19,13 @@ pub struct VerificationContract;
 
 #[contractimpl]
 impl VerificationContract {
+    /// Initialize the verification contract with an admin.
+    /// 
+    /// Auth: No authorization required for initialization.
+    /// Can only be called once.
+    /// 
+    /// Panics if:
+    /// - Contract is already initialized
     pub fn initialize(env: Env, admin: Address) {
         if env.storage().persistent().has(&ADMIN) {
             panic!("Already initialized");
@@ -26,6 +33,15 @@ impl VerificationContract {
         env.storage().persistent().set(&ADMIN, &admin);
     }
 
+    /// Verify a mentor with credentials (admin only).
+    /// 
+    /// Auth: Only the admin can verify mentors.
+    /// The admin address is retrieved from persistent storage.
+    /// 
+    /// Panics if:
+    /// - Contract is not initialized
+    /// - Caller is not the admin
+    /// - Caller fails authorization check
     pub fn verify_mentor(env: Env, mentor: Address, credential_hash: BytesN<32>, expiry: u64) {
         let admin: Address = env
             .storage()
@@ -44,12 +60,22 @@ impl VerificationContract {
         env.storage().persistent().set(&key, &rec);
         let tkey = (TIER_KEY, mentor.clone());
         if !env.storage().persistent().has(&tkey) {
-            env.storage().persistent().set(&tkey, &0u8);
+            env.storage().persistent().set(&tkey, &0i32);
         }
         env.events()
             .publish((symbol_short!("mentor_verified"), mentor), (rec.credential_hash, rec.expiry, rec.verified_at));
     }
 
+    /// Revoke a mentor's verification (admin only).
+    /// 
+    /// Auth: Only the admin can revoke verifications.
+    /// The admin address is retrieved from persistent storage.
+    /// 
+    /// Panics if:
+    /// - Contract is not initialized
+    /// - Caller is not the admin
+    /// - Caller fails authorization check
+    /// - Mentor is not verified
     pub fn revoke_verification(env: Env, mentor: Address) {
         let admin: Address = env
             .storage()
@@ -89,15 +115,16 @@ impl VerificationContract {
 
 #[cfg(test)]
 mod test {
+    extern crate std;
     use super::*;
-    use soroban_sdk::{testutils::Address as _, Address, BytesN, Env};
+    use soroban_sdk::{testutils::{Address as AddressTestUtils, MockAuth, MockAuthInvoke, Ledger}, Address, BytesN, Env, IntoVal};
 
     fn setup() -> (Env, Address, Address) {
         let env = Env::default();
         env.mock_all_auths();
         let contract_id = env.register_contract(None, VerificationContract);
         let client = VerificationContractClient::new(&env, &contract_id);
-        let admin = Address::generate(&env);
+        let admin = AddressTestUtils::generate(&env);
         client.initialize(&admin);
         (env, contract_id, admin)
     }

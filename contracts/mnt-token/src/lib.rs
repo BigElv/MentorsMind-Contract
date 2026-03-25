@@ -35,6 +35,13 @@ pub struct MNTToken;
 
 #[contractimpl]
 impl MNTToken {
+    /// Initialize the token contract with an admin.
+    /// 
+    /// Auth: No authorization required for initialization.
+    /// Can only be called once.
+    /// 
+    /// Panics if:
+    /// - Contract is already initialized
     pub fn initialize(env: Env, admin: Address) {
         if env.storage().persistent().has(&DataKey::Admin) {
             panic!("Already initialized");
@@ -50,6 +57,17 @@ impl MNTToken {
         env.storage().persistent().set(&DataKey::TotalSupply, &0i128);
     }
 
+    /// Mint new tokens (admin only).
+    /// 
+    /// Auth: Only the admin can mint tokens.
+    /// The admin address is retrieved from persistent storage.
+    /// 
+    /// Panics if:
+    /// - Contract is not initialized
+    /// - Caller is not the admin
+    /// - Caller fails authorization check
+    /// - Amount is not positive
+    /// - Minting would exceed supply cap
     pub fn mint(env: Env, to: Address, amount: i128) {
         let admin: Address = env.storage().persistent().get(&DataKey::Admin).expect("Not initialized");
         admin.require_auth();
@@ -75,6 +93,16 @@ impl MNTToken {
         );
     }
 
+    /// Burn tokens from an account.
+    /// 
+    /// Auth: Only the token holder can burn their own tokens.
+    /// The 'from' address must provide valid authorization.
+    /// 
+    /// Panics if:
+    /// - Caller is not the 'from' address
+    /// - Caller fails authorization check
+    /// - Amount is not positive
+    /// - Insufficient balance
     pub fn do_burn(env: Env, from: Address, amount: i128) {
         from.require_auth();
 
@@ -108,6 +136,15 @@ impl TokenInterface for MNTToken {
             .unwrap_or(0)
     }
 
+    /// Approve a spender to use tokens on behalf of the owner.
+    /// 
+    /// Auth: Only the token owner can approve spenders.
+    /// The 'from' address must provide valid authorization.
+    /// 
+    /// Panics if:
+    /// - Caller is not the 'from' address
+    /// - Caller fails authorization check
+    /// - Amount is negative
     fn approve(env: Env, from: Address, spender: Address, amount: i128, _expiration_ledger: u32) {
         from.require_auth();
         if amount < 0 {
@@ -133,6 +170,16 @@ impl TokenInterface for MNTToken {
             .unwrap_or(0)
     }
 
+    /// Transfer tokens from one account to another.
+    /// 
+    /// Auth: Only the token owner can transfer their tokens.
+    /// The 'from' address must provide valid authorization.
+    /// 
+    /// Panics if:
+    /// - Caller is not the 'from' address
+    /// - Caller fails authorization check
+    /// - Amount is not positive
+    /// - Insufficient balance
     fn transfer(env: Env, from: Address, to: Address, amount: i128) {
         from.require_auth();
         if amount <= 0 {
@@ -155,6 +202,17 @@ impl TokenInterface for MNTToken {
         );
     }
 
+    /// Transfer tokens using an allowance.
+    /// 
+    /// Auth: Only the approved spender can transfer tokens on behalf of the owner.
+    /// The spender address must provide valid authorization.
+    /// 
+    /// Panics if:
+    /// - Caller is not the spender
+    /// - Caller fails authorization check
+    /// - Amount is not positive
+    /// - Insufficient allowance
+    /// - Insufficient balance
     fn transfer_from(env: Env, spender: Address, from: Address, to: Address, amount: i128) {
         spender.require_auth();
         if amount <= 0 {
@@ -237,8 +295,8 @@ impl TokenInterface for MNTToken {
 #[cfg(test)]
 mod test {
     use super::*;
-    use soroban_sdk::testutils::{Address as _};
-    use soroban_sdk::{Env};
+    use soroban_sdk::testutils::{Address as _, MockAuth, MockAuthInvoke};
+    use soroban_sdk::{Env, IntoVal};
 
     #[test]
     fn test_initialization() {
