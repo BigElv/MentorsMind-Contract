@@ -10,6 +10,7 @@ export interface Payment {
   txHash: string | null;
   ledgerSequence: number | null;
   status: PaymentStatus;
+  fee: string | null;
   errorCode: string | null;
   errorMessage: string | null;
   createdAt: Date;
@@ -23,6 +24,7 @@ export interface CreatePaymentDto {
   amount: string;
   assetCode: string;
   txHash: string;
+  fee?: string;
 }
 
 export interface HorizonWebhookPayload {

@@ -11,7 +11,7 @@ const RESULT_CODE_MESSAGES: Record<string, string> = {
   tx_failed: 'Transaction failed on the Stellar network.',
 };
 
-async function fetchTransaction(txHash: string): Promise<{ successful: boolean; ledger: number; result_code?: string } | null> {
+async function fetchTransaction(txHash: string): Promise<{ successful: boolean; ledger: number; fee_paid?: string; result_code?: string } | null> {
   const res = await fetch(`${HORIZON_URL}/transactions/${txHash}`);
   if (res.status === 404) return null;
   if (!res.ok) throw new Error(`Horizon error: ${res.status}`);
@@ -20,6 +20,7 @@ async function fetchTransaction(txHash: string): Promise<{ successful: boolean; 
   return {
     successful: data.successful,
     ledger: data.ledger,
+    fee_paid: data.fee_paid,
     result_code: data.result_codes?.transaction,
   };
 }
@@ -38,11 +39,13 @@ async function pollPending(): Promise<void> {
         if (tx.successful) {
           await paymentTrackerService.updateStatus(payment.id, 'confirmed', {
             ledgerSequence: tx.ledger,
+            fee: tx.fee_paid,
           });
         } else {
           const errorCode = tx.result_code ?? 'tx_failed';
           await paymentTrackerService.updateStatus(payment.id, 'failed', {
             ledgerSequence: tx.ledger,
+            fee: tx.fee_paid,
             errorCode,
             errorMessage: RESULT_CODE_MESSAGES[errorCode] ?? 'Transaction failed.',
           });
@@ -65,6 +68,7 @@ export async function processWebhookEvent(payload: {
   transaction_hash: string;
   ledger: number;
   successful: boolean;
+  fee_paid?: string;
   result_code?: string;
 }): Promise<void> {
   const payment = await paymentTrackerService.findByTxHash(payload.transaction_hash);
@@ -73,11 +77,13 @@ export async function processWebhookEvent(payload: {
   if (payload.successful) {
     await paymentTrackerService.updateStatus(payment.id, 'confirmed', {
       ledgerSequence: payload.ledger,
+      fee: payload.fee_paid,
     });
   } else {
     const errorCode = payload.result_code ?? 'tx_failed';
     await paymentTrackerService.updateStatus(payment.id, 'failed', {
       ledgerSequence: payload.ledger,
+      fee: payload.fee_paid,
       errorCode,
       errorMessage: RESULT_CODE_MESSAGES[errorCode] ?? 'Transaction failed.',
     });
