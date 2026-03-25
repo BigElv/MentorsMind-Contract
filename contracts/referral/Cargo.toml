@@ -1,15 +1,15 @@
 [package]
-name = "mentorminds-mnt-token"
+name = "mentorminds-referral"
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.70"
 
 [lib]
-crate-type = ["cdylib", "rlib"]
+crate-type = ["cdylib"]
 
 [dependencies]
 soroban-sdk = { workspace = true }
-soroban-token-sdk = { workspace = true }
+mentorminds-mnt-token = { path = "../mnt-token" }
 
 [dev-dependencies]
 soroban-sdk = { workspace = true, features = ["testutils"] }
