@@ -2,7 +2,7 @@
 
 use soroban_sdk::token::TokenInterface;
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, symbol_short, Address, Env, String,
+    contract, contracterror, contractimpl, contracttype, symbol_short, Address, Env, String, Symbol, IntoVal,
 };
 use soroban_token_sdk::metadata::TokenMetadata;
 
@@ -16,6 +16,32 @@ pub enum Error {
     InsufficientAllowance = 4,
     Unauthorized = 5,
     SupplyCapExceeded = 6,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MintEventData {
+    pub amount: i128,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BurnEventData {
+    pub amount: i128,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ApproveEventData {
+    pub spender: Address,
+    pub amount: i128,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TransferEventData {
+    pub to: Address,
+    pub amount: i128,
 }
 
 #[contracttype]
@@ -103,7 +129,10 @@ impl MNTToken {
             .persistent()
             .set(&DataKey::TotalSupply, &new_total_supply);
 
-        env.events().publish((symbol_short!("mint"), to), amount);
+        env.events().publish(
+            (Symbol::new(&env, "MNTToken"), Symbol::new(&env, "Mint"), to.clone()),
+            MintEventData { amount },
+        );
     }
 
     /// Burn tokens from an account.
@@ -134,14 +163,10 @@ impl MNTToken {
             .get(&DataKey::TotalSupply)
             .unwrap_or(0);
 
-        env.storage()
-            .persistent()
-            .set(&DataKey::Balance(from.clone()), &(balance - amount));
-        env.storage()
-            .persistent()
-            .set(&DataKey::TotalSupply, &(total_supply - amount));
-
-        env.events().publish((symbol_short!("burn"), from), amount);
+        env.events().publish(
+            (Symbol::new(&env, "MNTToken"), Symbol::new(&env, "Burn"), from.clone()),
+            BurnEventData { amount },
+        );
     }
 }
 
@@ -174,9 +199,11 @@ impl TokenInterface for MNTToken {
 
         // Note: Simple implementation, expiration_ledger is usually used for TTL in Soroban
         // but for simplicity in this MVP we just store the amount.
-
-        env.events()
-            .publish((symbol_short!("approve"), from, spender), amount);
+        
+        env.events().publish(
+            (Symbol::new(&env, "MNTToken"), Symbol::new(&env, "Approve"), from.clone()),
+            ApproveEventData { spender, amount },
+        );
     }
 
     fn balance(env: Env, id: Address) -> i128 {
@@ -216,8 +243,10 @@ impl TokenInterface for MNTToken {
             .persistent()
             .set(&DataKey::Balance(to.clone()), &(to_balance + amount));
 
-        env.events()
-            .publish((symbol_short!("transfer"), from, to), amount);
+        env.events().publish(
+            (Symbol::new(&env, "MNTToken"), Symbol::new(&env, "Transfer"), from.clone()),
+            TransferEventData { to, amount },
+        );
     }
 
     /// Transfer tokens using an allowance.
@@ -249,9 +278,13 @@ impl TokenInterface for MNTToken {
 
         let to_balance = Self::balance(env.clone(), to.clone());
 
-        env.storage().persistent().set(
-            &DataKey::Allowance(from.clone(), spender.clone()),
-            &(allowance - amount),
+        env.storage().persistent().set(&DataKey::Allowance(from.clone(), spender.clone()), &(allowance - amount));
+        env.storage().persistent().set(&DataKey::Balance(from.clone()), &(from_balance - amount));
+        env.storage().persistent().set(&DataKey::Balance(to.clone()), &(to_balance + amount));
+
+        env.events().publish(
+            (Symbol::new(&env, "MNTToken"), Symbol::new(&env, "Transfer"), from.clone()),
+            TransferEventData { to, amount },
         );
         env.storage()
             .persistent()
@@ -290,9 +323,9 @@ impl TokenInterface for MNTToken {
             .get(&DataKey::TotalSupply)
             .unwrap_or(0);
 
-        env.storage().persistent().set(
-            &DataKey::Allowance(from.clone(), spender.clone()),
-            &(allowance - amount),
+        env.events().publish(
+            (Symbol::new(&env, "MNTToken"), Symbol::new(&env, "Burn"), from.clone()),
+            BurnEventData { amount },
         );
         env.storage()
             .persistent()
@@ -333,9 +366,10 @@ impl TokenInterface for MNTToken {
 
 #[cfg(test)]
 mod test {
+    extern crate std;
     use super::*;
-    use soroban_sdk::testutils::{Address as _, MockAuth, MockAuthInvoke};
-    use soroban_sdk::{Env, IntoVal};
+    use soroban_sdk::testutils::{Address as _, MockAuth, MockAuthInvoke, Events};
+    use soroban_sdk::{Env, IntoVal, Symbol, vec};
 
     #[test]
     fn test_initialization() {
@@ -364,9 +398,40 @@ mod test {
 
         client.mint(&user, &1000);
         assert_eq!(client.balance(&user), 1000);
+        
+        let events = env.events().all();
+        let last_event = events.last().unwrap();
+        assert_eq!(
+            last_event.0,
+            contract_id.clone()
+        );
+        assert_eq!(
+            last_event.1,
+            (Symbol::new(&env, "MNTToken"), Symbol::new(&env, "Mint"), user.clone()).into_val(&env)
+        );
+        assert_eq!(
+            last_event.2,
+            MintEventData { amount: 1000 }.into_val(&env)
+        );
 
         client.burn(&user, &400);
         assert_eq!(client.balance(&user), 600);
+        
+        let events = env.events().all();
+        let last_event = events.last().unwrap();
+        
+        assert_eq!(
+            last_event.0,
+            contract_id.clone()
+        );
+        assert_eq!(
+            last_event.1,
+            (Symbol::new(&env, "MNTToken"), Symbol::new(&env, "Burn"), user.clone()).into_val(&env)
+        );
+        assert_eq!(
+            last_event.2,
+            BurnEventData { amount: 400 }.into_val(&env)
+        );
     }
 
     #[test]
@@ -385,6 +450,22 @@ mod test {
         client.transfer(&user1, &user2, &300);
         assert_eq!(client.balance(&user1), 700);
         assert_eq!(client.balance(&user2), 300);
+
+        let events = env.events().all();
+        let last_event = events.last().unwrap();
+        
+        assert_eq!(
+            last_event.0,
+            contract_id.clone()
+        );
+        assert_eq!(
+            last_event.1,
+            (Symbol::new(&env, "MNTToken"), Symbol::new(&env, "Transfer"), user1.clone()).into_val(&env)
+        );
+        assert_eq!(
+            last_event.2,
+            TransferEventData { to: user2.clone(), amount: 300 }.into_val(&env)
+        );
     }
 
     #[test]
@@ -403,10 +484,42 @@ mod test {
         client.approve(&user1, &user2, &500, &100);
         assert_eq!(client.allowance(&user1, &user2), 500);
 
+        let events = env.events().all();
+        let mut last_event = events.last().unwrap();
+        
+        assert_eq!(
+            last_event.0,
+            contract_id.clone()
+        );
+        assert_eq!(
+            last_event.1,
+            (Symbol::new(&env, "MNTToken"), Symbol::new(&env, "Approve"), user1.clone()).into_val(&env)
+        );
+        assert_eq!(
+            last_event.2,
+            ApproveEventData { spender: user2.clone(), amount: 500 }.into_val(&env)
+        );
+
         client.transfer_from(&user2, &user1, &user2, &200);
         assert_eq!(client.balance(&user1), 800);
         assert_eq!(client.balance(&user2), 200);
         assert_eq!(client.allowance(&user1, &user2), 300);
+        
+        let events2 = env.events().all();
+        last_event = events2.last().unwrap();
+        
+        assert_eq!(
+            last_event.0,
+            contract_id.clone()
+        );
+        assert_eq!(
+            last_event.1,
+            (Symbol::new(&env, "MNTToken"), Symbol::new(&env, "Transfer"), user1.clone()).into_val(&env)
+        );
+        assert_eq!(
+            last_event.2,
+            TransferEventData { to: user2.clone(), amount: 200 }.into_val(&env)
+        );
     }
 
     #[test]

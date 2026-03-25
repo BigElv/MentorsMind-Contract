@@ -1,7 +1,5 @@
 #![no_std]
-use soroban_sdk::{
-    contract, contractimpl, contracttype, symbol_short, Address, BytesN, Env, Symbol,
-};
+use soroban_sdk::{contract, contractimpl, contracttype, symbol_short, Address, BytesN, Env, Symbol, IntoVal};
 
 #[contracttype]
 #[derive(Clone, Debug)]
@@ -11,6 +9,18 @@ pub struct VerificationRecord {
     pub expiry: u64,
     pub is_active: bool,
 }
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MentorVerifiedEventData {
+    pub credential_hash: BytesN<32>,
+    pub verified_at: u64,
+    pub expiry: u64,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VerificationRevokedEventData {}
 
 const ADMIN: Symbol = symbol_short!("ADMIN");
 const VER_KEY: Symbol = symbol_short!("VER");
@@ -65,8 +75,12 @@ impl VerificationContract {
             env.storage().persistent().set(&tkey, &0i32);
         }
         env.events().publish(
-            (symbol_short!("verified"), mentor),
-            (rec.credential_hash, rec.expiry, rec.verified_at),
+            (Symbol::new(&env, "Verification"), Symbol::new(&env, "Verified"), mentor.clone()),
+            MentorVerifiedEventData {
+                credential_hash: rec.credential_hash.clone(),
+                verified_at: rec.verified_at,
+                expiry: rec.expiry,
+            },
         );
     }
 
@@ -92,7 +106,10 @@ impl VerificationContract {
             env.storage().persistent().get(&key).expect("Not verified");
         rec.is_active = false;
         env.storage().persistent().set(&key, &rec);
-        env.events().publish((symbol_short!("revoked"), mentor), ());
+        env.events().publish(
+            (Symbol::new(&env, "Verification"), Symbol::new(&env, "Revoked"), mentor.clone()),
+            VerificationRevokedEventData {},
+        );
     }
 
     pub fn is_verified(env: Env, mentor: Address) -> bool {
@@ -114,10 +131,7 @@ impl VerificationContract {
 mod test {
     extern crate std;
     use super::*;
-    use soroban_sdk::{
-        testutils::{Address as AddressTestUtils, Ledger, MockAuth, MockAuthInvoke},
-        Address, BytesN, Env, IntoVal,
-    };
+    use soroban_sdk::{testutils::{Address as AddressTestUtils, MockAuth, MockAuthInvoke, Ledger, Events}, Address, BytesN, Env, IntoVal};
 
     fn setup() -> (Env, Address, Address) {
         let env = Env::default();
@@ -138,6 +152,26 @@ mod test {
         let now = env.ledger().timestamp();
         let expiry = now + 100;
         client.verify_mentor(&mentor, &hash, &expiry);
+        
+        let events = env.events().all();
+        let last_event = events.last().unwrap();
+        assert_eq!(
+            last_event.0,
+            contract_id.clone()
+        );
+        assert_eq!(
+            last_event.1,
+            (Symbol::new(&env, "Verification"), Symbol::new(&env, "Verified"), mentor.clone()).into_val(&env)
+        );
+        assert_eq!(
+            last_event.2,
+            MentorVerifiedEventData {
+                credential_hash: hash.clone(),
+                verified_at: now,
+                expiry,
+            }.into_val(&env)
+        );
+
         let rec = client.get_verification(&mentor);
         assert_eq!(rec.credential_hash, hash);
         assert_eq!(rec.is_active, true);
@@ -168,6 +202,22 @@ mod test {
         client.verify_mentor(&mentor, &hash, &expiry);
         assert!(client.is_verified(&mentor));
         client.revoke_verification(&mentor);
+        
+        let events = env.events().all();
+        let last_event = events.last().unwrap();
+        assert_eq!(
+            last_event.0,
+            contract_id.clone()
+        );
+        assert_eq!(
+            last_event.1,
+            (Symbol::new(&env, "Verification"), Symbol::new(&env, "Revoked"), mentor.clone()).into_val(&env)
+        );
+        assert_eq!(
+            last_event.2,
+            VerificationRevokedEventData {}.into_val(&env)
+        );
+
         let rec = client.get_verification(&mentor);
         assert_eq!(rec.is_active, false);
         assert!(!client.is_verified(&mentor));

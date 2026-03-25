@@ -1,6 +1,8 @@
 #![no_std]
 
-use soroban_sdk::{contract, contractimpl, contracttype, symbol_short, Address, Env};
+use soroban_sdk::{
+    contract, contractimpl, contracttype, symbol_short, Address, Env, Symbol, IntoVal,
+};
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -15,6 +17,19 @@ pub struct ReferralInfo {
     pub referrer: Address,
     pub referee_type: RefereeType,
     pub completed: bool,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReferralRegisteredEventData {
+    pub referee: Address,
+    pub is_mentor: bool,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RewardClaimedEventData {
+    pub amount: i128,
 }
 
 #[contracttype]
@@ -77,21 +92,15 @@ impl ReferralContract {
             completed: false,
         };
 
-        env.storage()
-            .persistent()
-            .set(&DataKey::Referral(referee.clone()), &info);
+        env.storage().persistent().set(&DataKey::Referral(referee.clone()), &info);
 
-        let count: u32 = env
-            .storage()
-            .persistent()
-            .get(&DataKey::ReferrerCount(referrer.clone()))
-            .unwrap_or(0);
-        env.storage()
-            .persistent()
-            .set(&DataKey::ReferrerCount(referrer.clone()), &(count + 1));
+        let count: u32 = env.storage().persistent().get(&DataKey::ReferrerCount(referrer.clone())).unwrap_or(0);
+        env.storage().persistent().set(&DataKey::ReferrerCount(referrer.clone()), &(count + 1));
 
-        env.events()
-            .publish((symbol_short!("ref_reg"), referrer, referee), is_mentor);
+        env.events().publish(
+            (Symbol::new(&env, "Referral"), Symbol::new(&env, "Registered"), referrer.clone()),
+            ReferralRegisteredEventData { referee, is_mentor },
+        );
     }
 
     pub fn fulfill_referral(env: Env, referee: Address) {
@@ -158,8 +167,10 @@ impl ReferralContract {
             .persistent()
             .set(&DataKey::PendingReward(referrer.clone()), &0i128);
 
-        env.events()
-            .publish((symbol_short!("rew_clm"), referrer), pending);
+        env.events().publish(
+            (Symbol::new(&env, "Referral"), Symbol::new(&env, "RewardClaimed"), referrer.clone()),
+            RewardClaimedEventData { amount: pending },
+        );
     }
 
     pub fn get_referral_count(env: Env, referrer: Address) -> u32 {
@@ -186,7 +197,10 @@ impl ReferralContract {
 
 #[cfg(test)]
 mod test {
+    extern crate std;
     use super::*;
+    use soroban_sdk::testutils::{Address as _, Events};
+    use soroban_sdk::{IntoVal, Symbol};
     use mentorminds_mnt_token::{MNTToken, MNTTokenClient};
     use soroban_sdk::testutils::Address as _;
 
@@ -247,6 +261,21 @@ mod test {
         assert_eq!(f.client().get_referral_count(&referrer), 1);
         assert_eq!(f.client().get_pending_rewards(&referrer), 0);
 
+        let events = f.env.events().all();
+        let last_event = events.last().unwrap();
+        assert_eq!(
+            last_event.0,
+            f.ref_id.clone()
+        );
+        assert_eq!(
+            last_event.1,
+            (Symbol::new(&f.env, "Referral"), Symbol::new(&f.env, "Registered"), referrer.clone()).into_val(&f.env)
+        );
+        assert_eq!(
+            last_event.2,
+            ReferralRegisteredEventData { referee: referee.clone(), is_mentor: true }.into_val(&f.env)
+        );
+
         // Fulfill referral as admin
         f.client().fulfill_referral(&referee);
         assert_eq!(f.client().get_pending_rewards(&referrer), REWARD_MENTOR);
@@ -255,6 +284,21 @@ mod test {
         f.client().claim_reward(&referrer);
         assert_eq!(f.client().get_pending_rewards(&referrer), 0);
         assert_eq!(f.mnt_client().balance(&referrer), REWARD_MENTOR);
+
+        let events2 = f.env.events().all();
+        let last_event2 = events2.last().unwrap();
+        assert_eq!(
+            last_event2.0,
+            f.ref_id.clone()
+        );
+        assert_eq!(
+            last_event2.1,
+            (Symbol::new(&f.env, "Referral"), Symbol::new(&f.env, "RewardClaimed"), referrer.clone()).into_val(&f.env)
+        );
+        assert_eq!(
+            last_event2.2,
+            RewardClaimedEventData { amount: REWARD_MENTOR }.into_val(&f.env)
+        );
     }
 
     #[test]

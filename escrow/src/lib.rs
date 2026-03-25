@@ -1,6 +1,6 @@
 #![no_std]
 use soroban_sdk::{
-    contract, contractimpl, contracttype, symbol_short, token, Address, Env, Symbol,
+    contract, contractimpl, contracttype, symbol_short, token, Address, Env, Symbol, IntoVal,
 };
 
 // ---------------------------------------------------------------------------
@@ -41,6 +41,67 @@ pub struct Escrow {
     pub dispute_reason: Symbol,
     /// Unix timestamp (seconds) at which `resolve_dispute` was called (0 until resolved).
     pub resolved_at: u64,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EscrowCreatedEventData {
+    pub mentor: Address,
+    pub learner: Address,
+    pub amount: i128,
+    pub session_id: Symbol,
+    pub token_address: Address,
+    pub session_end_time: u64,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EscrowReleasedEventData {
+    pub mentor: Address,
+    pub amount: i128,
+    pub net_amount: i128,
+    pub platform_fee: i128,
+    pub token_address: Address,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EscrowAutoReleasedEventData {
+    pub time: u64,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DisputeOpenedEventData {
+    pub caller: Address,
+    pub reason: Symbol,
+    pub token_address: Address,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DisputeResolvedEventData {
+    pub mentor_pct: u32,
+    pub mentor_amount: i128,
+    pub learner_amount: i128,
+    pub token_address: Address,
+    pub time: u64,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EscrowRefundedEventData {
+    pub learner: Address,
+    pub amount: i128,
+    pub token_address: Address,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReviewSubmittedEventData {
+    pub caller: Address,
+    pub reason: Symbol,
+    pub mentor: Address,
 }
 
 // ---------------------------------------------------------------------------
@@ -325,15 +386,15 @@ impl EscrowContract {
 
         // --- Emit event (includes token_address and session_end_time) ---
         env.events().publish(
-            (symbol_short!("created"), count),
-            (
+            (Symbol::new(&env, "Escrow"), Symbol::new(&env, "Created"), count),
+            EscrowCreatedEventData {
                 mentor,
                 learner,
                 amount,
                 session_id,
                 token_address,
                 session_end_time,
-            ),
+            },
         );
 
         count
@@ -427,8 +488,10 @@ impl EscrowContract {
 
         // Emit a dedicated `auto_released` event *before* the internal release
         // so listeners can distinguish this path from a manual release.
-        env.events()
-            .publish((symbol_short!("auto_rel"), escrow_id), (escrow_id, now));
+        env.events().publish(
+            (Symbol::new(&env, "Escrow"), Symbol::new(&env, "AutoReleased"), escrow_id),
+            EscrowAutoReleasedEventData { time: now },
+        );
 
         Self::_do_release(&env, &mut escrow, &key);
     }
@@ -479,8 +542,12 @@ impl EscrowContract {
         env.storage().persistent().set(&key, &escrow);
 
         env.events().publish(
-            (symbol_short!("disp_opnd"), escrow_id),
-            (escrow_id, caller, reason, escrow.token_address),
+            (Symbol::new(&env, "Escrow"), Symbol::new(&env, "DisputeOpened"), escrow_id),
+            DisputeOpenedEventData {
+                caller,
+                reason,
+                token_address: escrow.token_address,
+            },
         );
     }
 
@@ -594,15 +661,14 @@ impl EscrowContract {
 
         // --- Emit event ---
         env.events().publish(
-            (symbol_short!("disp_res"), escrow_id),
-            (
-                escrow_id,
+            (Symbol::new(&env, "Escrow"), Symbol::new(&env, "DisputeResolved"), escrow_id),
+            DisputeResolvedEventData {
                 mentor_pct,
                 mentor_amount,
                 learner_amount,
-                escrow.token_address.clone(),
-                now,
-            ),
+                token_address: escrow.token_address.clone(),
+                time: now,
+            },
         );
     }
 
@@ -663,8 +729,12 @@ impl EscrowContract {
         env.storage().persistent().set(&key, &escrow);
 
         env.events().publish(
-            (symbol_short!("refunded"), escrow_id),
-            (escrow.learner.clone(), escrow.amount, escrow.token_address),
+            (Symbol::new(&env, "Escrow"), Symbol::new(&env, "Refunded"), escrow_id),
+            EscrowRefundedEventData {
+                learner: escrow.learner.clone(),
+                amount: escrow.amount,
+                token_address: escrow.token_address,
+            },
         );
     }
 
@@ -781,8 +851,12 @@ impl EscrowContract {
             .extend_ttl(&review_key, ESCROW_TTL_THRESHOLD, ESCROW_TTL_BUMP);
 
         env.events().publish(
-            (symbol_short!("review"), escrow_id),
-            (escrow_id, caller, reason, escrow.mentor),
+            (Symbol::new(&env, "Escrow"), Symbol::new(&env, "ReviewSubmitted"), escrow_id),
+            ReviewSubmittedEventData {
+                caller,
+                reason,
+                mentor: escrow.mentor,
+            },
         );
     }
 
@@ -831,14 +905,14 @@ impl EscrowContract {
         env.storage().persistent().set(key, escrow);
 
         env.events().publish(
-            (symbol_short!("released"), escrow.id),
-            (
-                escrow.mentor.clone(),
-                escrow.amount,
+            (Symbol::new(env, "Escrow"), Symbol::new(env, "Released"), escrow.id),
+            EscrowReleasedEventData {
+                mentor: escrow.mentor.clone(),
+                amount: escrow.amount,
                 net_amount,
                 platform_fee,
-                escrow.token_address.clone(),
-            ),
+                token_address: escrow.token_address.clone(),
+            },
         );
     }
 
@@ -868,9 +942,9 @@ mod test {
     extern crate std;
     use super::*;
     use soroban_sdk::{
-        testutils::{Address as _, Ledger},
+        testutils::{Address as _, Ledger, Events},
         token::{Client as TokenClient, StellarAssetClient},
-        Address, Env, Vec,
+        Address, Env, Vec, IntoVal, Symbol,
     };
 
     // -----------------------------------------------------------------------
@@ -1048,9 +1122,21 @@ mod test {
         assert_eq!(token.balance(&f.contract_id), 1_000);
         let e = f.client().get_escrow(&id);
         assert_eq!(e.status, EscrowStatus::Active);
-        assert_eq!(e.amount, 1_000);
         assert_eq!(e.mentor, f.mentor);
         assert_eq!(e.learner, f.learner);
+
+        let events = f.env.events().all();
+        let ev = events.last().unwrap();
+        assert_eq!(ev.0, f.contract_id.clone());
+        assert_eq!(ev.1, (Symbol::new(&f.env, "Escrow"), Symbol::new(&f.env, "Created"), id).into_val(&f.env));
+        assert_eq!(ev.2, EscrowCreatedEventData {
+            mentor: f.mentor.clone(),
+            learner: f.learner.clone(),
+            amount: 1_000,
+            session_id: symbol_short!("S1"),
+            token_address: f.token_address.clone(),
+            session_end_time: 0,
+        }.into_val(&f.env));
     }
 
     #[test]
@@ -1125,6 +1211,18 @@ mod test {
         assert_eq!(e.status, EscrowStatus::Released);
         assert_eq!(e.platform_fee, 50);
         assert_eq!(e.net_amount, 950);
+
+        let events = f.env.events().all();
+        let ev = events.last().unwrap();
+        assert_eq!(ev.0, f.contract_id.clone());
+        assert_eq!(ev.1, (Symbol::new(&f.env, "Escrow"), Symbol::new(&f.env, "Released"), id).into_val(&f.env));
+        assert_eq!(ev.2, EscrowReleasedEventData {
+            mentor: f.mentor.clone(),
+            amount: 1_000,
+            net_amount: 950,
+            platform_fee: 50,
+            token_address: f.token_address.clone(),
+        }.into_val(&f.env));
     }
 
     #[test]
