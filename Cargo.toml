@@ -4,6 +4,11 @@ members = [
     "contracts/verification",
     "contracts/oracle",
     "contracts/timelock",
+    "contracts/treasury",
+    "contracts/staking",
+    "contracts/mnt-token",
+    "contracts/referral",
+    "contracts/bridge_receiver",
     "tests",
 ]
 

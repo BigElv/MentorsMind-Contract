@@ -1,8 +1,8 @@
 #![no_std]
 
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, symbol_short, vec, Address, Env, Map,
-    Symbol,
+    contract, contracterror, contractimpl, contracttype, symbol_short, Address, Env, Vec,
+    Symbol, token, IntoVal,
 };
 
 #[contracterror]
@@ -12,27 +12,24 @@ pub enum Error {
     AlreadyInitialized = 1,
     NotInitialized = 2,
     Unauthorized = 3,
-    CooldownNotMet = 4,
-    InvalidPercentage = 5,
-    InsufficientFees = 6,
+    InsufficientBalance = 4,
 }
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct BuybackExecutedEvent {
-    pub usdc_spent: i128,
-    pub mnt_burned: i128,
-    pub price: i128,
+pub struct AllocationHistory {
+    pub token: Address,
+    pub recipient: Address,
+    pub amount: i128,
+    pub timestamp: u64,
 }
 
 #[contracttype]
 #[derive(Clone)]
 pub enum DataKey {
     Admin,
-    TotalBurned,
-    LastBuybackTime,
-    BuybackPercentage,
-    AccumulatedFees,
+    StakingContract,
+    History,
 }
 
 #[contract]
@@ -40,162 +37,142 @@ pub struct TreasuryContract;
 
 #[contractimpl]
 impl TreasuryContract {
-    /// Initialize treasury contract with admin
-    pub fn init(env: Env, admin: Address) -> Result<(), Error> {
+    /// Initialize treasury contract with admin and staking contract address
+    pub fn initialize(env: Env, admin: Address, staking_contract: Address) -> Result<(), Error> {
         if env.storage().persistent().has(&DataKey::Admin) {
             return Err(Error::AlreadyInitialized);
         }
         env.storage().persistent().set(&DataKey::Admin, &admin);
-        env.storage().persistent().set(&DataKey::TotalBurned, &0i128);
-        env.storage().persistent().set(&DataKey::LastBuybackTime, &0u64);
-        env.storage()
-            .persistent()
-            .set(&DataKey::BuybackPercentage, &20i128);
-        env.storage()
-            .persistent()
-            .set(&DataKey::AccumulatedFees, &0i128);
+        env.storage().persistent().set(&DataKey::StakingContract, &staking_contract);
+        
+        let empty_history: Vec<AllocationHistory> = Vec::new(&env);
+        env.storage().persistent().set(&DataKey::History, &empty_history);
+        
         Ok(())
     }
 
-    /// Trigger buyback and burn mechanism (callable by anyone, enforces 7-day cooldown)
-    pub fn trigger_buyback(
-        env: Env,
-        usdc_token: Address,
-        mnt_token: Address,
-        dex_contract: Address,
-        price: i128,
-    ) -> Result<(), Error> {
-        if !env.storage().persistent().has(&DataKey::Admin) {
-            return Err(Error::NotInitialized);
-        }
+    /// Accept deposits of any approved Stellar asset
+    pub fn deposit(env: Env, from: Address, token: Address, amount: i128) -> Result<(), Error> {
+        from.require_auth();
+        
+        let token_client = token::Client::new(&env, &token);
+        token_client.transfer(&from, &env.current_contract_address(), &amount);
 
-        let now = env.ledger().timestamp();
-        let last_buyback: u64 = env
-            .storage()
-            .persistent()
-            .get(&DataKey::LastBuybackTime)
-            .unwrap_or(Ok(0u64))
-            .unwrap_or(0u64);
-
-        // Enforce 7-day cooldown
-        const SEVEN_DAYS: u64 = 7 * 24 * 3600;
-        if now < last_buyback + SEVEN_DAYS {
-            return Err(Error::CooldownNotMet);
-        }
-
-        let accumulated_fees: i128 = env
-            .storage()
-            .persistent()
-            .get(&DataKey::AccumulatedFees)
-            .unwrap_or(Ok(0i128))
-            .unwrap_or(0i128);
-
-        if accumulated_fees == 0 {
-            return Err(Error::InsufficientFees);
-        }
-
-        let buyback_percentage: i128 = env
-            .storage()
-            .persistent()
-            .get(&DataKey::BuybackPercentage)
-            .unwrap_or(Ok(20i128))
-            .unwrap_or(20i128);
-
-        // Calculate 20% of fees (or configured percentage)
-        let usdc_to_spend = (accumulated_fees * buyback_percentage) / 100;
-
-        if usdc_to_spend == 0 {
-            return Err(Error::InsufficientFees);
-        }
-
-        // Calculate MNT received from DEX swap
-        let mnt_burned = usdc_to_spend / price;
-
-        // Update storage
-        let mut total_burned: i128 = env
-            .storage()
-            .persistent()
-            .get(&DataKey::TotalBurned)
-            .unwrap_or(Ok(0i128))
-            .unwrap_or(0i128);
-        total_burned += mnt_burned;
-
-        env.storage()
-            .persistent()
-            .set(&DataKey::TotalBurned, &total_burned);
-        env.storage()
-            .persistent()
-            .set(&DataKey::LastBuybackTime, &now);
-
-        // Reduce accumulated fees
-        let remaining_fees = accumulated_fees - usdc_to_spend;
-        env.storage()
-            .persistent()
-            .set(&DataKey::AccumulatedFees, &remaining_fees);
-
-        // Emit buyback_executed event
+        // Emit deposited event
         env.events().publish(
-            (symbol_short!("buyback"), dex_contract),
-            BuybackExecutedEvent {
-                usdc_spent: usdc_to_spend,
-                mnt_burned,
-                price,
-            },
+            (symbol_short!("deposit"), from.clone(), token.clone()),
+            amount,
         );
 
         Ok(())
     }
 
-    /// Get total MNT burned
-    pub fn get_total_burned(env: Env) -> Result<i128, Error> {
-        env.storage()
-            .persistent()
-            .get(&DataKey::TotalBurned)
-            .unwrap_or(Ok(0i128))
+    /// get_balance(env, token: Address) -> i128
+    pub fn get_balance(env: Env, token: Address) -> i128 {
+        let token_client = token::Client::new(&env, &token);
+        token_client.balance(&env.current_contract_address())
     }
 
-    /// Set buyback percentage (0-50%), only admin can call
-    pub fn set_buyback_percentage(env: Env, percentage: i128) -> Result<(), Error> {
-        let admin: Address = env
-            .storage()
-            .persistent()
-            .get(&DataKey::Admin)
-            .ok_or(Error::NotInitialized)??;
-
+    /// allocate(env, token, recipient, amount) — governance/timelock only
+    pub fn allocate(env: Env, token: Address, recipient: Address, amount: i128) -> Result<(), Error> {
+        let admin = env.storage().persistent()
+            .get::<DataKey, Address>(&DataKey::Admin)
+            .ok_or(Error::NotInitialized)?;
         admin.require_auth();
 
-        if percentage < 0 || percentage > 50 {
-            return Err(Error::InvalidPercentage);
-        }
+        let token_client = token::Client::new(&env, &token);
+        token_client.transfer(&env.current_contract_address(), &recipient, &amount);
 
-        env.storage()
-            .persistent()
-            .set(&DataKey::BuybackPercentage, &percentage);
+        // Track allocation history
+        let mut history = env.storage().persistent()
+            .get::<DataKey, Vec<AllocationHistory>>(&DataKey::History)
+            .unwrap_or_else(|| Vec::new(&env));
+            
+        history.push_back(AllocationHistory {
+            token: token.clone(),
+            recipient: recipient.clone(),
+            amount,
+            timestamp: env.ledger().timestamp(),
+        });
+        env.storage().persistent().set(&DataKey::History, &history);
+
+        // Emit allocated event
+        env.events().publish(
+            (symbol_short!("allocate"), recipient.clone(), token.clone()),
+            amount,
+        );
+
         Ok(())
     }
 
-    /// Accumulate fees (called by other contracts collecting fees)
-    pub fn add_fees(env: Env, amount: i128) -> Result<(), Error> {
-        let mut accumulated: i128 = env
-            .storage()
-            .persistent()
-            .get(&DataKey::AccumulatedFees)
-            .unwrap_or(Ok(0i128))
-            .unwrap_or(0i128);
+    /// distribute_to_stakers(env, token, total_amount) — pro-rata by stake amount
+    pub fn distribute_to_stakers(env: Env, token: Address, total_amount: i128) -> Result<(), Error> {
+        let admin = env.storage().persistent()
+            .get::<DataKey, Address>(&DataKey::Admin)
+            .ok_or(Error::NotInitialized)?;
+        admin.require_auth();
 
-        accumulated += amount;
-        env.storage()
-            .persistent()
-            .set(&DataKey::AccumulatedFees, &accumulated);
+        let staking_contract = env.storage().persistent()
+            .get::<DataKey, Address>(&DataKey::StakingContract)
+            .ok_or(Error::NotInitialized)?;
+        
+        let token_client = token::Client::new(&env, &token);
+        token_client.transfer(&env.current_contract_address(), &staking_contract, &total_amount);
+
+        // Call staking contract's distribute_revenue
+        env.invoke_contract::<()>(
+            &staking_contract,
+            &Symbol::new(&env, "distribute_revenue"),
+            (token.clone(), total_amount).into_val(&env),
+        );
+
+        // Emit distributed event
+        env.events().publish(
+            (symbol_short!("distrib"), staking_contract.clone(), token.clone()),
+            total_amount,
+        );
+
         Ok(())
     }
 
-    /// Get accumulated fees
-    pub fn get_accumulated_fees(env: Env) -> Result<i128, Error> {
-        env.storage()
-            .persistent()
-            .get(&DataKey::AccumulatedFees)
-            .unwrap_or(Ok(0i128))
+    /// buyback_and_burn(env, xlm_amount) — swap XLM for MNT on DEX, burn MNT
+    pub fn buyback_and_burn(env: Env, xlm_token: Address, mnt_token: Address, dex_contract: Address, xlm_amount: i128) -> Result<(), Error> {
+        let admin = env.storage().persistent()
+            .get::<DataKey, Address>(&DataKey::Admin)
+            .ok_or(Error::NotInitialized)?;
+        admin.require_auth();
+
+        // 1. Transfer XLM to DEX (or approve)
+        let xlm_client = token::Client::new(&env, &xlm_token);
+        xlm_client.transfer(&env.current_contract_address(), &dex_contract, &xlm_amount);
+
+        // 2. Call DEX swap (assuming it returns the amount of MNT received)
+        let mnt_received: i128 = env.invoke_contract(
+            &dex_contract,
+            &Symbol::new(&env, "swap"),
+            (xlm_token.clone(), mnt_token.clone(), xlm_amount).into_val(&env),
+        );
+
+        // 3. Burn MNT
+        env.invoke_contract::<()>(
+            &mnt_token,
+            &Symbol::new(&env, "burn"),
+            (env.current_contract_address(), mnt_received).into_val(&env),
+        );
+
+        // Emit buyback event
+        env.events().publish(
+            (symbol_short!("buyback"), mnt_token.clone()),
+            mnt_received,
+        );
+
+        Ok(())
+    }
+
+    pub fn get_history(env: Env) -> Vec<AllocationHistory> {
+        env.storage().persistent()
+            .get::<DataKey, Vec<AllocationHistory>>(&DataKey::History)
+            .unwrap_or_else(|| Vec::new(&env))
     }
 }
 
@@ -203,75 +180,143 @@ impl TreasuryContract {
 mod tests {
     use super::*;
     use soroban_sdk::testutils::{Address as _, Ledger};
+    use soroban_sdk::Env;
 
-    #[test]
-    fn test_buyback_execution() {
-        let env = Env::default();
-        let admin = Address::random(&env);
-        let usdc_token = Address::random(&env);
-        let mnt_token = Address::random(&env);
-        let dex = Address::random(&env);
+    #[contract]
+    pub struct MockDEX;
 
-        assert!(TreasuryContract::init(env.clone(), admin.clone()).is_ok());
-        assert!(TreasuryContract::add_fees(env.clone(), 1000).is_ok());
+    #[contractimpl]
+    impl MockDEX {
+        pub fn swap(_env: Env, _token_in: Address, _token_out: Address, amount_in: i128) -> i128 {
+            amount_in
+        }
+    }
 
-        env.ledger().set_timestamp(100);
-        let result = TreasuryContract::trigger_buyback(
-            env.clone(),
-            usdc_token,
-            mnt_token,
-            dex,
-            100, // price
-        );
-        assert!(result.is_ok());
+    #[contract]
+    pub struct MockStaking;
 
-        let burned = TreasuryContract::get_total_burned(env.clone()).unwrap();
-        assert_eq!(burned, 200 / 100); // 200 USDC spent / 100 price = 2 MNT
+    #[contractimpl]
+    impl MockStaking {
+        pub fn distribute_revenue(_env: Env, _token: Address, _amount: i128) {
+        }
+    }
+
+    #[contract]
+    pub struct MockMNT;
+
+    #[contractimpl]
+    impl MockMNT {
+        pub fn burn(_env: Env, _from: Address, _amount: i128) {
+        }
+    }
+
+    fn setup_test(env: &Env) -> (Address, Address, Address) {
+        let admin = Address::generate(env);
+        let staking = env.register_contract(None, MockStaking);
+        
+        let contract_id = env.register_contract(None, TreasuryContract);
+        let client = TreasuryContractClient::new(env, &contract_id);
+        client.initialize(&admin, &staking);
+        
+        (admin, staking, contract_id)
     }
 
     #[test]
-    fn test_cooldown_enforcement() {
+    fn test_initialization() {
         let env = Env::default();
-        let admin = Address::random(&env);
-        let usdc_token = Address::random(&env);
-        let mnt_token = Address::random(&env);
-        let dex = Address::random(&env);
-
-        TreasuryContract::init(env.clone(), admin.clone()).unwrap();
-        TreasuryContract::add_fees(env.clone(), 1000).unwrap();
-
-        env.ledger().set_timestamp(100);
-        TreasuryContract::trigger_buyback(env.clone(), usdc_token.clone(), mnt_token.clone(), dex.clone(), 100)
-            .unwrap();
-
-        // Try to trigger again within 7 days
-        env.ledger().set_timestamp(200);
-        let result = TreasuryContract::trigger_buyback(
-            env.clone(),
-            usdc_token,
-            mnt_token,
-            dex,
-            100,
-        );
-        assert_eq!(result, Err(Error::CooldownNotMet));
+        let (admin, staking, _) = setup_test(&env);
+        
+        let client = TreasuryContractClient::new(&env, &env.register_contract(None, TreasuryContract));
+        client.initialize(&admin, &staking);
+        let result = client.try_initialize(&admin, &staking);
+        assert!(result.is_err());
     }
 
     #[test]
-    fn test_burn_verification() {
+    fn test_deposit_and_balance() {
         let env = Env::default();
-        let admin = Address::random(&env);
-        let usdc_token = Address::random(&env);
-        let mnt_token = Address::random(&env);
-        let dex = Address::random(&env);
+        env.mock_all_auths();
+        let (admin, _, contract_id) = setup_test(&env);
+        let user = Address::generate(&env);
+        let token_addr = env.register_stellar_asset_contract(admin.clone());
+        let token_client = token::Client::new(&env, &token_addr);
+        let stellar_asset_client = token::StellarAssetClient::new(&env, &token_addr);
+        
+        stellar_asset_client.mint(&user, &1000);
+        
+        let treasury_client = TreasuryContractClient::new(&env, &contract_id);
+        treasury_client.deposit(&user, &token_addr, &500);
+        
+        assert_eq!(treasury_client.get_balance(&token_addr), 500);
+        assert_eq!(token_client.balance(&user), 500);
+        assert_eq!(token_client.balance(&contract_id), 500);
+    }
 
-        TreasuryContract::init(env.clone(), admin).unwrap();
-        TreasuryContract::add_fees(env.clone(), 5000).unwrap();
+    #[test]
+    fn test_allocate() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (admin, _, contract_id) = setup_test(&env);
+        let recipient = Address::generate(&env);
+        let token_addr = env.register_stellar_asset_contract(admin.clone());
+        let token_client = token::Client::new(&env, &token_addr);
+        let stellar_asset_client = token::StellarAssetClient::new(&env, &token_addr);
+        
+        stellar_asset_client.mint(&contract_id, &1000);
+        
+        let treasury_client = TreasuryContractClient::new(&env, &contract_id);
+        
+        env.ledger().set_timestamp(12345);
+        treasury_client.allocate(&token_addr, &recipient, &400);
+        
+        assert_eq!(treasury_client.get_balance(&token_addr), 600);
+        assert_eq!(token_client.balance(&recipient), 400);
 
-        env.ledger().set_timestamp(100);
-        TreasuryContract::trigger_buyback(env.clone(), usdc_token, mnt_token, dex, 50).unwrap();
+        let history = treasury_client.get_history();
+        assert_eq!(history.len(), 1);
+        let entry = history.get(0).unwrap();
+        assert_eq!(entry.token, token_addr);
+        assert_eq!(entry.recipient, recipient);
+        assert_eq!(entry.amount, 400);
+        assert_eq!(entry.timestamp, 12345);
+    }
 
-        let burned = TreasuryContract::get_total_burned(env).unwrap();
-        assert!(burned > 0);
-        assert_eq!(burned, 1000 / 50); // 1000 USDC (20% of 5000) / 50 price
+    #[test]
+    fn test_distribute_to_stakers() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (admin, staking_addr, contract_id) = setup_test(&env);
+        let token_addr = env.register_stellar_asset_contract(admin.clone());
+        let token_client = token::Client::new(&env, &token_addr);
+        let stellar_asset_client = token::StellarAssetClient::new(&env, &token_addr);
+        
+        stellar_asset_client.mint(&contract_id, &1000);
+        
+        let treasury_client = TreasuryContractClient::new(&env, &contract_id);
+        treasury_client.distribute_to_stakers(&token_addr, &300);
+        
+        assert_eq!(treasury_client.get_balance(&token_addr), 700);
+        assert_eq!(token_client.balance(&staking_addr), 300);
+    }
+
+    #[test]
+    fn test_buyback_and_burn() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (admin, _, contract_id) = setup_test(&env);
+        
+        let xlm_addr = env.register_stellar_asset_contract(admin.clone());
+        let mnt_addr = env.register_contract(None, MockMNT);
+        let dex_addr = env.register_contract(None, MockDEX);
+        
+        let xlm_client = token::Client::new(&env, &xlm_addr);
+        let stellar_asset_client = token::StellarAssetClient::new(&env, &xlm_addr);
+        stellar_asset_client.mint(&contract_id, &1000);
+        
+        let treasury_client = TreasuryContractClient::new(&env, &contract_id);
+        treasury_client.buyback_and_burn(&xlm_addr, &mnt_addr, &dex_addr, &1000);
+        
+        assert_eq!(xlm_client.balance(&contract_id), 0);
+        assert_eq!(xlm_client.balance(&dex_addr), 1000);
     }
 }
