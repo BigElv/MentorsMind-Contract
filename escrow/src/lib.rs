@@ -61,6 +61,8 @@ const AUTO_REL_DLY: Symbol = symbol_short!("AR_DELAY");
 const SESSION_KEY: Symbol = symbol_short!("SESSION");
 const ORACLE_ID: Symbol = symbol_short!("ORACLE");
 const ORACLE_MAX_AGE: Symbol = symbol_short!("OR_AGE");
+const MENTOR_ESCROWS: Symbol = symbol_short!("MNT_ESC");
+const LEARNER_ESCROWS: Symbol = symbol_short!("LRN_ESC");
 const MAX_FEE_BPS: u32 = 1_000;
 const DEFAULT_AUTO_RELEASE_DELAY: u64 = 72 * 60 * 60;
 const APPROVED_TOKEN_KEY: Symbol = symbol_short!("APRV_TOK");
@@ -453,19 +455,62 @@ impl EscrowContract {
         Self::_is_token_approved(&env, &token_address)
     }
 
-    pub fn get_escrows_by_mentor(env: Env, mentor: Address) -> Vec<Escrow> {
+    pub fn get_escrows_by_mentor(env: Env, mentor: Address, page: u32, page_size: u32) -> Vec<Escrow> {
+        let page_size = if page_size > 50 { 50 } else { page_size };
+        let mentor_key = (MENTOR_ESCROWS, mentor);
+        let mentor_escrows: Vec<u64> = env.storage().persistent().get(&mentor_key).unwrap_or(Vec::new(&env));
+        let start = page.checked_mul(page_size).unwrap_or(0);
+        let mut result = Vec::new(&env);
+
+        if start >= mentor_escrows.len() {
+            return result;
+        }
+
+        let end = (start + page_size).min(mentor_escrows.len());
+        for i in start..end {
+            let id = mentor_escrows.get(i).unwrap();
+            let key = (symbol_short!("ESCROW"), id);
+            if let Some(escrow) = env.storage().persistent().get::<_, Escrow>(&key) {
+                result.push_back(escrow);
+            }
+        }
+        result
+    }
+
+    pub fn get_escrows_by_learner(env: Env, learner: Address, page: u32, page_size: u32) -> Vec<Escrow> {
+        let page_size = if page_size > 50 { 50 } else { page_size };
+        let learner_key = (LEARNER_ESCROWS, learner);
+        let learner_escrows: Vec<u64> = env.storage().persistent().get(&learner_key).unwrap_or(Vec::new(&env));
+        let start = page.checked_mul(page_size).unwrap_or(0);
+        let mut result = Vec::new(&env);
+
+        if start >= learner_escrows.len() {
+            return result;
+        }
+
+        let end = (start + page_size).min(learner_escrows.len());
+        for i in start..end {
+            let id = learner_escrows.get(i).unwrap();
+            let key = (symbol_short!("ESCROW"), id);
+            if let Some(escrow) = env.storage().persistent().get::<_, Escrow>(&key) {
+                result.push_back(escrow);
+            }
+        }
+        result
+    }
+
+    pub fn get_escrows_by_status(env: Env, status: EscrowStatus) -> Vec<u64> {
         let count = env.storage().persistent().get(&ESCROW_COUNT).unwrap_or(0u64);
         let mut result = Vec::new(&env);
 
         for i in 1..=count {
             let key = (symbol_short!("ESCROW"), i);
             if let Some(escrow) = env.storage().persistent().get::<_, Escrow>(&key) {
-                if escrow.mentor == mentor {
-                    result.push_back(escrow);
+                if escrow.status == status {
+                    result.push_back(i);
                 }
             }
         }
-
         result
     }
 
@@ -682,6 +727,20 @@ impl EscrowContract {
         };
         let key = (symbol_short!("ESCROW"), count);
         env.storage().persistent().set(&key, &escrow);
+
+        // Update index maps
+        let mentor_key = (MENTOR_ESCROWS, mentor.clone());
+        let mut mentor_escrows: Vec<u64> = env.storage().persistent().get(&mentor_key).unwrap_or(Vec::new(&env));
+        mentor_escrows.push_back(count);
+        env.storage().persistent().set(&mentor_key, &mentor_escrows);
+        env.storage().persistent().extend_ttl(&mentor_key, ESCROW_TTL_THRESHOLD, ESCROW_TTL_BUMP);
+
+        let learner_key = (LEARNER_ESCROWS, learner.clone());
+        let mut learner_escrows: Vec<u64> = env.storage().persistent().get(&learner_key).unwrap_or(Vec::new(&env));
+        learner_escrows.push_back(count);
+        env.storage().persistent().set(&learner_key, &learner_escrows);
+        env.storage().persistent().extend_ttl(&learner_key, ESCROW_TTL_THRESHOLD, ESCROW_TTL_BUMP);
+
         env.events().publish((symbol_short!("created"), count), (mentor, learner, amount, token_address));
         count
     }
