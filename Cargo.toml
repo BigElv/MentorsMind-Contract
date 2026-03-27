@@ -3,7 +3,7 @@ resolver = "2"
 members = [
     "escrow",
     "contracts/allowance",
-    "contracts/multisig_admin",
+    "contracts/bounty",
     "contracts/interface_registry",
     "contracts/verification",
     "contracts/oracle",
@@ -19,6 +19,7 @@ members = [
     "contracts/payment_router",
     "contracts/streak_rewards",
     "contracts/shared",
+    "contracts/proposal_templates",
     "contracts/upgrade_registry",
     "contracts/rate_limiter",
     "contracts/performance_bond",

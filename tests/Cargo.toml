@@ -8,12 +8,18 @@ rust-version = "1.70"
 name = "mentorminds_integration_tests"
 path = "lib.rs"
 
-[dev-dependencies]
+[dependencies]
 soroban-sdk = { workspace = true, features = ["testutils"] }
 mentorminds-escrow = { path = "../escrow", features = ["testutils"] }
 mentorminds-verification = { path = "../contracts/verification", features = ["testutils"] }
 shared = { path = "../contracts/shared" }
 mentorminds-governance = { path = "../contracts/governance", features = ["testutils"] }
+mentorminds-reputation = { path = "../contracts/reputation", features = ["testutils"] }
+mentorminds-timelock = { path = "../contracts/timelock", features = ["testutils"] }
+mentorminds-credit-score = { path = "../contracts/credit_score", features = ["testutils"] }
+mentorminds-staking = { path = "../contracts/staking", features = ["testutils"] }
+
+[dev-dependencies]
 
 [[test]]
 name = "upgrade_test"
