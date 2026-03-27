@@ -1,8 +1,36 @@
 #![no_std]
+
 use soroban_sdk::{
-    contract, contractimpl, contracttype, symbol_short, Address, Env, IntoVal, Symbol,
+    contract, contractimpl, contracttype, symbol_short, Address, BytesN, Env,
+    IntoVal, Symbol,
 };
 
+// ── Storage keys ────────────────────────────────────────────────────────────
+const ESCROW: Symbol = symbol_short!("ESCROW");
+const TTL_THRESHOLD: u32 = 500_000;
+const TTL_BUMP: u32 = 1_000_000;
+
+// ── Types ────────────────────────────────────────────────────────────────────
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReviewRecord {
+    pub session_id: Symbol,
+    pub mentor: Address,
+    pub learner: Address,
+    pub rating: u32,
+    pub timestamp: u64,
+    pub comment_hash: BytesN<32>,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum DataKey {
+    Review(Symbol),
+    MentorRatingSum(Address),
+    MentorReviewCount(Address),
+}
+
+// ── Escrow status mirror (must match escrow contract) ────────────────────────
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum EscrowStatus {
@@ -15,7 +43,7 @@ pub enum EscrowStatus {
 
 #[contracttype]
 #[derive(Clone, Debug)]
-pub struct Escrow {
+pub struct EscrowInfo {
     pub id: u64,
     pub mentor: Address,
     pub learner: Address,
@@ -38,86 +66,285 @@ pub struct Escrow {
     pub sessions_completed: u32,
 }
 
-#[contracttype]
-pub enum DataKey {
-    Admin,
-    EscrowContract,
-    MentorRating(Address),
-    MentorReviewCount(Address),
-}
-
+// ── Contract ─────────────────────────────────────────────────────────────────
 #[contract]
 pub struct ReputationContract;
 
 #[contractimpl]
 impl ReputationContract {
-    pub fn initialize(env: Env, admin: Address, escrow: Address) {
-        env.storage().persistent().set(&DataKey::Admin, &admin);
+    /// Initialize with the escrow contract address for cross-contract verification.
+    pub fn initialize(env: Env, escrow_contract: Address) {
+        if env.storage().instance().has(&ESCROW) {
+            panic!("Already initialized");
+        }
+        env.storage().instance().set(&ESCROW, &escrow_contract);
         env.storage()
-            .persistent()
-            .set(&DataKey::EscrowContract, &escrow);
+            .instance()
+            .extend_ttl(TTL_THRESHOLD, TTL_BUMP);
     }
 
-    pub fn add_review(env: Env, learner: Address, escrow_id: u64, rating: u32) {
+    /// Submit a review for a completed session.
+    /// Caller must be the learner; session must be Released in escrow.
+    pub fn submit_review(
+        env: Env,
+        session_id: Symbol,
+        mentor: Address,
+        learner: Address,
+        rating: u32,
+        comment_hash: BytesN<32>,
+    ) {
+        // Auth: caller must be learner
         learner.require_auth();
+
+        // Validate rating 1–5
         if rating < 1 || rating > 5 {
-            panic!("rating must be between 1 and 5");
+            panic!("InvalidRating");
         }
 
+        // Prevent duplicate review
+        let review_key = DataKey::Review(session_id.clone());
+        if env.storage().persistent().has(&review_key) {
+            panic!("DuplicateReview");
+        }
+
+        // Cross-contract: verify session is Released
         let escrow_addr: Address = env
             .storage()
-            .persistent()
-            .get(&DataKey::EscrowContract)
-            .unwrap();
+            .instance()
+            .get(&ESCROW)
+            .expect("EscrowContractNotSet");
 
-        // Call Escrow to get details
-        let escrow: Escrow = env.invoke_contract(
+        let escrow: EscrowInfo = env.invoke_contract(
             &escrow_addr,
-            &Symbol::new(&env, "get_escrow"),
-            (escrow_id,).into_val(&env),
+            &Symbol::new(&env, "get_escrow_by_session"),
+            (session_id.clone(),).into_val(&env),
         );
 
-        if escrow.learner != learner {
-            panic!("not your escrow");
+        if escrow.status != EscrowStatus::Released {
+            panic!("SessionNotReleased");
         }
 
-        if escrow.status != EscrowStatus::Released && escrow.status != EscrowStatus::Resolved {
-            panic!("escrow not completed");
-        }
-
-        let mentor = escrow.mentor;
-        let r_key = DataKey::MentorRating(mentor.clone());
-        let c_key = DataKey::MentorReviewCount(mentor.clone());
-
-        let current_total: u64 = env.storage().persistent().get(&r_key).unwrap_or(0);
-        let current_count: u32 = env.storage().persistent().get(&c_key).unwrap_or(0);
-
+        // Store review
+        let record = ReviewRecord {
+            session_id: session_id.clone(),
+            mentor: mentor.clone(),
+            learner: learner.clone(),
+            rating,
+            timestamp: env.ledger().timestamp(),
+            comment_hash,
+        };
+        env.storage().persistent().set(&review_key, &record);
         env.storage()
             .persistent()
-            .set(&r_key, &(current_total + rating as u64));
-        env.storage().persistent().set(&c_key, &(current_count + 1));
+            .extend_ttl(&review_key, TTL_THRESHOLD, TTL_BUMP);
 
+        // Update running average
+        let sum_key = DataKey::MentorRatingSum(mentor.clone());
+        let cnt_key = DataKey::MentorReviewCount(mentor.clone());
+
+        let current_sum: u32 = env
+            .storage()
+            .persistent()
+            .get(&sum_key)
+            .unwrap_or(0u32);
+        let current_count: u32 = env
+            .storage()
+            .persistent()
+            .get(&cnt_key)
+            .unwrap_or(0u32);
+
+        let new_sum = current_sum.checked_add(rating).expect("sum overflow");
+        let new_count = current_count.checked_add(1).expect("count overflow");
+
+        env.storage().persistent().set(&sum_key, &new_sum);
+        env.storage()
+            .persistent()
+            .extend_ttl(&sum_key, TTL_THRESHOLD, TTL_BUMP);
+        env.storage().persistent().set(&cnt_key, &new_count);
+        env.storage()
+            .persistent()
+            .extend_ttl(&cnt_key, TTL_THRESHOLD, TTL_BUMP);
+
+        // Emit event
         env.events().publish(
-            (symbol_short!("reput"), symbol_short!("reviewed"), mentor),
-            (learner, rating),
+            (
+                symbol_short!("review"),
+                Symbol::new(&env, "review_submitted"),
+                mentor.clone(),
+            ),
+            (session_id, learner, rating, env.ledger().timestamp()),
         );
     }
 
-    pub fn get_rating(env: Env, mentor: Address) -> u32 {
-        let total: u64 = env
-            .storage()
-            .persistent()
-            .get(&DataKey::MentorRating(mentor.clone()))
-            .unwrap_or(0);
-        let count: u32 = env
-            .storage()
-            .persistent()
-            .get(&DataKey::MentorReviewCount(mentor))
-            .unwrap_or(0);
+    /// Returns (avg_rating * 100, review_count) for a mentor.
+    pub fn get_mentor_rating(env: Env, mentor: Address) -> (u32, u32) {
+        let sum_key = DataKey::MentorRatingSum(mentor.clone());
+        let cnt_key = DataKey::MentorReviewCount(mentor.clone());
+
+        let sum: u32 = env.storage().persistent().get(&sum_key).unwrap_or(0);
+        let count: u32 = env.storage().persistent().get(&cnt_key).unwrap_or(0);
+
         if count == 0 {
-            0
-        } else {
-            (total / count as u64) as u32
+            return (0, 0);
         }
+
+        let avg_times_100 = (sum * 100) / count;
+        (avg_times_100, count)
+    }
+
+    /// Returns the review record for a given session.
+    pub fn get_review(env: Env, session_id: Symbol) -> ReviewRecord {
+        env.storage()
+            .persistent()
+            .get(&DataKey::Review(session_id))
+            .expect("Review not found")
+    }
+}
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use soroban_sdk::{testutils::{Address as _, Ledger}, Env};
+
+    // Mock escrow contract for testing
+    #[contract]
+    pub struct MockEscrow;
+
+    #[contractimpl]
+    impl MockEscrow {
+        pub fn set_status(env: Env, session_id: Symbol, released: bool) {
+            env.storage()
+                .persistent()
+                .set(&session_id, &released);
+        }
+
+        pub fn get_escrow_by_session(env: Env, session_id: Symbol) -> EscrowInfo {
+            let released: bool = env
+                .storage()
+                .persistent()
+                .get(&session_id)
+                .unwrap_or(false);
+            let dummy = Address::generate(&env);
+            EscrowInfo {
+                id: 1,
+                mentor: dummy.clone(),
+                learner: dummy.clone(),
+                amount: 100,
+                session_id: session_id.clone(),
+                status: if released {
+                    EscrowStatus::Released
+                } else {
+                    EscrowStatus::Active
+                },
+                created_at: 0,
+                token_address: dummy.clone(),
+                platform_fee: 0,
+                net_amount: 100,
+                session_end_time: 0,
+                auto_release_delay: 0,
+                dispute_reason: Symbol::new(&env, ""),
+                resolved_at: 0,
+                usd_amount: 0,
+                quoted_token_amount: 0,
+                send_asset: dummy.clone(),
+                dest_asset: dummy.clone(),
+                total_sessions: 1,
+                sessions_completed: 1,
+            }
+        }
+    }
+
+    fn setup() -> (Env, ReputationContractClient<'static>, Address, Address, Address) {
+        let env = Env::default();
+        env.mock_all_auths();
+        env.ledger().with_mut(|li| li.timestamp = 1_000_000);
+
+        let escrow_id = env.register_contract(None, MockEscrow);
+        let rep_id = env.register_contract(None, ReputationContract);
+        let client = ReputationContractClient::new(&env, &rep_id);
+        client.initialize(&escrow_id);
+
+        let mentor = Address::generate(&env);
+        let learner = Address::generate(&env);
+
+        (env, client, escrow_id, mentor, learner)
+    }
+
+    #[test]
+    fn test_submit_review_success() {
+        let (env, client, escrow_id, mentor, learner) = setup();
+        let session_id = Symbol::new(&env, "session1");
+        let comment_hash = BytesN::from_array(&env, &[1u8; 32]);
+
+        // Mark session as released in mock escrow
+        let mock = MockEscrowClient::new(&env, &escrow_id);
+        mock.set_status(&session_id, &true);
+
+        client.submit_review(&session_id, &mentor, &learner, &5, &comment_hash);
+
+        let (avg, count) = client.get_mentor_rating(&mentor);
+        assert_eq!(count, 1);
+        assert_eq!(avg, 500); // 5 * 100
+
+        let review = client.get_review(&session_id);
+        assert_eq!(review.rating, 5);
+        assert_eq!(review.mentor, mentor);
+        assert_eq!(review.learner, learner);
+    }
+
+    #[test]
+    fn test_running_average() {
+        let (env, client, escrow_id, mentor, learner) = setup();
+        let mock = MockEscrowClient::new(&env, &escrow_id);
+        let comment_hash = BytesN::from_array(&env, &[0u8; 32]);
+
+        for i in 1u32..=3 {
+            let sid = match i {
+                1 => Symbol::new(&env, "s1"),
+                2 => Symbol::new(&env, "s2"),
+                _ => Symbol::new(&env, "s3"),
+            };
+            mock.set_status(&sid, &true);
+            client.submit_review(&sid, &mentor, &learner, &(i * 2).min(5), &comment_hash);
+        }
+
+        let (avg, count) = client.get_mentor_rating(&mentor);
+        assert_eq!(count, 3);
+        // ratings: 2, 4, 5 → sum=11, avg*100 = 1100/3 = 366
+        assert_eq!(avg, 366);
+    }
+
+    #[test]
+    #[should_panic(expected = "InvalidRating")]
+    fn test_invalid_rating() {
+        let (env, client, escrow_id, mentor, learner) = setup();
+        let session_id = Symbol::new(&env, "s_bad");
+        let comment_hash = BytesN::from_array(&env, &[0u8; 32]);
+        let mock = MockEscrowClient::new(&env, &escrow_id);
+        mock.set_status(&session_id, &true);
+        client.submit_review(&session_id, &mentor, &learner, &6, &comment_hash);
+    }
+
+    #[test]
+    #[should_panic(expected = "SessionNotReleased")]
+    fn test_session_not_released() {
+        let (env, client, _escrow_id, mentor, learner) = setup();
+        let session_id = Symbol::new(&env, "s_active");
+        let comment_hash = BytesN::from_array(&env, &[0u8; 32]);
+        // Not marking as released → status stays Active
+        client.submit_review(&session_id, &mentor, &learner, &4, &comment_hash);
+    }
+
+    #[test]
+    #[should_panic(expected = "DuplicateReview")]
+    fn test_duplicate_review() {
+        let (env, client, escrow_id, mentor, learner) = setup();
+        let session_id = Symbol::new(&env, "s_dup");
+        let comment_hash = BytesN::from_array(&env, &[0u8; 32]);
+        let mock = MockEscrowClient::new(&env, &escrow_id);
+        mock.set_status(&session_id, &true);
+        client.submit_review(&session_id, &mentor, &learner, &3, &comment_hash);
+        client.submit_review(&session_id, &mentor, &learner, &4, &comment_hash);
     }
 }

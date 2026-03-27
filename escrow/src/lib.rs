@@ -595,6 +595,19 @@ impl EscrowContract {
             .get(&DataKey::Escrow(id))
             .expect("Not found")
     }
+
+    pub fn get_escrow_by_session(env: Env, session_id: Symbol) -> Escrow {
+        let id: u64 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Session(session_id))
+            .expect("Session not found");
+        env.storage()
+            .persistent()
+            .get(&DataKey::Escrow(id))
+            .expect("Not found")
+    }
+
     pub fn get_escrow_count(env: Env) -> u64 {
         env.storage()
             .persistent()
