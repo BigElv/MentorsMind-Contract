@@ -12,6 +12,7 @@ members = [
     "contracts/streak_rewards",
     "contracts/shared",
     "contracts/mnt-token",
+    "contracts/session_nft",
     "tests",
 ]
 
