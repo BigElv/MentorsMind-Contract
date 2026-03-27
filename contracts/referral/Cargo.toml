@@ -9,10 +9,10 @@ crate-type = ["cdylib"]
 
 [dependencies]
 soroban-sdk = { workspace = true }
-mentorminds-mnt-token = { path = "../mnt-token" }
 
 [dev-dependencies]
 soroban-sdk = { workspace = true, features = ["testutils"] }
+mentorminds-mnt-token = { path = "../mnt-token" }
 
 [features]
 testutils = ["soroban-sdk/testutils"]

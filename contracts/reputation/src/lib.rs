@@ -1,8 +1,7 @@
 #![no_std]
 
 use soroban_sdk::{
-    contract, contractimpl, contracttype, symbol_short, Address, BytesN, Env,
-    IntoVal, Symbol,
+    contract, contractimpl, contracttype, symbol_short, Address, BytesN, Env, IntoVal, Symbol,
 };
 
 // ── Storage keys ────────────────────────────────────────────────────────────
@@ -78,9 +77,7 @@ impl ReputationContract {
             panic!("Already initialized");
         }
         env.storage().instance().set(&ESCROW, &escrow_contract);
-        env.storage()
-            .instance()
-            .extend_ttl(TTL_THRESHOLD, TTL_BUMP);
+        env.storage().instance().extend_ttl(TTL_THRESHOLD, TTL_BUMP);
     }
 
     /// Submit a review for a completed session.
@@ -142,16 +139,8 @@ impl ReputationContract {
         let sum_key = DataKey::MentorRatingSum(mentor.clone());
         let cnt_key = DataKey::MentorReviewCount(mentor.clone());
 
-        let current_sum: u32 = env
-            .storage()
-            .persistent()
-            .get(&sum_key)
-            .unwrap_or(0u32);
-        let current_count: u32 = env
-            .storage()
-            .persistent()
-            .get(&cnt_key)
-            .unwrap_or(0u32);
+        let current_sum: u32 = env.storage().persistent().get(&sum_key).unwrap_or(0u32);
+        let current_count: u32 = env.storage().persistent().get(&cnt_key).unwrap_or(0u32);
 
         let new_sum = current_sum.checked_add(rating).expect("sum overflow");
         let new_count = current_count.checked_add(1).expect("count overflow");
@@ -205,7 +194,10 @@ impl ReputationContract {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use soroban_sdk::{testutils::{Address as _, Ledger}, Env};
+    use soroban_sdk::{
+        testutils::{Address as _, Ledger},
+        Env,
+    };
 
     // Mock escrow contract for testing
     #[contract]
@@ -214,17 +206,11 @@ mod tests {
     #[contractimpl]
     impl MockEscrow {
         pub fn set_status(env: Env, session_id: Symbol, released: bool) {
-            env.storage()
-                .persistent()
-                .set(&session_id, &released);
+            env.storage().persistent().set(&session_id, &released);
         }
 
         pub fn get_escrow_by_session(env: Env, session_id: Symbol) -> EscrowInfo {
-            let released: bool = env
-                .storage()
-                .persistent()
-                .get(&session_id)
-                .unwrap_or(false);
+            let released: bool = env.storage().persistent().get(&session_id).unwrap_or(false);
             let dummy = Address::generate(&env);
             EscrowInfo {
                 id: 1,
@@ -255,7 +241,13 @@ mod tests {
         }
     }
 
-    fn setup() -> (Env, ReputationContractClient<'static>, Address, Address, Address) {
+    fn setup() -> (
+        Env,
+        ReputationContractClient<'static>,
+        Address,
+        Address,
+        Address,
+    ) {
         let env = Env::default();
         env.mock_all_auths();
         env.ledger().with_mut(|li| li.timestamp = 1_000_000);

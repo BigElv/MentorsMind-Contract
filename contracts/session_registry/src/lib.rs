@@ -56,9 +56,7 @@ impl SessionRegistry {
             panic!("Already initialized");
         }
         env.storage().instance().set(&BACKEND, &backend);
-        env.storage()
-            .instance()
-            .extend_ttl(TTL_THRESHOLD, TTL_BUMP);
+        env.storage().instance().extend_ttl(TTL_THRESHOLD, TTL_BUMP);
     }
 
     /// Register a new session. Only callable by the platform backend.
@@ -205,7 +203,10 @@ impl SessionRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use soroban_sdk::{testutils::{Address as _, Ledger}, Env};
+    use soroban_sdk::{
+        testutils::{Address as _, Ledger},
+        Env,
+    };
 
     fn setup() -> (Env, SessionRegistryClient<'static>, Address) {
         let env = Env::default();
@@ -267,10 +268,16 @@ mod tests {
         );
 
         client.update_status(&session_id, &SessionStatus::Confirmed);
-        assert_eq!(client.get_session(&session_id).status, SessionStatus::Confirmed);
+        assert_eq!(
+            client.get_session(&session_id).status,
+            SessionStatus::Confirmed
+        );
 
         client.update_status(&session_id, &SessionStatus::Completed);
-        assert_eq!(client.get_session(&session_id).status, SessionStatus::Completed);
+        assert_eq!(
+            client.get_session(&session_id).status,
+            SessionStatus::Completed
+        );
     }
 
     #[test]
@@ -286,7 +293,15 @@ mod tests {
                 2 => Symbol::new(&env, "s2"),
                 _ => Symbol::new(&env, "s3"),
             };
-            client.register_session(&sid, &mentor, &learner, &2_000_000u64, &60u32, &100i128, &token);
+            client.register_session(
+                &sid,
+                &mentor,
+                &learner,
+                &2_000_000u64,
+                &60u32,
+                &100i128,
+                &token,
+            );
         }
 
         let mentor_sessions = client.get_sessions_by_mentor(&mentor);
@@ -314,7 +329,10 @@ mod tests {
         );
 
         client.update_status(&session_id, &SessionStatus::Cancelled);
-        assert_eq!(client.get_session(&session_id).status, SessionStatus::Cancelled);
+        assert_eq!(
+            client.get_session(&session_id).status,
+            SessionStatus::Cancelled
+        );
     }
 
     #[test]
@@ -326,7 +344,23 @@ mod tests {
         let session_id = Symbol::new(&env, "sess_dup");
         let token = dummy_token(&env);
 
-        client.register_session(&session_id, &mentor, &learner, &2_000_000u64, &60u32, &100i128, &token);
-        client.register_session(&session_id, &mentor, &learner, &2_000_000u64, &60u32, &100i128, &token);
+        client.register_session(
+            &session_id,
+            &mentor,
+            &learner,
+            &2_000_000u64,
+            &60u32,
+            &100i128,
+            &token,
+        );
+        client.register_session(
+            &session_id,
+            &mentor,
+            &learner,
+            &2_000_000u64,
+            &60u32,
+            &100i128,
+            &token,
+        );
     }
 }

@@ -417,7 +417,7 @@ mod test {
     extern crate std;
     use super::*;
     use soroban_sdk::testutils::{Address as _, Events, MockAuth, MockAuthInvoke};
-    use soroban_sdk::{vec, Env, IntoVal, Symbol};
+    use soroban_sdk::{vec, Env, IntoVal, Symbol, TryFromVal};
 
     #[test]
     fn test_initialization() {
@@ -459,7 +459,8 @@ mod test {
             )
                 .into_val(&env)
         );
-        assert_eq!(last_event.2, MintEventData { amount: 1000 }.into_val(&env));
+        let mint_data = MintEventData::try_from_val(&env, &last_event.2).unwrap();
+        assert_eq!(mint_data.amount, 1000);
 
         client.burn(&user, &400);
         assert_eq!(client.balance(&user), 600);
@@ -477,7 +478,8 @@ mod test {
             )
                 .into_val(&env)
         );
-        assert_eq!(last_event.2, BurnEventData { amount: 400 }.into_val(&env));
+        let burn_data = BurnEventData::try_from_val(&env, &last_event.2).unwrap();
+        assert_eq!(burn_data.amount, 400);
     }
 
     #[test]
@@ -510,14 +512,9 @@ mod test {
             )
                 .into_val(&env)
         );
-        assert_eq!(
-            last_event.2,
-            TransferEventData {
-                to: user2.clone(),
-                amount: 300
-            }
-            .into_val(&env)
-        );
+        let transfer_data = TransferEventData::try_from_val(&env, &last_event.2).unwrap();
+        assert_eq!(transfer_data.to, user2.clone());
+        assert_eq!(transfer_data.amount, 300);
     }
 
     #[test]
@@ -549,14 +546,9 @@ mod test {
             )
                 .into_val(&env)
         );
-        assert_eq!(
-            last_event.2,
-            ApproveEventData {
-                spender: user2.clone(),
-                amount: 500
-            }
-            .into_val(&env)
-        );
+        let approve_data = ApproveEventData::try_from_val(&env, &last_event.2).unwrap();
+        assert_eq!(approve_data.spender, user2.clone());
+        assert_eq!(approve_data.amount, 500);
 
         client.transfer_from(&user2, &user1, &user2, &200);
         assert_eq!(client.balance(&user1), 800);
@@ -576,14 +568,9 @@ mod test {
             )
                 .into_val(&env)
         );
-        assert_eq!(
-            last_event.2,
-            TransferEventData {
-                to: user2.clone(),
-                amount: 200
-            }
-            .into_val(&env)
-        );
+        let transfer_from_data = TransferEventData::try_from_val(&env, &last_event.2).unwrap();
+        assert_eq!(transfer_from_data.to, user2.clone());
+        assert_eq!(transfer_from_data.amount, 200);
     }
 
     #[test]

@@ -1,8 +1,8 @@
 #![no_std]
 
 use soroban_sdk::{
-    contract, contractimpl, contracttype, symbol_short, Address, Bytes, BytesN, Env, IntoVal,
-    Map, Symbol, TryFromVal, Val,
+    contract, contractimpl, contracttype, symbol_short, Address, Bytes, BytesN, Env, Map, Symbol,
+    TryFromVal, Val,
 };
 
 #[contracttype]
@@ -107,7 +107,9 @@ impl ProposalTemplatesContract {
             created_at: env.ledger().timestamp(),
         };
 
-        env.storage().instance().set(&DataKey::ProposalCount, &count);
+        env.storage()
+            .instance()
+            .set(&DataKey::ProposalCount, &count);
         env.storage()
             .persistent()
             .set(&DataKey::Proposal(count), &record);
@@ -157,7 +159,7 @@ impl ProposalTemplatesContract {
     fn expected_schema_hash(env: &Env, template_type: &TemplateType) -> BytesN<32> {
         let schema = Self::schema_descriptor(template_type);
         let bytes = Bytes::from_slice(env, schema.as_bytes());
-        env.crypto().sha256(&bytes)
+        env.crypto().sha256(&bytes).into()
     }
 
     fn schema_descriptor(template_type: &TemplateType) -> &'static str {
@@ -168,9 +170,7 @@ impl ProposalTemplatesContract {
             TemplateType::UpdateAdmin => "UpdateAdmin:new_admin:Address",
             TemplateType::UpdateKycRequirement => "UpdateKycRequirement:kyc_required:bool",
             TemplateType::UpdateVelocityLimit => "UpdateVelocityLimit:velocity_limit:i128",
-            TemplateType::TreasuryAllocation => {
-                "TreasuryAllocation:recipient:Address,amount:i128"
-            }
+            TemplateType::TreasuryAllocation => "TreasuryAllocation:recipient:Address,amount:i128",
         }
     }
 
@@ -242,6 +242,7 @@ mod tests {
 
     use super::*;
     use soroban_sdk::testutils::Address as _;
+    use soroban_sdk::IntoVal;
 
     fn setup() -> (Env, Address, ProposalTemplatesContractClient<'static>) {
         let env = Env::default();
@@ -263,9 +264,7 @@ mod tests {
             TemplateType::UpdateAdmin => "UpdateAdmin:new_admin:Address",
             TemplateType::UpdateKycRequirement => "UpdateKycRequirement:kyc_required:bool",
             TemplateType::UpdateVelocityLimit => "UpdateVelocityLimit:velocity_limit:i128",
-            TemplateType::TreasuryAllocation => {
-                "TreasuryAllocation:recipient:Address,amount:i128"
-            }
+            TemplateType::TreasuryAllocation => "TreasuryAllocation:recipient:Address,amount:i128",
         };
 
         let bytes = Bytes::from_slice(env, descriptor.as_bytes());

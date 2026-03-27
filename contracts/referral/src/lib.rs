@@ -1,8 +1,6 @@
 #![no_std]
 
-use soroban_sdk::{
-    contract, contractimpl, contracttype, symbol_short, Address, Env, IntoVal, Symbol,
-};
+use soroban_sdk::{contract, contractimpl, contracttype, Address, Env, IntoVal, Symbol};
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -171,9 +169,13 @@ impl ReferralContract {
             .get(&DataKey::MNTToken)
             .expect("Token not set");
 
-        // Call MNT Token to mint rewards.
-        let client = mentorminds_mnt_token::MNTTokenClient::new(&env, &mnt_token);
-        client.mint(&referrer, &pending);
+        // Call MNT token `mint(Address, i128)` without linking the token contract crate,
+        // which avoids duplicate exported symbols during wasm linking.
+        env.invoke_contract::<()>(
+            &mnt_token,
+            &Symbol::new(&env, "mint"),
+            (referrer.clone(), pending).into_val(&env),
+        );
 
         env.storage()
             .persistent()
@@ -216,9 +218,8 @@ mod test {
     extern crate std;
     use super::*;
     use mentorminds_mnt_token::{MNTToken, MNTTokenClient};
-    use soroban_sdk::testutils::Address as _;
     use soroban_sdk::testutils::{Address as _, Events};
-    use soroban_sdk::{IntoVal, Symbol};
+    use soroban_sdk::{IntoVal, Symbol, TryFromVal};
 
     struct TestFixture {
         env: Env,
@@ -289,13 +290,14 @@ mod test {
             )
                 .into_val(&f.env)
         );
+        let payload = ReferralRegisteredEventData::try_from_val(&f.env, &last_event.2)
+            .expect("registered payload should decode");
         assert_eq!(
-            last_event.2,
+            payload,
             ReferralRegisteredEventData {
                 referee: referee.clone(),
-                is_mentor: true
+                is_mentor: true,
             }
-            .into_val(&f.env)
         );
 
         // Fulfill referral as admin
@@ -319,12 +321,13 @@ mod test {
             )
                 .into_val(&f.env)
         );
+        let payload2 = RewardClaimedEventData::try_from_val(&f.env, &last_event2.2)
+            .expect("reward payload should decode");
         assert_eq!(
-            last_event2.2,
+            payload2,
             RewardClaimedEventData {
-                amount: REWARD_MENTOR
+                amount: REWARD_MENTOR,
             }
-            .into_val(&f.env)
         );
     }
 

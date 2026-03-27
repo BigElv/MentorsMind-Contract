@@ -110,10 +110,10 @@ impl GovernanceContract {
         env.storage().persistent().set(&ADMIN, &admin);
         env.storage().persistent().set(&TOKEN, &mnt_token);
 
-        env.storage().persistent().set(&SNAPSHOT, &snapshot_contract);
         env.storage()
             .persistent()
-            .set(&VOTING_PERIOD_SECS, &period);
+            .set(&SNAPSHOT, &snapshot_contract);
+        env.storage().persistent().set(&VOTING_PERIOD_SECS, &period);
 
         env.storage().persistent().set(&VOTING_PERIOD_SECS, &period);
 
@@ -149,7 +149,11 @@ impl GovernanceContract {
             .get(&VOTING_PERIOD_SECS)
             .unwrap_or(DEFAULT_VOTING_PERIOD_SECS);
 
-        let snapshot_contract: Address = env.storage().persistent().get(&SNAPSHOT).expect("snapshot not set");
+        let snapshot_contract: Address = env
+            .storage()
+            .persistent()
+            .get(&SNAPSHOT)
+            .expect("snapshot not set");
         env.invoke_contract::<()>(
             &snapshot_contract,
             &Symbol::new(&env, "record_snapshot"),
@@ -206,7 +210,11 @@ impl GovernanceContract {
             panic!("already voted");
         }
 
-        let snapshot_contract: Address = env.storage().persistent().get(&SNAPSHOT).expect("snapshot not set");
+        let snapshot_contract: Address = env
+            .storage()
+            .persistent()
+            .get(&SNAPSHOT)
+            .expect("snapshot not set");
         let weight: i128 = env.invoke_contract(
             &snapshot_contract,
             &Symbol::new(&env, "get_voting_power"),
@@ -351,7 +359,7 @@ impl GovernanceContract {
     }
 
     fn require_initialized(env: &Env) {
-        if !env.storage().instance().has(&ADMIN) {
+        if !env.storage().persistent().has(&ADMIN) {
             panic!("not initialized");
         }
     }
@@ -366,13 +374,12 @@ impl GovernanceContract {
         }
     }
 
+    #[allow(dead_code)]
     fn token_address(env: &Env) -> Address {
-        env.storage()
-            .instance()
-            .get(&TOKEN)
-            .expect("token not set")
+        env.storage().instance().get(&TOKEN).expect("token not set")
     }
 
+    #[allow(dead_code)]
     fn get_balance(env: &Env, addr: &Address) -> i128 {
         let token = Self::token_address(env);
         let fn_name = Symbol::new(env, "balance");
@@ -380,6 +387,7 @@ impl GovernanceContract {
         env.invoke_contract::<i128>(&token, &fn_name, args)
     }
 
+    #[allow(dead_code)]
     fn get_total_supply(env: &Env) -> i128 {
         let token = Self::token_address(env);
         let fn_name = Symbol::new(env, "total_supply");
@@ -390,9 +398,7 @@ impl GovernanceContract {
     fn apply_action(env: &Env, action: &ProposalAction) {
         match action {
             ProposalAction::UpdateFee(new_fee_bps) => {
-                env.storage()
-                    .instance()
-                    .set(&CURRENT_FEE_BPS, new_fee_bps);
+                env.storage().instance().set(&CURRENT_FEE_BPS, new_fee_bps);
             }
             ProposalAction::UpdateAutoRelease(new_delay) => {
                 env.storage()
@@ -463,18 +469,29 @@ mod tests {
     #[contractimpl]
     impl MockSnapshot {
         pub fn record_snapshot(env: Env, _id: u32) {
-            env.storage().persistent().set(&symbol_short!("TOT_SUP"), &1000i128);
+            env.storage()
+                .persistent()
+                .set(&symbol_short!("TOT_SUP"), &1000i128);
         }
         pub fn get_total_supply_at(env: Env, _id: u32) -> i128 {
-            env.storage().persistent().get(&symbol_short!("TOT_SUP")).unwrap_or(0)
+            env.storage()
+                .persistent()
+                .get(&symbol_short!("TOT_SUP"))
+                .unwrap_or(0)
         }
         pub fn get_voting_power(env: Env, _id: u32, voter: Address) -> i128 {
-            let token: Address = env.storage().persistent().get(&symbol_short!("TOKEN")).unwrap();
+            let token: Address = env
+                .storage()
+                .persistent()
+                .get(&symbol_short!("TOKEN"))
+                .unwrap();
             let args = vec![&env, voter.into_val(&env)];
             env.invoke_contract::<i128>(&token, &Symbol::new(&env, "balance"), args)
         }
         pub fn set_token(env: Env, token: Address) {
-            env.storage().persistent().set(&symbol_short!("TOKEN"), &token);
+            env.storage()
+                .persistent()
+                .set(&symbol_short!("TOKEN"), &token);
         }
     }
 
@@ -493,7 +510,13 @@ mod tests {
 
         let admin = Address::generate(&env);
         let voter = Address::generate(&env);
-        gov.initialize(&admin, &token_id, &snapshot_id, &Some(10u64), &Some(1_000u32));
+        gov.initialize(
+            &admin,
+            &token_id,
+            &snapshot_id,
+            &Some(10u64),
+            &Some(1_000u32),
+        );
         token.set_total_supply(&1_000i128);
         token.set_balance(&voter, &200i128);
 
@@ -531,7 +554,13 @@ mod tests {
 
         let admin = Address::generate(&env);
         let voter = Address::generate(&env);
-        gov.initialize(&admin, &token_id, &snapshot_id, &Some(10u64), &Some(1_000u32));
+        gov.initialize(
+            &admin,
+            &token_id,
+            &snapshot_id,
+            &Some(10u64),
+            &Some(1_000u32),
+        );
 
         token.set_total_supply(&10_000i128);
         token.set_balance(&voter, &100i128);
@@ -569,7 +598,13 @@ mod tests {
 
         let admin = Address::generate(&env);
         let voter = Address::generate(&env);
-        gov.initialize(&admin, &token_id, &snapshot_id, &Some(10u64), &Some(1_000u32));
+        gov.initialize(
+            &admin,
+            &token_id,
+            &snapshot_id,
+            &Some(10u64),
+            &Some(1_000u32),
+        );
         token.set_total_supply(&1_000i128);
         token.set_balance(&voter, &200i128);
 

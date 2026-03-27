@@ -35,8 +35,8 @@ pub enum DataKey {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum BountyStatus {
     Open,
-    Claimed,   // at least one learner has claimed
-    Verified,  // a claim was verified and reward released
+    Claimed,  // at least one learner has claimed
+    Verified, // a claim was verified and reward released
     Disputed,
     Refunded,
 }
@@ -140,9 +140,11 @@ impl BountyContract {
         env.storage()
             .persistent()
             .extend_ttl(&DataKey::Admin, TTL_THRESHOLD, TTL_BUMP);
-        env.storage()
-            .persistent()
-            .extend_ttl(&DataKey::VerificationContract, TTL_THRESHOLD, TTL_BUMP);
+        env.storage().persistent().extend_ttl(
+            &DataKey::VerificationContract,
+            TTL_THRESHOLD,
+            TTL_BUMP,
+        );
         env.storage()
             .persistent()
             .extend_ttl(&DataKey::BountyCount, TTL_THRESHOLD, TTL_BUMP);
@@ -259,9 +261,11 @@ impl BountyContract {
             env.storage()
                 .persistent()
                 .set(&DataKey::Bounty(bounty_id), &updated);
-            env.storage()
-                .persistent()
-                .extend_ttl(&DataKey::Bounty(bounty_id), TTL_THRESHOLD, TTL_BUMP);
+            env.storage().persistent().extend_ttl(
+                &DataKey::Bounty(bounty_id),
+                TTL_THRESHOLD,
+                TTL_BUMP,
+            );
         }
 
         env.storage().instance().extend_ttl(TTL_THRESHOLD, TTL_BUMP);
@@ -287,15 +291,12 @@ impl BountyContract {
             .persistent()
             .get(&DataKey::VerificationContract)
             .expect("Not initialized");
-        let is_verified: bool = env.invoke_contract(
-            &ver_contract,
-            &Symbol::new(&env, "is_verified"),
-            {
+        let is_verified: bool =
+            env.invoke_contract(&ver_contract, &Symbol::new(&env, "is_verified"), {
                 let mut args: Vec<Val> = Vec::new(&env);
                 args.push_back(mentor.clone().into_val(&env));
                 args
-            },
-        );
+            });
         if !is_verified {
             panic!("Mentor is not verified");
         }
@@ -435,7 +436,11 @@ impl BountyContract {
         }
 
         let token_client = token::Client::new(&env, &bounty.token);
-        token_client.transfer(&env.current_contract_address(), &bounty.poster, &bounty.reward);
+        token_client.transfer(
+            &env.current_contract_address(),
+            &bounty.poster,
+            &bounty.reward,
+        );
 
         bounty.status = BountyStatus::Refunded;
         env.storage()
@@ -542,9 +547,11 @@ mod test {
                 env.storage()
                     .persistent()
                     .set(&TokenKey::Balance(to.clone()), &(bal + amount));
-                env.storage()
-                    .persistent()
-                    .extend_ttl(&TokenKey::Balance(to), TTL_THRESHOLD, TTL_BUMP);
+                env.storage().persistent().extend_ttl(
+                    &TokenKey::Balance(to),
+                    TTL_THRESHOLD,
+                    TTL_BUMP,
+                );
                 env.storage().instance().extend_ttl(TTL_THRESHOLD, TTL_BUMP);
             }
 
@@ -560,9 +567,11 @@ mod test {
                 env.storage()
                     .persistent()
                     .set(&TokenKey::Balance(from.clone()), &(from_bal - amount));
-                env.storage()
-                    .persistent()
-                    .extend_ttl(&TokenKey::Balance(from), TTL_THRESHOLD, TTL_BUMP);
+                env.storage().persistent().extend_ttl(
+                    &TokenKey::Balance(from),
+                    TTL_THRESHOLD,
+                    TTL_BUMP,
+                );
                 let to_bal: i128 = env
                     .storage()
                     .persistent()
@@ -571,9 +580,11 @@ mod test {
                 env.storage()
                     .persistent()
                     .set(&TokenKey::Balance(to.clone()), &(to_bal + amount));
-                env.storage()
-                    .persistent()
-                    .extend_ttl(&TokenKey::Balance(to), TTL_THRESHOLD, TTL_BUMP);
+                env.storage().persistent().extend_ttl(
+                    &TokenKey::Balance(to),
+                    TTL_THRESHOLD,
+                    TTL_BUMP,
+                );
                 env.storage().instance().extend_ttl(TTL_THRESHOLD, TTL_BUMP);
             }
         }
@@ -779,10 +790,16 @@ mod test {
 
         // Bump all contract instance TTLs before advancing time
         f.env.as_contract(&f.token_id, || {
-            f.env.storage().instance().extend_ttl(TTL_THRESHOLD, TTL_BUMP);
+            f.env
+                .storage()
+                .instance()
+                .extend_ttl(TTL_THRESHOLD, TTL_BUMP);
         });
         f.env.as_contract(&f.bounty_id, || {
-            f.env.storage().instance().extend_ttl(TTL_THRESHOLD, TTL_BUMP);
+            f.env
+                .storage()
+                .instance()
+                .extend_ttl(TTL_THRESHOLD, TTL_BUMP);
         });
 
         // Advance time past deadline; keep sequence within TTL_BUMP range

@@ -1,7 +1,8 @@
 #![no_std]
 
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, symbol_short, Address, BytesN, Env, Symbol, Vec,
+    contract, contracterror, contractimpl, contracttype, symbol_short, Address, BytesN, Env,
+    Symbol, Vec,
 };
 
 // ---------------------------------------------------------------------------
@@ -146,11 +147,7 @@ impl UpgradeRegistryContract {
             .set(&DataKey::Subscribers(contract_name.clone()), &subscribers);
 
         env.events().publish(
-            (
-                symbol_short!("sub"),
-                symbol_short!("added"),
-                contract_name,
-            ),
+            (symbol_short!("sub"), symbol_short!("added"), contract_name),
             subscriber,
         );
 
@@ -182,9 +179,10 @@ impl UpgradeRegistryContract {
             return Err(Error::NotSubscribed);
         }
 
-        env.storage()
-            .persistent()
-            .set(&DataKey::Subscribers(contract_name.clone()), &new_subscribers);
+        env.storage().persistent().set(
+            &DataKey::Subscribers(contract_name.clone()),
+            &new_subscribers,
+        );
 
         env.events().publish(
             (
@@ -233,7 +231,12 @@ mod test {
     use soroban_sdk::testutils::Address as _;
     use soroban_sdk::Env;
 
-    fn setup() -> (Env, Address, Address, UpgradeRegistryContractClient<'static>) {
+    fn setup() -> (
+        Env,
+        Address,
+        Address,
+        UpgradeRegistryContractClient<'static>,
+    ) {
         let env = Env::default();
         env.mock_all_auths();
 

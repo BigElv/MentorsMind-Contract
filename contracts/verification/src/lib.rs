@@ -32,22 +32,6 @@ pub struct VerificationRevokedEventData {
     pub revoked: bool,
 }
 
-#[contracttype]
-#[derive(Clone)]
-pub enum DataKey {
-    Admin,
-    Verification(Address),
-    Tier(Address),
-}
-
-#[contracttype]
-#[derive(Clone)]
-pub enum DataKey {
-    Admin,
-    Verification(Address),
-    Tier(Address),
-}
-
 #[contract]
 pub struct VerificationContract;
 
@@ -97,7 +81,11 @@ impl VerificationContract {
             env.storage().persistent().set(&tkey, &0i32);
         }
         env.events().publish(
-            (symbol_short!("Verify"), symbol_short!("VrfyOk"), mentor.clone()),
+            (
+                symbol_short!("Verify"),
+                symbol_short!("VrfyOk"),
+                mentor.clone(),
+            ),
             MentorVerifiedEventData {
                 credential_hash: rec.credential_hash.clone(),
                 verified_at: rec.verified_at,
@@ -129,7 +117,11 @@ impl VerificationContract {
         rec.is_active = false;
         env.storage().persistent().set(&key, &rec);
         env.events().publish(
-            (symbol_short!("Verify"), symbol_short!("Revoke"), mentor.clone()),
+            (
+                symbol_short!("Verify"),
+                symbol_short!("Revoke"),
+                mentor.clone(),
+            ),
             VerificationRevokedEventData { revoked: true },
         );
     }

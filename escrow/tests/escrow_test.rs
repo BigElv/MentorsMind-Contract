@@ -1,6 +1,6 @@
 #![cfg(test)]
 
-use mentorminds_escrow::{EscrowContract, EscrowContractClient, EscrowParams, EscrowStatus};
+use mentorminds_escrow::{EscrowContract, EscrowContractClient, EscrowStatus};
 use soroban_sdk::{
     symbol_short,
     testutils::{Address as _, Ledger},
@@ -64,6 +64,7 @@ impl TestFixture {
             &fee_bps,
             &approved,
             &auto_release_delay_secs,
+            &None,
         );
 
         TestFixture {
@@ -87,16 +88,15 @@ impl TestFixture {
     }
 
     fn create_escrow_at(&self, amount: i128, session_end_time: u64, session_id: &str) -> u64 {
-        let params = EscrowParams {
-            mentor: self.mentor.clone(),
-            learner: self.learner.clone(),
-            amount,
-            session_id: Symbol::new(&self.env, session_id),
-            token_address: self.token_address.clone(),
-            session_end_time,
-            total_sessions: 1,
-        };
-        self.client().create_escrow(&params)
+        self.client().create_escrow(
+            &self.mentor,
+            &self.learner,
+            &amount,
+            &Symbol::new(&self.env, session_id),
+            &self.token_address,
+            &session_end_time,
+            &1u32,
+        )
     }
 
     fn create_package_escrow_at(
@@ -106,16 +106,15 @@ impl TestFixture {
         session_id: &str,
         total_sessions: u32,
     ) -> u64 {
-        let params = EscrowParams {
-            mentor: self.mentor.clone(),
-            learner: self.learner.clone(),
-            amount,
-            session_id: Symbol::new(&self.env, session_id),
-            token_address: self.token_address.clone(),
-            session_end_time,
-            total_sessions,
-        };
-        self.client().create_escrow(&params)
+        self.client().create_escrow(
+            &self.mentor,
+            &self.learner,
+            &amount,
+            &Symbol::new(&self.env, session_id),
+            &self.token_address,
+            &session_end_time,
+            &total_sessions,
+        )
     }
 
     fn open_dispute(&self, escrow_id: u64) {
@@ -298,7 +297,15 @@ fn test_query_by_mentor_pagination() {
     // Create 5 escrows for the same mentor
     for i in 0..5 {
         let session_id = Symbol::new(&f.env, &format!("S{}", i));
-        f.client().create_escrow(&mentor, &learner, &1_000, &session_id, &f.token_address, &0, &1u32);
+        f.client().create_escrow(
+            &mentor,
+            &learner,
+            &1_000,
+            &session_id,
+            &f.token_address,
+            &0,
+            &1u32,
+        );
     }
 
     // Page 0, size 2 -> should return 2 escrows (ids 1, 2)
@@ -335,7 +342,15 @@ fn test_query_by_learner_pagination() {
     // Create 3 escrows for the same learner
     for i in 0..3 {
         let session_id = Symbol::new(&f.env, &format!("L{}", i));
-        f.client().create_escrow(&mentor, &learner, &1_000, &session_id, &f.token_address, &0, &1u32);
+        f.client().create_escrow(
+            &mentor,
+            &learner,
+            &1_000,
+            &session_id,
+            &f.token_address,
+            &0,
+            &1u32,
+        );
     }
 
     // Page 0, size 2 -> 2 escrows
@@ -368,14 +383,14 @@ fn test_query_by_status() {
     assert!(vec_has_u64(&active_ids, id1));
     assert!(vec_has_u64(&active_ids, id2));
     assert!(vec_has_u64(&active_ids, id3));
-    
+
     // Release one
     f.client().release_funds(&f.learner, &id1);
 
     let active_ids2 = f.client().get_escrows_by_status(&EscrowStatus::Active);
     assert_eq!(active_ids2.len(), 2);
     assert!(!vec_has_u64(&active_ids2, id1));
-    
+
     let released_ids = f.client().get_escrows_by_status(&EscrowStatus::Released);
     assert_eq!(released_ids.len(), 1);
     assert!(vec_has_u64(&released_ids, id1));
@@ -390,7 +405,15 @@ fn test_page_size_cap() {
     // Create 60 escrows
     for i in 0..60 {
         let session_id = Symbol::new(&f.env, &format!("S{}", i));
-        f.client().create_escrow(&mentor, &learner, &100, &session_id, &f.token_address, &0, &1u32);
+        f.client().create_escrow(
+            &mentor,
+            &learner,
+            &100,
+            &session_id,
+            &f.token_address,
+            &0,
+            &1u32,
+        );
     }
 
     // Try to get 100 per page, should be capped at 50

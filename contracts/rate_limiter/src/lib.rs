@@ -112,11 +112,7 @@ impl RateLimiterContract {
         }
 
         // Within current window - check and increment counter
-        let current_count: u32 = env
-            .storage()
-            .temporary()
-            .get(&call_count_key)
-            .unwrap_or(0);
+        let current_count: u32 = env.storage().temporary().get(&call_count_key).unwrap_or(0);
 
         if current_count >= max_calls {
             // Rate limit exceeded - emit event
@@ -216,9 +212,7 @@ impl RateLimiterContract {
 
     /// Check if an address is whitelisted.
     pub fn is_whitelisted(env: Env, address: Address) -> bool {
-        env.storage()
-            .instance()
-            .has(&DataKey::Whitelist(address))
+        env.storage().instance().has(&DataKey::Whitelist(address))
     }
 }
 

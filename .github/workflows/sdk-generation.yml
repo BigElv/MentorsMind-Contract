@@ -32,7 +32,7 @@ jobs:
           target: wasm32-unknown-unknown
 
       - name: Build Contracts
-        run: cargo build --workspace --target wasm32-unknown-unknown --release
+        run: cargo build --workspace --target wasm32-unknown-unknown --release --exclude mentorminds-integration-tests
 
       - name: Install Stellar CLI
         run: |
