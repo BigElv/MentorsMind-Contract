@@ -179,12 +179,12 @@ impl CreditScoreContract {
         // 1. Fetch historical data from Escrow
         let mentor_list: Vec<Escrow> = env.invoke_contract(
             &escrow_addr,
-            &symbol_short!("mentor"),
+            &soroban_sdk::Symbol::new(&env, "get_escrows_by_mentor"),
             (user.clone(), 0u32, 50u32).into_val(&env),
         );
         let learner_list: Vec<Escrow> = env.invoke_contract(
             &escrow_addr,
-            &symbol_short!("learner"),
+            &soroban_sdk::Symbol::new(&env, "get_escrows_by_learner"),
             (user.clone(), 0u32, 50u32).into_val(&env),
         );
 

@@ -31,7 +31,7 @@ pub struct StakeRecord {
     pub amount: i128,
     pub staked_at: u64,
     pub unlock_at: u64,
-    pub tier: u8,
+    pub tier: u32,
 }
 
 // ---------------------------------------------------------------------------
@@ -44,7 +44,7 @@ pub struct StakedEventData {
     pub mentor: Address,
     pub amount: i128,
     pub unlock_at: u64,
-    pub tier: u8,
+    pub tier: u32,
 }
 
 #[contracttype]
@@ -77,7 +77,7 @@ const TIER_BRONZE: i128 = 100;
 const TIER_SILVER: i128 = 500;
 const TIER_GOLD: i128 = 2_000;
 
-fn compute_tier(amount: i128) -> u8 {
+fn compute_tier(amount: i128) -> u32 {
     if amount >= TIER_GOLD {
         3
     } else if amount >= TIER_SILVER {
@@ -274,7 +274,7 @@ impl StakingContract {
 
     /// Return the tier for a mentor.
     /// 0 = None, 1 = Bronze, 2 = Silver, 3 = Gold
-    pub fn get_tier(env: Env, mentor: Address) -> u8 {
+    pub fn get_tier(env: Env, mentor: Address) -> u32 {
         env.storage()
             .persistent()
             .get::<DataKey, StakeRecord>(&DataKey::Stake(mentor))
@@ -371,9 +371,7 @@ mod test {
             let mnt_id = env.register_contract(None, MockMNT);
 
             let staking_id = env.register_contract(None, StakingContract);
-            StakingContractClient::new(&env, &staking_id)
-                .initialize(&admin, &mnt_id)
-                .unwrap();
+            StakingContractClient::new(&env, &staking_id).initialize(&admin, &mnt_id);
 
             Fixture {
                 env,
@@ -406,10 +404,10 @@ mod test {
         let mentor = Address::generate(&f.env);
         f.fund(&mentor, 50);
 
-        f.client().stake(&mentor, &50, &30).unwrap();
+        f.client().stake(&mentor, &50, &30);
 
         assert_eq!(f.client().get_tier(&mentor), 0);
-        let record = f.client().get_stake(&mentor).unwrap();
+        let record = f.client().get_stake(&mentor);
         assert_eq!(record.amount, 50);
         assert_eq!(record.tier, 0);
     }
@@ -420,7 +418,7 @@ mod test {
         let mentor = Address::generate(&f.env);
         f.fund(&mentor, 100);
 
-        f.client().stake(&mentor, &100, &30).unwrap();
+        f.client().stake(&mentor, &100, &30);
 
         assert_eq!(f.client().get_tier(&mentor), 1);
     }
@@ -431,7 +429,7 @@ mod test {
         let mentor = Address::generate(&f.env);
         f.fund(&mentor, 500);
 
-        f.client().stake(&mentor, &500, &30).unwrap();
+        f.client().stake(&mentor, &500, &30);
 
         assert_eq!(f.client().get_tier(&mentor), 2);
     }
@@ -442,7 +440,7 @@ mod test {
         let mentor = Address::generate(&f.env);
         f.fund(&mentor, 2_000);
 
-        f.client().stake(&mentor, &2_000, &30).unwrap();
+        f.client().stake(&mentor, &2_000, &30);
 
         assert_eq!(f.client().get_tier(&mentor), 3);
     }
@@ -455,9 +453,9 @@ mod test {
         let mentor = Address::generate(&f.env);
         f.fund(&mentor, 500);
 
-        f.client().stake(&mentor, &500, &10).unwrap();
+        f.client().stake(&mentor, &500, &10);
 
-        let record = f.client().get_stake(&mentor).unwrap();
+        let record = f.client().get_stake(&mentor);
         // 10 days * 86400 seconds
         assert_eq!(record.unlock_at, 1_000_000 + 10 * 86_400);
     }
@@ -468,7 +466,7 @@ mod test {
         let mentor = Address::generate(&f.env);
         f.fund(&mentor, 1_000);
 
-        f.client().stake(&mentor, &1_000, &30).unwrap();
+        f.client().stake(&mentor, &1_000, &30);
 
         assert_eq!(f.mnt().balance(&mentor), 0);
         assert_eq!(f.mnt().balance(&f.staking_id), 1_000);
@@ -480,7 +478,7 @@ mod test {
         let mentor = Address::generate(&f.env);
         f.fund(&mentor, 2_000);
 
-        f.client().stake(&mentor, &500, &30).unwrap();
+        f.client().stake(&mentor, &500, &30);
 
         let result = f.client().try_stake(&mentor, &500, &30);
         assert_eq!(result, Err(Ok(Error::AlreadyStaked)));
@@ -507,12 +505,12 @@ mod test {
         let mentor = Address::generate(&f.env);
         f.fund(&mentor, 500);
 
-        f.client().stake(&mentor, &500, &30).unwrap();
+        f.client().stake(&mentor, &500, &30);
 
         // Advance past lock period
         f.env.ledger().set_timestamp(30 * 86_400 + 1);
 
-        f.client().unstake(&mentor).unwrap();
+        f.client().unstake(&mentor);
 
         assert_eq!(f.mnt().balance(&mentor), 500);
         assert_eq!(f.mnt().balance(&f.staking_id), 0);
@@ -530,7 +528,7 @@ mod test {
         let mentor = Address::generate(&f.env);
         f.fund(&mentor, 500);
 
-        f.client().stake(&mentor, &500, &30).unwrap();
+        f.client().stake(&mentor, &500, &30);
 
         // Only 1 day has passed — still locked
         f.env.ledger().set_timestamp(86_400);

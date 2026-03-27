@@ -1,7 +1,5 @@
 #![no_std]
-use soroban_sdk::{
-    contract, contractimpl, contracttype, symbol_short, Address, Env, Symbol, Vec,
-};
+use soroban_sdk::{contract, contractimpl, contracttype, symbol_short, Address, Env, Symbol, Vec};
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -18,7 +16,7 @@ pub struct BundleNFT {
 #[contracttype]
 pub enum DataKey {
     TokenIdCounter,
-    Bundle(u64), // token_id -> BundleNFT
+    Bundle(u64),           // token_id -> BundleNFT
     OwnerBundles(Address), // owner -> Vec<u64>
 }
 
@@ -41,9 +39,15 @@ impl SessionBundleNFT {
     ) -> u64 {
         learner.require_auth();
 
-        let mut token_id: u64 = env.storage().persistent().get(&DataKey::TokenIdCounter).unwrap_or(0);
+        let mut token_id: u64 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::TokenIdCounter)
+            .unwrap_or(0);
         token_id += 1;
-        env.storage().persistent().set(&DataKey::TokenIdCounter, &token_id);
+        env.storage()
+            .persistent()
+            .set(&DataKey::TokenIdCounter, &token_id);
 
         let bundle = BundleNFT {
             token_id,
@@ -55,7 +59,9 @@ impl SessionBundleNFT {
             transferable: true, // Mark as transferable by default as per requirement
         };
 
-        env.storage().persistent().set(&DataKey::Bundle(token_id), &bundle);
+        env.storage()
+            .persistent()
+            .set(&DataKey::Bundle(token_id), &bundle);
 
         let mut owner_bundles: Vec<u64> = env
             .storage()
@@ -63,7 +69,9 @@ impl SessionBundleNFT {
             .get(&DataKey::OwnerBundles(learner.clone()))
             .unwrap_or(Vec::new(&env));
         owner_bundles.push_back(token_id);
-        env.storage().persistent().set(&DataKey::OwnerBundles(learner.clone()), &owner_bundles);
+        env.storage()
+            .persistent()
+            .set(&DataKey::OwnerBundles(learner.clone()), &owner_bundles);
 
         // Emit minted event
         env.events().publish(
@@ -107,7 +115,9 @@ impl SessionBundleNFT {
                 new_from_bundles.push_back(id);
             }
         }
-        env.storage().persistent().set(&DataKey::OwnerBundles(from.clone()), &new_from_bundles);
+        env.storage()
+            .persistent()
+            .set(&DataKey::OwnerBundles(from.clone()), &new_from_bundles);
 
         // Add to new owner's list
         let mut to_bundles: Vec<u64> = env
@@ -116,11 +126,15 @@ impl SessionBundleNFT {
             .get(&DataKey::OwnerBundles(to.clone()))
             .unwrap_or(Vec::new(&env));
         to_bundles.push_back(token_id);
-        env.storage().persistent().set(&DataKey::OwnerBundles(to.clone()), &to_bundles);
+        env.storage()
+            .persistent()
+            .set(&DataKey::OwnerBundles(to.clone()), &to_bundles);
 
         // Update bundle owner
         bundle.owner = to.clone();
-        env.storage().persistent().set(&DataKey::Bundle(token_id), &bundle);
+        env.storage()
+            .persistent()
+            .set(&DataKey::Bundle(token_id), &bundle);
 
         // Emit transferred event
         env.events().publish(
@@ -155,7 +169,9 @@ impl SessionBundleNFT {
         }
 
         bundle.sessions_remaining -= 1;
-        env.storage().persistent().set(&DataKey::Bundle(token_id), &bundle);
+        env.storage()
+            .persistent()
+            .set(&DataKey::Bundle(token_id), &bundle);
 
         // Emit redeemed event
         env.events().publish(
@@ -165,7 +181,11 @@ impl SessionBundleNFT {
 
         // Create session in registry (conceptual, emitted as event)
         env.events().publish(
-            (symbol_short!("registry"), symbol_short!("session"), bundle.mentor.clone()),
+            (
+                symbol_short!("registry"),
+                symbol_short!("session"),
+                bundle.mentor.clone(),
+            ),
             (holder, env.ledger().timestamp()),
         );
     }
@@ -194,7 +214,10 @@ impl SessionBundleNFT {
         }
 
         // Remove from owner's list
-        let owner_bundles_res: Option<Vec<u64>> = env.storage().persistent().get(&DataKey::OwnerBundles(holder.clone()));
+        let owner_bundles_res: Option<Vec<u64>> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::OwnerBundles(holder.clone()));
         if let Some(owner_bundles) = owner_bundles_res {
             let mut new_owner_bundles = Vec::new(&env);
             for id in owner_bundles.iter() {
@@ -202,11 +225,15 @@ impl SessionBundleNFT {
                     new_owner_bundles.push_back(id);
                 }
             }
-            env.storage().persistent().set(&DataKey::OwnerBundles(holder.clone()), &new_owner_bundles);
+            env.storage()
+                .persistent()
+                .set(&DataKey::OwnerBundles(holder.clone()), &new_owner_bundles);
         }
 
         // Delete bundle
-        env.storage().persistent().remove(&DataKey::Bundle(token_id));
+        env.storage()
+            .persistent()
+            .remove(&DataKey::Bundle(token_id));
 
         // Emit burned event
         env.events().publish(
@@ -233,7 +260,11 @@ impl SessionBundleNFT {
 
         let mut bundles = Vec::new(&env);
         for id in owner_bundles_ids.iter() {
-            if let Some(bundle) = env.storage().persistent().get::<DataKey, BundleNFT>(&DataKey::Bundle(id)) {
+            if let Some(bundle) = env
+                .storage()
+                .persistent()
+                .get::<DataKey, BundleNFT>(&DataKey::Bundle(id))
+            {
                 bundles.push_back(bundle);
             }
         }
@@ -354,9 +385,12 @@ mod test {
         client.redeem(&learner, &token_id);
 
         client.burn(&learner, &token_id);
-        
+
         assert_eq!(client.get_bundles_by_owner(&learner).len(), 0);
-        let res = env.storage().persistent().get::<DataKey, BundleNFT>(&DataKey::Bundle(token_id));
+        let res = env
+            .storage()
+            .persistent()
+            .get::<DataKey, BundleNFT>(&DataKey::Bundle(token_id));
         assert!(res.is_none());
     }
 
