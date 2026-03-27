@@ -24,6 +24,8 @@ members = [
     "contracts/rate_limiter",
     "contracts/performance_bond",
     "contracts/health_dashboard",
+    "contracts/reputation",
+    "contracts/session_registry",
     "tests",
 ]
 
