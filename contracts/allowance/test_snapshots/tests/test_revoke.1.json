@@ -292,7 +292,7 @@
                 "symbol": "allowance"
               },
               {
-                "symbol": "auth"
+                "symbol": "authorized"
               },
               {
                 "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHK3M"
@@ -487,7 +487,7 @@
             "data": {
               "vec": [
                 {
-                  "string": "caught panic 'allowance not found' from contract function 'Symbol(obj#55)'"
+                  "string": "caught panic 'allowance not found' from contract function 'Symbol(obj#57)'"
                 },
                 {
                   "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHK3M"

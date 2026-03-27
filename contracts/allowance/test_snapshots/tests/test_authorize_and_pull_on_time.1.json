@@ -643,7 +643,7 @@
                 "symbol": "allowance"
               },
               {
-                "symbol": "auth"
+                "symbol": "authorized"
               },
               {
                 "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHK3M"
@@ -814,7 +814,7 @@
                 "symbol": "allowance"
               },
               {
-                "symbol": "pay_pull"
+                "symbol": "payment_pulled"
               },
               {
                 "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHK3M"
@@ -1086,7 +1086,7 @@
                 "symbol": "allowance"
               },
               {
-                "symbol": "pay_pull"
+                "symbol": "payment_pulled"
               },
               {
                 "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHK3M"

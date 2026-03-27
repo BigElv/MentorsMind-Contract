@@ -577,7 +577,7 @@
                 "symbol": "allowance"
               },
               {
-                "symbol": "auth"
+                "symbol": "authorized"
               },
               {
                 "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHK3M"
@@ -748,7 +748,7 @@
                 "symbol": "allowance"
               },
               {
-                "symbol": "pay_pull"
+                "symbol": "payment_pulled"
               },
               {
                 "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHK3M"
@@ -856,7 +856,7 @@
             "data": {
               "vec": [
                 {
-                  "string": "caught panic 'pull too early' from contract function 'Symbol(obj#109)'"
+                  "string": "caught panic 'pull too early' from contract function 'Symbol(obj#113)'"
                 },
                 {
                   "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAITA4"

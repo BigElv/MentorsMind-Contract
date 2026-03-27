@@ -121,7 +121,7 @@ impl VestingContract {
             total: total_amount,
             claimed: 0,
             cliff_end: schedule_start + cliff_seconds,
-            vesting_end: schedule_start + vesting_seconds,
+            vesting_end: schedule_start + cliff_seconds + vesting_seconds,
             start: schedule_start,
         };
 
@@ -188,8 +188,8 @@ impl VestingContract {
         }
 
         // Linear vesting between cliff and end
-        let vested_period = current_time - schedule.start;
-        let total_period = schedule.vesting_end - schedule.start;
+        let vested_period = current_time - schedule.cliff_end;
+        let total_period = schedule.vesting_end - schedule.cliff_end;
         let vested_amount = (schedule.total * vested_period as i128) / total_period as i128;
 
         vested_amount - schedule.claimed
@@ -274,8 +274,8 @@ impl VestingContract {
         } else if current_time >= schedule.vesting_end {
             schedule.total
         } else {
-            let vested_period = current_time - schedule.start;
-            let total_period = schedule.vesting_end - schedule.start;
+            let vested_period = current_time - schedule.cliff_end;
+            let total_period = schedule.vesting_end - schedule.cliff_end;
             (schedule.total * vested_period as i128) / total_period as i128
         };
 
@@ -355,10 +355,10 @@ impl VestingContract {
 
 #[cfg(test)]
 mod test {
-    extern crate std;
     use super::*;
-    use soroban_sdk::testutils::{Address as _, Events, Ledger, MockAuth, MockAuthInvoke};
-    use soroban_sdk::{vec, Env, IntoVal, String, Symbol};
+    use soroban_sdk::testutils::{Address as _, Ledger};
+    use soroban_sdk::token::TokenInterface;
+    use soroban_sdk::{Env, String};
 
     fn create_mock_token(env: &Env) -> Address {
         let token_contract_id = env.register_contract(None, MockToken);
@@ -389,13 +389,20 @@ mod test {
         let vesting_client = VestingContractClient::new(&env, &vesting_contract_id);
 
         vesting_client.initialize(&admin, &token);
+    }
 
-        // Should panic if initialized again
-        env.mock_all_auths();
-        let result = std::panic::catch_unwind(|| {
-            vesting_client.initialize(&admin, &token);
-        });
-        assert!(result.is_err());
+    #[test]
+    #[should_panic(expected = "Already initialized")]
+    fn test_initialize_twice_panics() {
+        let env = Env::default();
+        let admin = Address::generate(&env);
+        let token = Address::generate(&env);
+
+        let vesting_contract_id = env.register_contract(None, VestingContract);
+        let vesting_client = VestingContractClient::new(&env, &vesting_contract_id);
+
+        vesting_client.initialize(&admin, &token);
+        vesting_client.initialize(&admin, &token);
     }
 
     #[test]

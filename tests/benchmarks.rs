@@ -6,9 +6,7 @@ use soroban_sdk::{
     token::{Client as TokenClient, StellarAssetClient},
     IntoVal,
 };
-use mentorminds_escrow::{
-    Escrow, EscrowContract, EscrowContractClient, EscrowStatus,
-};
+use mentorminds_escrow::{Escrow, EscrowContract, EscrowContractClient, EscrowParams, EscrowStatus};
 
 // ============================================================================
 // Benchmark Infrastructure
@@ -122,25 +120,29 @@ fn benchmark_create_escrow() {
     let session_end_time = fixture.env.ledger().timestamp() + 3600;
 
     // Warm up
-    fixture.client.create_escrow(
-        &fixture.mentor,
-        &fixture.learner,
-        &1000,
-        &symbol_short!("sess1"),
-        &fixture.token_address,
-        &session_end_time,
-    );
+    let params_warmup = EscrowParams {
+        mentor: fixture.mentor.clone(),
+        learner: fixture.learner.clone(),
+        amount: 1000,
+        session_id: symbol_short!("sess1"),
+        token_address: fixture.token_address.clone(),
+        session_end_time,
+        total_sessions: 1,
+    };
+    fixture.client.create_escrow(&params_warmup);
 
     // Benchmark: create_escrow with token transfer
     let start_count = fixture.get_escrow_count();
-    fixture.client.create_escrow(
-        &fixture.mentor,
-        &fixture.learner,
-        &5000,
-        &symbol_short!("sess2"),
-        &fixture.token_address,
-        &session_end_time,
-    );
+    let params_bench = EscrowParams {
+        mentor: fixture.mentor.clone(),
+        learner: fixture.learner.clone(),
+        amount: 5000,
+        session_id: symbol_short!("sess2"),
+        token_address: fixture.token_address.clone(),
+        session_end_time,
+        total_sessions: 1,
+    };
+    fixture.client.create_escrow(&params_bench);
     let end_count = fixture.get_escrow_count();
 
     assert_eq!(end_count, start_count + 1, "Escrow counter should increment");
@@ -161,14 +163,16 @@ fn benchmark_release_funds_with_fee() {
     let session_end_time = fixture.env.ledger().timestamp() + 3600;
 
     // Create escrow
-    fixture.client.create_escrow(
-        &fixture.mentor,
-        &fixture.learner,
-        &10_000,
-        &symbol_short!("sess1"),
-        &fixture.token_address,
-        &session_end_time,
-    );
+    let params = EscrowParams {
+        mentor: fixture.mentor.clone(),
+        learner: fixture.learner.clone(),
+        amount: 10_000,
+        session_id: symbol_short!("sess1"),
+        token_address: fixture.token_address.clone(),
+        session_end_time,
+        total_sessions: 1,
+    };
+    fixture.client.create_escrow(&params);
 
     let escrow_id = fixture.get_escrow_count();
 
@@ -203,14 +207,16 @@ fn benchmark_get_escrows_by_mentor_100() {
     for i in 0..100 {
         let session_id = format!("sess{}", i);
         let session_sym = Symbol::new(&fixture.env, &session_id);
-        fixture.client.create_escrow(
-            &fixture.mentor,
-            &fixture.learner,
-            &1000,
-            &session_sym,
-            &fixture.token_address,
-            &session_end_time,
-        );
+        let params = EscrowParams {
+            mentor: fixture.mentor.clone(),
+            learner: fixture.learner.clone(),
+            amount: 1000,
+            session_id: session_sym,
+            token_address: fixture.token_address.clone(),
+            session_end_time,
+            total_sessions: 1,
+        };
+        fixture.client.create_escrow(&params);
     }
 
     // Benchmark: retrieve all escrows for mentor
@@ -234,14 +240,16 @@ fn benchmark_submit_review_cross_contract() {
     let session_end_time = fixture.env.ledger().timestamp() + 3600;
 
     // Create and release an escrow
-    fixture.client.create_escrow(
-        &fixture.mentor,
-        &fixture.learner,
-        &5000,
-        &symbol_short!("sess1"),
-        &fixture.token_address,
-        &session_end_time,
-    );
+    let params = EscrowParams {
+        mentor: fixture.mentor.clone(),
+        learner: fixture.learner.clone(),
+        amount: 5000,
+        session_id: symbol_short!("sess1"),
+        token_address: fixture.token_address.clone(),
+        session_end_time,
+        total_sessions: 1,
+    };
+    fixture.client.create_escrow(&params);
 
     let escrow_id = fixture.get_escrow_count();
     fixture.client.release_funds(&fixture.learner, &escrow_id);
@@ -267,14 +275,16 @@ fn benchmark_dispute() {
     let session_end_time = fixture.env.ledger().timestamp() + 3600;
 
     // Create escrow
-    fixture.client.create_escrow(
-        &fixture.mentor,
-        &fixture.learner,
-        &5000,
-        &symbol_short!("sess1"),
-        &fixture.token_address,
-        &session_end_time,
-    );
+    let params = EscrowParams {
+        mentor: fixture.mentor.clone(),
+        learner: fixture.learner.clone(),
+        amount: 5000,
+        session_id: symbol_short!("sess1"),
+        token_address: fixture.token_address.clone(),
+        session_end_time,
+        total_sessions: 1,
+    };
+    fixture.client.create_escrow(&params);
 
     let escrow_id = fixture.get_escrow_count();
 
@@ -301,14 +311,16 @@ fn benchmark_resolve_dispute_50_50() {
     let session_end_time = fixture.env.ledger().timestamp() + 3600;
 
     // Create escrow
-    fixture.client.create_escrow(
-        &fixture.mentor,
-        &fixture.learner,
-        &10_000,
-        &symbol_short!("sess1"),
-        &fixture.token_address,
-        &session_end_time,
-    );
+    let params = EscrowParams {
+        mentor: fixture.mentor.clone(),
+        learner: fixture.learner.clone(),
+        amount: 10_000,
+        session_id: symbol_short!("sess1"),
+        token_address: fixture.token_address.clone(),
+        session_end_time,
+        total_sessions: 1,
+    };
+    fixture.client.create_escrow(&params);
 
     let escrow_id = fixture.get_escrow_count();
 
@@ -338,14 +350,16 @@ fn benchmark_try_auto_release() {
     let session_end_time = fixture.env.ledger().timestamp() + 3600;
 
     // Create escrow with custom auto-release delay
-    fixture.client.create_escrow(
-        &fixture.mentor,
-        &fixture.learner,
-        &5000,
-        &symbol_short!("sess1"),
-        &fixture.token_address,
-        &session_end_time,
-    );
+    let params = EscrowParams {
+        mentor: fixture.mentor.clone(),
+        learner: fixture.learner.clone(),
+        amount: 5000,
+        session_id: symbol_short!("sess1"),
+        token_address: fixture.token_address.clone(),
+        session_end_time,
+        total_sessions: 1,
+    };
+    fixture.client.create_escrow(&params);
 
     let escrow_id = fixture.get_escrow_count();
 
@@ -375,14 +389,16 @@ fn benchmark_refund() {
     let session_end_time = fixture.env.ledger().timestamp() + 3600;
 
     // Create escrow
-    fixture.client.create_escrow(
-        &fixture.mentor,
-        &fixture.learner,
-        &5000,
-        &symbol_short!("sess1"),
-        &fixture.token_address,
-        &session_end_time,
-    );
+    let params = EscrowParams {
+        mentor: fixture.mentor.clone(),
+        learner: fixture.learner.clone(),
+        amount: 5000,
+        session_id: symbol_short!("sess1"),
+        token_address: fixture.token_address.clone(),
+        session_end_time,
+        total_sessions: 1,
+    };
+    fixture.client.create_escrow(&params);
 
     let escrow_id = fixture.get_escrow_count();
 

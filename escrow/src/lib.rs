@@ -18,14 +18,14 @@ use shared::StateMachine;
 impl StateMachine for EscrowStatus {
     type State = Self;
     fn is_valid_transition(_env: &Env, from: &Self::State, to: &Self::State) -> bool {
-        match (from, to) {
-            (EscrowStatus::Active, EscrowStatus::Released) => true,
-            (EscrowStatus::Active, EscrowStatus::Disputed) => true,
-            (EscrowStatus::Active, EscrowStatus::Refunded) => true,
-            (EscrowStatus::Disputed, EscrowStatus::Resolved) => true,
-            (EscrowStatus::Disputed, EscrowStatus::Refunded) => true,
-            _ => false,
-        }
+        matches!(
+            (from, to),
+            (EscrowStatus::Active, EscrowStatus::Released)
+                | (EscrowStatus::Active, EscrowStatus::Disputed)
+                | (EscrowStatus::Active, EscrowStatus::Refunded)
+                | (EscrowStatus::Disputed, EscrowStatus::Resolved)
+                | (EscrowStatus::Disputed, EscrowStatus::Refunded)
+        )
     }
 }
 
@@ -112,6 +112,18 @@ pub struct EscrowCreatedEventData {
     pub session_id: Symbol,
     pub token_address: Address,
     pub session_end_time: u64,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EscrowParams {
+    pub mentor: Address,
+    pub learner: Address,
+    pub amount: i128,
+    pub session_id: Symbol,
+    pub token_address: Address,
+    pub session_end_time: u64,
+    pub total_sessions: u32,
 }
 
 #[contracttype]
@@ -207,29 +219,20 @@ impl EscrowContract {
         Self::_set_token_approved(&env, &token_address, approved);
     }
 
-    pub fn create_escrow(
-        env: Env,
-        mentor: Address,
-        learner: Address,
-        amount: i128,
-        session_id: Symbol,
-        token_address: Address,
-        session_end_time: u64,
-        total_sessions: u32,
-    ) -> u64 {
+    pub fn create_escrow(env: Env, params: EscrowParams) -> u64 {
         Self::_create_escrow_internal(
             &env,
-            mentor,
-            learner,
-            amount,
-            session_id,
-            token_address.clone(),
-            session_end_time,
+            params.mentor,
+            params.learner,
+            params.amount,
+            params.session_id,
+            params.token_address.clone(),
+            params.session_end_time,
             0,
-            amount,
-            token_address.clone(),
-            token_address,
-            total_sessions,
+            params.amount,
+            params.token_address.clone(),
+            params.token_address,
+            params.total_sessions,
         )
     }
 
@@ -492,6 +495,12 @@ impl EscrowContract {
             .get(&DataKey::EscrowCount)
             .unwrap_or(0)
     }
+    pub fn get_auto_release_delay(env: Env) -> u64 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::AutoRelDelay)
+            .unwrap_or(DEFAULT_AUTO_RELEASE_DELAY)
+    }
     pub fn get_fee_bps(env: Env) -> u32 {
         env.storage()
             .persistent()
@@ -566,6 +575,7 @@ impl EscrowContract {
             .unwrap_or(Vec::new(&env))
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn _create_escrow_internal(
         env: &Env,
         mentor: Address,

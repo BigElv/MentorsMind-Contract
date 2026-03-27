@@ -13,10 +13,10 @@ use soroban_sdk::{
     symbol_short,
     testutils::{Address as _, Events, Ledger},
     token::{Client as TokenClient, StellarAssetClient},
-    Address, BytesN, Env, TryFromVal, Vec,
+    Address, BytesN, Env, Symbol, TryFromVal, Vec,
 };
 
-use mentorminds_escrow::{EscrowContract, EscrowContractClient, EscrowStatus};
+use mentorminds_escrow::{EscrowContract, EscrowContractClient, EscrowParams, EscrowStatus};
 use mentorminds_verification::{VerificationContract, VerificationContractClient};
 
 // ---------------------------------------------------------------------------
@@ -25,7 +25,9 @@ use mentorminds_verification::{VerificationContract, VerificationContractClient}
 
 /// Registers a Stellar Asset Contract and returns its address + SAC client.
 fn create_token<'a>(env: &'a Env, admin: &Address) -> (Address, StellarAssetClient<'a>) {
-    let addr = env.register_stellar_asset_contract(admin.clone());
+    let addr = env
+        .register_stellar_asset_contract_v2(admin.clone())
+        .address();
     (addr.clone(), StellarAssetClient::new(env, &addr))
 }
 
@@ -100,14 +102,18 @@ impl<'a> Fixture<'a> {
 
     fn create_escrow(&self, amount: i128) -> u64 {
         let now = self.env.ledger().timestamp();
-        self.escrow.create_escrow(
-            &self.mentor,
-            &self.learner,
-            &amount,
-            &symbol_short!("SES1"),
-            &self.token,
-            &now,
-        )
+        let count = self.escrow.get_escrow_count() + 1;
+        let session_id = Symbol::new(&self.env, &format!("SESS_{}", count));
+        let params = EscrowParams {
+            mentor: self.mentor.clone(),
+            learner: self.learner.clone(),
+            amount,
+            session_id,
+            token_address: self.token.clone(),
+            session_end_time: now,
+            total_sessions: 1,
+        };
+        self.escrow.create_escrow(&params)
     }
 }
 
@@ -290,10 +296,15 @@ fn test_event_order_full_lifecycle() {
         .filter_map(|(_, topics, _)| {
             // topics is a Vec<Val>; first element is the discriminant symbol
             let t: soroban_sdk::Vec<soroban_sdk::Val> = topics;
-            if t.len() >= 1 {
-                let first: soroban_sdk::Val = t.get(0).unwrap();
-                // Try to interpret as Symbol using TryFromVal trait
-                soroban_sdk::Symbol::try_from_val(&env, &first).ok()
+            if !t.is_empty() {
+                let first_val: soroban_sdk::Val = t.get(0).unwrap();
+                let first_sym = soroban_sdk::Symbol::try_from_val(&env, &first_val).ok();
+                if first_sym == Some(symbol_short!("Escrow")) && t.len() >= 2 {
+                    let second_val: soroban_sdk::Val = t.get(1).unwrap();
+                    soroban_sdk::Symbol::try_from_val(&env, &second_val).ok()
+                } else {
+                    first_sym
+                }
             } else {
                 None
             }
@@ -303,10 +314,10 @@ fn test_event_order_full_lifecycle() {
     // We expect at minimum a "created" event followed by a "released" event
     let created_pos = escrow_events
         .iter()
-        .position(|s| *s == symbol_short!("created"));
+        .position(|s| *s == symbol_short!("Created"));
     let released_pos = escrow_events
         .iter()
-        .position(|s| *s == symbol_short!("released"));
+        .position(|s| *s == symbol_short!("Released"));
 
     assert!(created_pos.is_some(), "must emit 'created' event");
     assert!(released_pos.is_some(), "must emit 'released' event");
@@ -428,14 +439,16 @@ fn test_staking_tier_verified_vs_unverified() {
     let tok = TokenClient::new(&env, &token);
 
     // Gold mentor session
-    let eid_gold = gold_escrow.create_escrow(
-        &mentor_gold,
-        &learner,
-        &10_000,
-        &symbol_short!("G1"),
-        &token,
-        &now,
-    );
+    let params_gold = EscrowParams {
+        mentor: mentor_gold.clone(),
+        learner: learner.clone(),
+        amount: 10_000,
+        session_id: symbol_short!("G1"),
+        token_address: token.clone(),
+        session_end_time: now,
+        total_sessions: 1,
+    };
+    let eid_gold = gold_escrow.create_escrow(&params_gold);
     let gold_mentor_before = tok.balance(&mentor_gold);
     let treasury_before = tok.balance(&treasury);
     gold_escrow.release_funds(&learner, &eid_gold);
@@ -444,14 +457,16 @@ fn test_staking_tier_verified_vs_unverified() {
 
     // Standard mentor session (unverified)
     assert!(!verif.is_verified(&mentor_std));
-    let eid_std = std_escrow.create_escrow(
-        &mentor_std,
-        &learner,
-        &10_000,
-        &symbol_short!("S1"),
-        &token,
-        &now,
-    );
+    let params_std = EscrowParams {
+        mentor: mentor_std.clone(),
+        learner: learner.clone(),
+        amount: 10_000,
+        session_id: symbol_short!("S1"),
+        token_address: token.clone(),
+        session_end_time: now,
+        total_sessions: 1,
+    };
+    let eid_std = std_escrow.create_escrow(&params_std);
     let std_mentor_before = tok.balance(&mentor_std);
     let treasury_before2 = tok.balance(&treasury);
     std_escrow.release_funds(&learner, &eid_std);
@@ -473,30 +488,38 @@ fn test_multiple_sessions_tracked_independently() {
     let now = env.ledger().timestamp();
 
     // Register three sessions
-    let eid1 = f.escrow.create_escrow(
-        &f.mentor,
-        &f.learner,
-        &1_000,
-        &symbol_short!("SES1"),
-        &f.token,
-        &now,
-    );
-    let eid2 = f.escrow.create_escrow(
-        &f.mentor,
-        &f.learner,
-        &2_000,
-        &symbol_short!("SES2"),
-        &f.token,
-        &now,
-    );
-    let eid3 = f.escrow.create_escrow(
-        &f.mentor,
-        &f.learner,
-        &3_000,
-        &symbol_short!("SES3"),
-        &f.token,
-        &now,
-    );
+    let params1 = EscrowParams {
+        mentor: f.mentor.clone(),
+        learner: f.learner.clone(),
+        amount: 1_000,
+        session_id: symbol_short!("SES1"),
+        token_address: f.token.clone(),
+        session_end_time: now,
+        total_sessions: 1,
+    };
+    let eid1 = f.escrow.create_escrow(&params1);
+
+    let params2 = EscrowParams {
+        mentor: f.mentor.clone(),
+        learner: f.learner.clone(),
+        amount: 2_000,
+        session_id: symbol_short!("SES2"),
+        token_address: f.token.clone(),
+        session_end_time: now,
+        total_sessions: 1,
+    };
+    let eid2 = f.escrow.create_escrow(&params2);
+
+    let params3 = EscrowParams {
+        mentor: f.mentor.clone(),
+        learner: f.learner.clone(),
+        amount: 3_000,
+        session_id: symbol_short!("SES3"),
+        token_address: f.token.clone(),
+        session_end_time: now,
+        total_sessions: 1,
+    };
+    let eid3 = f.escrow.create_escrow(&params3);
 
     assert_eq!(f.escrow.get_escrow_count(), 3);
 
@@ -537,14 +560,16 @@ fn test_auto_release_after_session_end() {
 
     let now = env.ledger().timestamp();
     // session ends in 60 s; default auto-release delay = 72 h
-    let eid = f.escrow.create_escrow(
-        &f.mentor,
-        &f.learner,
-        &10_000,
-        &symbol_short!("SES1"),
-        &f.token,
-        &(now + 60),
-    );
+    let params = EscrowParams {
+        mentor: f.mentor.clone(),
+        learner: f.learner.clone(),
+        amount: 10_000,
+        session_id: symbol_short!("SES1"),
+        token_address: f.token.clone(),
+        session_end_time: now + 60,
+        total_sessions: 1,
+    };
+    let eid = f.escrow.create_escrow(&params);
 
     // Before window: must fail
     advance_time(&env, 60 + 72 * 3600 - 1);

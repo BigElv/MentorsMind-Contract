@@ -21,18 +21,18 @@ pub enum SubscriptionStatus {
 impl StateMachine for SubscriptionStatus {
     type State = Self;
     fn is_valid_transition(_env: &Env, from: &Self::State, to: &Self::State) -> bool {
-        match (from, to) {
-            (SubscriptionStatus::Trial, SubscriptionStatus::Active) => true,
-            (SubscriptionStatus::Trial, SubscriptionStatus::Cancelled) => true,
-            (SubscriptionStatus::Active, SubscriptionStatus::GracePeriod) => true,
-            (SubscriptionStatus::Active, SubscriptionStatus::Paused) => true,
-            (SubscriptionStatus::Active, SubscriptionStatus::Cancelled) => true,
-            (SubscriptionStatus::GracePeriod, SubscriptionStatus::Active) => true,
-            (SubscriptionStatus::GracePeriod, SubscriptionStatus::Expired) => true,
-            (SubscriptionStatus::Paused, SubscriptionStatus::Active) => true,
-            (SubscriptionStatus::Paused, SubscriptionStatus::Cancelled) => true,
-            _ => false,
-        }
+        matches!(
+            (from, to),
+            (SubscriptionStatus::Trial, SubscriptionStatus::Active)
+                | (SubscriptionStatus::Trial, SubscriptionStatus::Cancelled)
+                | (SubscriptionStatus::Active, SubscriptionStatus::GracePeriod)
+                | (SubscriptionStatus::Active, SubscriptionStatus::Paused)
+                | (SubscriptionStatus::Active, SubscriptionStatus::Cancelled)
+                | (SubscriptionStatus::GracePeriod, SubscriptionStatus::Active)
+                | (SubscriptionStatus::GracePeriod, SubscriptionStatus::Expired)
+                | (SubscriptionStatus::Paused, SubscriptionStatus::Active)
+                | (SubscriptionStatus::Paused, SubscriptionStatus::Cancelled)
+        )
     }
 }
 
@@ -49,13 +49,13 @@ pub enum LoanStatus {
 impl StateMachine for LoanStatus {
     type State = Self;
     fn is_valid_transition(_env: &Env, from: &Self::State, to: &Self::State) -> bool {
-        match (from, to) {
-            (LoanStatus::Pending, LoanStatus::Active) => true,
-            (LoanStatus::Pending, LoanStatus::Cancelled) => true,
-            (LoanStatus::Active, LoanStatus::Repaid) => true,
-            (LoanStatus::Active, LoanStatus::Defaulted) => true,
-            _ => false,
-        }
+        matches!(
+            (from, to),
+            (LoanStatus::Pending, LoanStatus::Active)
+                | (LoanStatus::Pending, LoanStatus::Cancelled)
+                | (LoanStatus::Active, LoanStatus::Repaid)
+                | (LoanStatus::Active, LoanStatus::Defaulted)
+        )
     }
 }
 
@@ -73,13 +73,13 @@ pub enum ISAStatus {
 impl StateMachine for ISAStatus {
     type State = Self;
     fn is_valid_transition(_env: &Env, from: &Self::State, to: &Self::State) -> bool {
-        match (from, to) {
-            (ISAStatus::Pending, ISAStatus::StudyPeriod) => true,
-            (ISAStatus::StudyPeriod, ISAStatus::GracePeriod) => true,
-            (ISAStatus::GracePeriod, ISAStatus::Repayment) => true,
-            (ISAStatus::Repayment, ISAStatus::Completed) => true,
-            (ISAStatus::Repayment, ISAStatus::Defaulted) => true,
-            _ => false,
-        }
+        matches!(
+            (from, to),
+            (ISAStatus::Pending, ISAStatus::StudyPeriod)
+                | (ISAStatus::StudyPeriod, ISAStatus::GracePeriod)
+                | (ISAStatus::GracePeriod, ISAStatus::Repayment)
+                | (ISAStatus::Repayment, ISAStatus::Completed)
+                | (ISAStatus::Repayment, ISAStatus::Defaulted)
+        )
     }
 }

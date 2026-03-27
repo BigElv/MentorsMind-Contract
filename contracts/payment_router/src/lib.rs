@@ -44,6 +44,17 @@ pub struct PaymentRoutedEvent {
     pub token: Address,
 }
 
+#[contracttype]
+pub struct EscrowParams {
+    pub mentor: Address,
+    pub learner: Address,
+    pub amount: i128,
+    pub session_id: Symbol,
+    pub token_address: Address,
+    pub session_end_time: u64,
+    pub total_sessions: u32,
+}
+
 #[derive(Clone)]
 #[contracttype]
 pub enum DataKey {
@@ -193,16 +204,16 @@ impl PaymentRouter {
             .set(&DataKey::EscrowIdCounter, &(counter + 1));
 
         // Emit payment routed event
-        Self::emit_payment_routed(
-            &env,
+        let event = PaymentRoutedEvent {
             source_chain,
-            &source_tx_hash,
+            source_tx_hash: source_tx_hash.clone(),
             escrow_id,
-            &learner,
-            &mentor,
+            learner: learner.clone(),
+            mentor: mentor.clone(),
             amount,
-            &token,
-        );
+            token: token.clone(),
+        };
+        Self::emit_payment_routed(&env, event);
 
         escrow_id
     }
@@ -364,20 +375,21 @@ impl PaymentRouter {
         let session_end_time = env.ledger().timestamp() + (30 * 24 * 60 * 60);
         let total_sessions = 1u32;
 
+        let params = EscrowParams {
+            mentor,
+            learner,
+            amount,
+            session_id,
+            token_address: token,
+            session_end_time,
+            total_sessions,
+        };
+
         // Call create_escrow on the escrow contract
         let escrow_id: u64 = env.invoke_contract(
             escrow_contract,
             &Symbol::new(env, "create_escrow"),
-            (
-                mentor,
-                learner,
-                amount,
-                session_id,
-                token,
-                session_end_time,
-                total_sessions,
-            )
-                .into_val(env),
+            (params,).into_val(env),
         );
 
         escrow_id
@@ -403,26 +415,7 @@ impl PaymentRouter {
         }
     }
 
-    fn emit_payment_routed(
-        env: &Env,
-        source_chain: u32,
-        source_tx_hash: &BytesN<32>,
-        escrow_id: u64,
-        learner: &Address,
-        mentor: &Address,
-        amount: i128,
-        token: &Address,
-    ) {
-        let event = PaymentRoutedEvent {
-            source_chain,
-            source_tx_hash: source_tx_hash.clone(),
-            escrow_id,
-            learner: learner.clone(),
-            mentor: mentor.clone(),
-            amount,
-            token: token.clone(),
-        };
-
+    fn emit_payment_routed(env: &Env, event: PaymentRoutedEvent) {
         env.events()
             .publish((symbol_short!("router"), symbol_short!("routed")), event);
     }
@@ -432,9 +425,9 @@ impl PaymentRouter {
 #[cfg(test)]
 mod test {
     use super::*;
-    use soroban_sdk::testutils::{Address as _, BytesN as _};
+    use soroban_sdk::testutils::Address as _;
 
-    fn setup_env(env: &Env) -> (Address, Address, Address, Address, PaymentRouterClient) {
+    fn setup_env(env: &Env) -> (Address, Address, Address, Address, PaymentRouterClient<'_>) {
         let admin = Address::generate(env);
         let escrow_contract = Address::generate(env);
         let bridge_receiver = Address::generate(env);

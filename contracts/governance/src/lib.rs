@@ -40,13 +40,13 @@ impl StateMachine for ProposalStatus {
     type State = ProposalStatus;
 
     fn is_valid_transition(_env: &Env, from: &Self::State, to: &Self::State) -> bool {
-        match (from, to) {
-            (ProposalStatus::Active, ProposalStatus::Passed) => true,
-            (ProposalStatus::Active, ProposalStatus::Failed) => true,
-            (ProposalStatus::Active, ProposalStatus::Cancelled) => true,
-            (ProposalStatus::Passed, ProposalStatus::Executed) => true,
-            _ => false,
-        }
+        matches!(
+            (from, to),
+            (ProposalStatus::Active, ProposalStatus::Passed)
+                | (ProposalStatus::Active, ProposalStatus::Failed)
+                | (ProposalStatus::Active, ProposalStatus::Cancelled)
+                | (ProposalStatus::Passed, ProposalStatus::Executed)
+        )
     }
 }
 

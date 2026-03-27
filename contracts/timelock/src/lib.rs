@@ -40,7 +40,7 @@ impl TimelockController {
         delay: u64,
     ) -> BytesN<32> {
         caller.require_auth();
-        if delay < MIN_DELAY || delay > MAX_DELAY {
+        if !(MIN_DELAY..=MAX_DELAY).contains(&delay) {
             panic!("invalid delay");
         }
         let mut count: u64 = env.storage().persistent().get(&OP_COUNT).unwrap_or(0);

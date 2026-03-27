@@ -259,6 +259,8 @@ mod tests {
 
         let owner = Address::generate(&env);
         let spender = Address::generate(&env);
+        let token = MockTokenClient::new(&env, &token_id);
+        token.mint(&owner, &1000);
 
         allowance.authorize(&owner, &spender, &token_id, &100, &5, &60);
         allowance.pull_payment(&spender, &owner, &token_id, &100);
