@@ -28,6 +28,7 @@ members = [
     "contracts/session_registry",
     "contracts/cert_showcase",
     "contracts/lending_pool",
+    "contracts/collateral_loan",
     "contracts/prediction_market",
     "tests",
 ]
