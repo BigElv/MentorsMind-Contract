@@ -44,17 +44,6 @@ pub struct PaymentRoutedEvent {
     pub token: Address,
 }
 
-#[contracttype]
-pub struct EscrowParams {
-    pub mentor: Address,
-    pub learner: Address,
-    pub amount: i128,
-    pub session_id: Symbol,
-    pub token_address: Address,
-    pub session_end_time: u64,
-    pub total_sessions: u32,
-}
-
 #[derive(Clone)]
 #[contracttype]
 pub enum DataKey {
@@ -375,21 +364,20 @@ impl PaymentRouter {
         let session_end_time = env.ledger().timestamp() + (30 * 24 * 60 * 60);
         let total_sessions = 1u32;
 
-        let params = EscrowParams {
-            mentor,
-            learner,
-            amount,
-            session_id,
-            token_address: token,
-            session_end_time,
-            total_sessions,
-        };
-
-        // Call create_escrow on the escrow contract
+        // Call create_escrow on the escrow contract with individual parameters
         let escrow_id: u64 = env.invoke_contract(
             escrow_contract,
             &Symbol::new(env, "create_escrow"),
-            (params,).into_val(env),
+            (
+                mentor,
+                learner,
+                amount,
+                session_id,
+                token,
+                session_end_time,
+                total_sessions,
+            )
+                .into_val(env),
         );
 
         escrow_id
@@ -426,6 +414,144 @@ impl PaymentRouter {
 mod test {
     use super::*;
     use soroban_sdk::testutils::Address as _;
+    use soroban_sdk::testutils::Ledger;
+
+    // =========================================================================
+    // Mock Bridge Receiver Contract
+    // =========================================================================
+
+    /// Mock bridge receiver that simulates the real bridge receiver contract
+    /// for testing cross-chain payment routing
+    #[contract]
+    pub struct MockBridgeReceiver;
+
+    #[contracttype]
+    #[derive(Clone)]
+    pub enum MockBridgeKey {
+        ProcessedVAA(BytesN<32>),
+    }
+
+    #[contractimpl]
+    impl MockBridgeReceiver {
+        /// Mark a VAA as processed (for test setup)
+        pub fn set_vaa_processed(env: Env, vaa_hash: BytesN<32>) {
+            env.storage()
+                .instance()
+                .set(&MockBridgeKey::ProcessedVAA(vaa_hash), &true);
+        }
+
+        /// Check if a VAA has been processed
+        pub fn is_vaa_processed(env: Env, vaa_hash: BytesN<32>) -> bool {
+            env.storage()
+                .instance()
+                .has(&MockBridgeKey::ProcessedVAA(vaa_hash))
+        }
+    }
+
+    // =========================================================================
+    // Mock Escrow Contract
+    // =========================================================================
+
+    /// Mock escrow contract that simulates escrow creation
+    #[contract]
+    pub struct MockEscrow;
+
+    #[contracttype]
+    #[derive(Clone)]
+    pub enum MockEscrowKey {
+        EscrowCount,
+        Escrow(u64),
+        Session(Symbol),
+    }
+
+    #[contractimpl]
+    impl MockEscrow {
+        /// Create an escrow (simplified mock implementation)
+        pub fn create_escrow(
+            env: Env,
+            mentor: Address,
+            learner: Address,
+            amount: i128,
+            session_id: Symbol,
+            token_address: Address,
+            session_end_time: u64,
+            total_sessions: u32,
+        ) -> u64 {
+            // Simplified: just increment counter and return ID
+            let mut count: u64 = env
+                .storage()
+                .instance()
+                .get(&MockEscrowKey::EscrowCount)
+                .unwrap_or(0);
+            count += 1;
+            env.storage()
+                .instance()
+                .set(&MockEscrowKey::EscrowCount, &count);
+            count
+        }
+
+        pub fn get_escrow_count(env: Env) -> u64 {
+            env.storage()
+                .instance()
+                .get(&MockEscrowKey::EscrowCount)
+                .unwrap_or(0)
+        }
+    }
+
+    // =========================================================================
+    // Mock Token Contract
+    // =========================================================================
+
+    /// Mock token contract for testing Stellar direct payments
+    #[contract]
+    pub struct MockToken;
+
+    #[contracttype]
+    #[derive(Clone)]
+    pub enum MockTokenKey {
+        Balance(Address),
+    }
+
+    #[contractimpl]
+    impl MockToken {
+        pub fn mint(env: Env, to: Address, amount: i128) {
+            let bal: i128 = env
+                .storage()
+                .instance()
+                .get(&MockTokenKey::Balance(to.clone()))
+                .unwrap_or(0);
+            env.storage()
+                .instance()
+                .set(&MockTokenKey::Balance(to), &(bal + amount));
+        }
+
+        pub fn balance(env: Env, id: Address) -> i128 {
+            env.storage()
+                .instance()
+                .get(&MockTokenKey::Balance(id))
+                .unwrap_or(0)
+        }
+
+        pub fn transfer(env: Env, from: Address, to: Address, amount: i128) {
+            let from_bal = Self::balance(env.clone(), from.clone());
+            assert!(from_bal >= amount, "Insufficient balance");
+            let to_bal = Self::balance(env.clone(), to.clone());
+            env.storage()
+                .instance()
+                .set(&MockTokenKey::Balance(from), &(from_bal - amount));
+            env.storage()
+                .instance()
+                .set(&MockTokenKey::Balance(to), &(to_bal + amount));
+        }
+
+        pub fn spendable_balance(env: Env, id: Address) -> i128 {
+            Self::balance(env, id)
+        }
+    }
+
+    // =========================================================================
+    // Test Setup
+    // =========================================================================
 
     fn setup_env(env: &Env) -> (Address, Address, Address, Address, PaymentRouterClient<'_>) {
         let admin = Address::generate(env);
@@ -437,6 +563,54 @@ mod test {
         let client = PaymentRouterClient::new(env, &contract_id);
 
         (admin, escrow_contract, bridge_receiver, token, client)
+    }
+
+    /// Setup with mock contracts for integration testing
+    struct IntegrationFixture {
+        env: Env,
+        router_client: PaymentRouterClient<'static>,
+        bridge_client: MockBridgeReceiverClient<'static>,
+        escrow_client: MockEscrowClient<'static>,
+        token_client: MockTokenClient<'static>,
+        admin: Address,
+    }
+
+    impl IntegrationFixture {
+        fn setup() -> Self {
+            let env = Env::default();
+            env.mock_all_auths();
+
+            let admin = Address::generate(&env);
+
+            // Register mock contracts
+            let bridge_id = env.register_contract(None, MockBridgeReceiver);
+            let escrow_id = env.register_contract(None, MockEscrow);
+            let token_id = env.register_contract(None, MockToken);
+
+            // Register payment router
+            let router_id = env.register_contract(None, PaymentRouter);
+
+            // Initialize router with mock contract addresses
+            let router_client = PaymentRouterClient::new(&env, &router_id);
+            router_client.init(&admin, &escrow_id, &bridge_id);
+
+            IntegrationFixture {
+                env,
+                router_client,
+                bridge_client: MockBridgeReceiverClient::new(&env, &bridge_id),
+                escrow_client: MockEscrowClient::new(&env, &escrow_id),
+                token_client: MockTokenClient::new(&env, &token_id),
+                admin,
+            }
+        }
+
+        fn fund_learner(&self, learner: &Address, amount: i128) {
+            self.token_client.mint(learner, &amount);
+        }
+
+        fn mark_bridge_vaa_processed(&self, vaa_hash: &BytesN<32>) {
+            self.bridge_client.set_vaa_processed(vaa_hash);
+        }
     }
 
     #[test]
@@ -599,5 +773,276 @@ mod test {
 
         let count = client.get_route_count();
         assert_eq!(count, 0);
+    }
+
+    // =========================================================================
+    // STELLAR DIRECT PAYMENT TEST
+    // =========================================================================
+
+    /// Test routing a direct Stellar payment (source_chain = 0)
+    /// This verifies that native Stellar payments are properly routed to escrow
+    #[test]
+    fn test_stellar_direct_payment() {
+        let fixture = IntegrationFixture::setup();
+        let learner = Address::generate(&fixture.env);
+        let mentor = Address::generate(&fixture.env);
+
+        // Fund the learner with tokens
+        let amount = 1000i128;
+        fixture.fund_learner(&learner, amount);
+
+        let tx_hash = BytesN::from_array(&fixture.env, &[1u8; 32]);
+
+        // Route a Stellar direct payment
+        let escrow_id = fixture.router_client.route_payment(
+            &CHAIN_STELLAR,
+            &tx_hash,
+            &learner,
+            &mentor,
+            &amount,
+            &fixture.token_client.address,
+        );
+
+        // Verify escrow ID was returned (should be 1 for first escrow)
+        assert_eq!(escrow_id, 1);
+
+        // Verify route was stored
+        let stored_escrow_id = fixture.router_client.get_route(&tx_hash);
+        assert_eq!(stored_escrow_id, escrow_id);
+
+        // Verify transaction is marked as processed
+        assert!(fixture.router_client.is_tx_processed(&tx_hash));
+
+        // Verify route count increased
+        assert_eq!(fixture.router_client.get_route_count(), 1);
+
+        // Verify route details
+        let route = fixture.router_client.get_route_details(&tx_hash);
+        assert_eq!(route.source_chain, CHAIN_STELLAR);
+        assert_eq!(route.learner, learner);
+        assert_eq!(route.mentor, mentor);
+        assert_eq!(route.amount, amount);
+    }
+
+    // =========================================================================
+    // BRIDGED ETH PAYMENT TEST
+    // =========================================================================
+
+    /// Test routing a bridged ETH payment
+    /// This verifies that cross-chain payments via bridge are properly routed
+    #[test]
+    fn test_bridged_eth_payment() {
+        let fixture = IntegrationFixture::setup();
+        let learner = Address::generate(&fixture.env);
+        let mentor = Address::generate(&fixture.env);
+
+        let tx_hash = BytesN::from_array(&fixture.env, &[2u8; 32]);
+        let amount = 5000i128; // 5000 units (e.g., USDC from ETH)
+
+        // Mark the VAA as processed in the mock bridge receiver
+        fixture.mark_bridge_vaa_processed(&tx_hash);
+
+        // Route the bridged ETH payment
+        let escrow_id = fixture.router_client.route_payment(
+            &CHAIN_ETHEREUM,
+            &tx_hash,
+            &learner,
+            &mentor,
+            &amount,
+            &fixture.token_client.address,
+        );
+
+        // Verify escrow was created
+        assert_eq!(escrow_id, 1);
+
+        // Verify route details show ETH as source chain
+        let route = fixture.router_client.get_route_details(&tx_hash);
+        assert_eq!(route.source_chain, CHAIN_ETHEREUM);
+        assert_eq!(route.amount, amount);
+
+        // Verify transaction is marked as processed
+        assert!(fixture.router_client.is_tx_processed(&tx_hash));
+    }
+
+    // =========================================================================
+    // DUPLICATE ROUTING PREVENTION TEST
+    // =========================================================================
+
+    /// Test that duplicate routing is prevented
+    /// This ensures the same transaction cannot be routed twice (replay protection)
+    #[test]
+    #[should_panic(expected = "Transaction already routed")]
+    fn test_duplicate_routing_prevention() {
+        let fixture = IntegrationFixture::setup();
+        let learner = Address::generate(&fixture.env);
+        let mentor = Address::generate(&fixture.env);
+
+        // Fund the learner
+        let amount = 1000i128;
+        fixture.fund_learner(&learner, amount);
+
+        let tx_hash = BytesN::from_array(&fixture.env, &[3u8; 32]);
+
+        // Route payment first time - should succeed
+        let escrow_id_1 = fixture.router_client.route_payment(
+            &CHAIN_STELLAR,
+            &tx_hash,
+            &learner,
+            &mentor,
+            &amount,
+            &fixture.token_client.address,
+        );
+        assert_eq!(escrow_id_1, 1);
+
+        // Attempt to route the same transaction again - should panic
+        fixture.router_client.route_payment(
+            &CHAIN_STELLAR,
+            &tx_hash,
+            &learner,
+            &mentor,
+            &amount,
+            &fixture.token_client.address,
+        );
+    }
+
+    /// Test that different transactions get different escrow IDs
+    #[test]
+    fn test_multiple_routes_different_ids() {
+        let fixture = IntegrationFixture::setup();
+        let learner = Address::generate(&fixture.env);
+        let mentor = Address::generate(&fixture.env);
+
+        // Fund learner with enough for multiple payments
+        fixture.fund_learner(&learner, 3000);
+
+        // Route first payment
+        let tx_hash_1 = BytesN::from_array(&fixture.env, &[1u8; 32]);
+        let escrow_id_1 = fixture.router_client.route_payment(
+            &CHAIN_STELLAR,
+            &tx_hash_1,
+            &learner,
+            &mentor,
+            &1000,
+            &fixture.token_client.address,
+        );
+
+        // Route second payment
+        let tx_hash_2 = BytesN::from_array(&fixture.env, &[2u8; 32]);
+        let escrow_id_2 = fixture.router_client.route_payment(
+            &CHAIN_STELLAR,
+            &tx_hash_2,
+            &learner,
+            &mentor,
+            &2000,
+            &fixture.token_client.address,
+        );
+
+        // Verify different escrow IDs
+        assert_ne!(escrow_id_1, escrow_id_2);
+        assert_eq!(escrow_id_1, 1);
+        assert_eq!(escrow_id_2, 2);
+
+        // Verify route count
+        assert_eq!(fixture.router_client.get_route_count(), 2);
+
+        // Verify both routes are stored and accessible
+        assert_eq!(fixture.router_client.get_route(&tx_hash_1), escrow_id_1);
+        assert_eq!(fixture.router_client.get_route(&tx_hash_2), escrow_id_2);
+    }
+
+    /// Test that bridged payments from different chains are properly distinguished
+    #[test]
+    fn test_bridged_payments_different_chains() {
+        let fixture = IntegrationFixture::setup();
+        let learner = Address::generate(&fixture.env);
+        let mentor = Address::generate(&fixture.env);
+
+        // Route from Ethereum
+        let tx_hash_eth = BytesN::from_array(&fixture.env, &[10u8; 32]);
+        fixture.mark_bridge_vaa_processed(&tx_hash_eth);
+        let escrow_id_eth = fixture.router_client.route_payment(
+            &CHAIN_ETHEREUM,
+            &tx_hash_eth,
+            &learner,
+            &mentor,
+            &3000,
+            &fixture.token_client.address,
+        );
+
+        // Route from BSC
+        let tx_hash_bsc = BytesN::from_array(&fixture.env, &[20u8; 32]);
+        fixture.mark_bridge_vaa_processed(&tx_hash_bsc);
+        let escrow_id_bsc = fixture.router_client.route_payment(
+            &CHAIN_BSC,
+            &tx_hash_bsc,
+            &learner,
+            &mentor,
+            &4000,
+            &fixture.token_client.address,
+        );
+
+        // Verify different escrow IDs
+        assert_ne!(escrow_id_eth, escrow_id_bsc);
+
+        // Verify source chains are recorded correctly
+        let route_eth = fixture.router_client.get_route_details(&tx_hash_eth);
+        let route_bsc = fixture.router_client.get_route_details(&tx_hash_bsc);
+
+        assert_eq!(route_eth.source_chain, CHAIN_ETHEREUM);
+        assert_eq!(route_bsc.source_chain, CHAIN_BSC);
+    }
+
+    /// Test route not found error
+    #[test]
+    #[should_panic(expected = "Route not found")]
+    fn test_get_route_not_found() {
+        let env = Env::default();
+        let (admin, escrow_contract, bridge_receiver, _, client) = setup_env(&env);
+
+        client.init(&admin, &escrow_contract, &bridge_receiver);
+
+        // Try to get route for non-existent transaction
+        let tx_hash = BytesN::from_array(&env, &[99u8; 32]);
+        client.get_route(&tx_hash);
+    }
+
+    /// Test that negative amounts are rejected
+    #[test]
+    #[should_panic(expected = "Amount must be positive")]
+    fn test_route_payment_negative_amount() {
+        let fixture = IntegrationFixture::setup();
+        let learner = Address::generate(&fixture.env);
+        let mentor = Address::generate(&fixture.env);
+
+        let tx_hash = BytesN::from_array(&fixture.env, &[1u8; 32]);
+        fixture.router_client.route_payment(
+            &CHAIN_STELLAR,
+            &tx_hash,
+            &learner,
+            &mentor,
+            &-100,
+            &fixture.token_client.address,
+        );
+    }
+
+    /// Test that bridged payment fails when bridge hasn't verified the transaction
+    #[test]
+    #[should_panic(expected = "Bridge transaction not verified")]
+    fn test_bridged_payment_not_verified() {
+        let fixture = IntegrationFixture::setup();
+        let learner = Address::generate(&fixture.env);
+        let mentor = Address::generate(&fixture.env);
+
+        let tx_hash = BytesN::from_array(&fixture.env, &[5u8; 32]);
+        // Don't mark VAA as processed - should fail
+
+        fixture.router_client.route_payment(
+            &CHAIN_ETHEREUM,
+            &tx_hash,
+            &learner,
+            &mentor,
+            &1000,
+            &fixture.token_client.address,
+        );
     }
 }
