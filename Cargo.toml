@@ -32,6 +32,8 @@ members = [
     "contracts/velocity_limits",
     "contracts/prediction_market",
     "tests",
+
+    "contracts/isa",
 ]
 
 [workspace.package]
