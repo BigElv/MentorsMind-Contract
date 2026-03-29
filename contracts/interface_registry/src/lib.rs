@@ -35,6 +35,7 @@ impl InterfaceRegistryContract {
             panic!("Already initialized");
         }
         env.storage().persistent().set(&DataKey::Admin, &admin);
+        let empty_vec: Vec<Symbol> = Vec::new(&env);
         env.storage()
             .persistent()
             .set(&DataKey::InterfaceIds, &Vec::<Symbol>::new(&env));

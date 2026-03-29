@@ -380,7 +380,7 @@ impl EscrowContract {
         env.storage().persistent().set(&ESCROW_COUNT, &count);
         env.storage()
             .persistent()
-            .extend_ttl(&ESCROW_COUNT, ESCROW_TTL_THRESHOLD, ESCROW_TTL_BUMP);
+            .extend_ttl(&ESCROW_COUNT, EXTEND_TTL_THRESHOLD, EXTEND_TTL_BUMP);
 
         token_client.transfer(&learner, &env.current_contract_address(), &amount);
 

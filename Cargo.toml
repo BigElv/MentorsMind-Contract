@@ -26,6 +26,10 @@ members = [
     "contracts/health_dashboard",
     "contracts/reputation",
     "contracts/session_registry",
+    "contracts/cert_showcase",
+    "contracts/lending_pool",
+    "contracts/collateral_loan",
+    "contracts/prediction_market",
     "tests",
 ]
 
