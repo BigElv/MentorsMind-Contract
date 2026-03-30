@@ -62,7 +62,7 @@ export async function fetchTransactions(address: string, opts?: { asset?: AssetC
   const records: any[] = data._embedded?.records ?? [];
   const items: TransactionItem[] = records.map(r => {
     const amount = r.amount ?? r.starting_balance ?? '0';
-    const asset = r.asset_code ?? (r.type === 'create_account' ? 'XLM' : 'XLM') ?? 'XLM';
+    const asset = r.asset_code ?? 'XLM';
     const txHash = r.transaction_hash ?? r.id;
     const from = r.from ?? r.source_account ?? '';
     const to = r.to ?? r.account ?? '';

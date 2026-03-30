@@ -1,118 +1,75 @@
-import { HORIZON_CONFIG } from '../config/horizon.config';
+import { horizonConfig } from '../config/horizon.config';
+
+export type HorizonEndpoint = 'primary' | 'backup';
 
 export interface NetworkStatus {
-  activeEndpoint: string;
-  isHealthy: boolean;
-  lastLedgerSequence: number;
-  lastLedgerTime: string;
-  isStalled: boolean;
-  isCongested: boolean;
-  latencyMs: number;
-  hasFailureSpike: boolean;
+  status: 'ok' | 'degraded' | 'down';
+  activeHorizon: HorizonEndpoint;
+  primary: string;
+  backup: string;
+  ledger?: number;
+  latencyMs?: number;
+  lastUpdate: string;
+  errors: string[];
 }
 
-class NetworkMonitor {
-  private status: NetworkStatus = {
-    activeEndpoint: HORIZON_CONFIG.endpoints[0],
-    isHealthy: true,
-    lastLedgerSequence: 0,
-    lastLedgerTime: new Date().toISOString(),
-    isStalled: false,
-    isCongested: false,
-    latencyMs: 0,
-    hasFailureSpike: false,
-  };
+let statusState: NetworkStatus = {
+  status: 'down',
+  activeHorizon: 'primary',
+  primary: horizonConfig.primary,
+  backup: horizonConfig.backup,
+  lastUpdate: new Date().toISOString(),
+  errors: ['Monitor starting'],
+};
 
-  private errorCount = 0;
-  private txFailureCount = 0;
-  private readonly FAILOVER_THRESHOLD = 3;
-  private readonly SPIKE_THRESHOLD = 50; // Alarms after 50 failures in interval
+async function fetchLatestLedger(url: string): Promise<{ ledger?: number; latencyMs: number }> {
+  const start = Date.now();
+  const res = await fetch(`${url}/ledgers?limit=1`, { timeout: horizonConfig.healthyResponseTimeoutMs } as any);
+  const latencyMs = Date.now() - start;
+  if (!res.ok) throw new Error(`Horizon ${url} returned ${res.status}`);
 
-  constructor() {
-    // Start monitoring only if not in a testing environment
-    if (process.env.NODE_ENV !== 'test') {
-      this.startMonitoring();
-    }
-  }
-
-  private async checkHealth(endpoint: string): Promise<boolean> {
-    const startTime = Date.now();
-    try {
-      const resp = await fetch(`${endpoint}/ledgers?limit=1&order=desc`);
-      if (!resp.ok) return false;
-      
-      const data: any = await resp.json();
-      if (!data._embedded?.records?.length) return false;
-      
-      const latestLedger = data._embedded.records[0];
-      
-      this.status.latencyMs = Date.now() - startTime;
-      const ledgerTime = new Date(latestLedger.closed_at).getTime();
-      const now = Date.now();
-
-      // Detect stall: No new ledger in X seconds
-      this.status.isStalled = (now - ledgerTime) > HORIZON_CONFIG.maxStallDurationMs;
-      
-      // Detect congestion: transaction_count vs max_tx_set_size
-      const congestionRatio = latestLedger.transaction_count / latestLedger.max_tx_set_size;
-      this.status.isCongested = congestionRatio > HORIZON_CONFIG.congestionCapacityThreshold;
-
-      this.status.lastLedgerSequence = latestLedger.sequence;
-      this.status.lastLedgerTime = latestLedger.closed_at;
-      
-      return true;
-    } catch (err) {
-      console.error(`Health check failed for ${endpoint}:`, err);
-      return false;
-    }
-  }
-
-  private async performCheck() {
-    const healthy = await this.checkHealth(this.status.activeEndpoint);
-    
-    // Check for failure spikes (e.g. if 50+ transactions failed since last check)
-    this.status.hasFailureSpike = this.txFailureCount > this.SPIKE_THRESHOLD;
-    if (this.status.hasFailureSpike) {
-      console.error(`ALERT: Transaction failure spike detected (${this.txFailureCount} failures)`);
-    }
-    // Reset failure count each interval
-    this.txFailureCount = 0;
-
-    if (!healthy) {
-      this.errorCount++;
-      if (this.errorCount >= this.FAILOVER_THRESHOLD) {
-        this.attemptFailover();
-      }
-      this.status.isHealthy = false;
-    } else {
-      this.errorCount = 0;
-      this.status.isHealthy = true;
-    }
-  }
-
-  private attemptFailover() {
-    const currentIndex = HORIZON_CONFIG.endpoints.indexOf(this.status.activeEndpoint);
-    const nextIndex = (currentIndex + 1) % HORIZON_CONFIG.endpoints.length;
-    this.status.activeEndpoint = HORIZON_CONFIG.endpoints[nextIndex];
-    this.errorCount = 0;
-    console.warn(`Failing over to Horizon node: ${this.status.activeEndpoint}`);
-  }
-
-  /**
-   * Called by other services to record a transaction submission failure.
-   */
-  public recordTransactionFailure() {
-    this.txFailureCount++;
-  }
-
-  public startMonitoring() {
-    setInterval(() => this.performCheck(), HORIZON_CONFIG.checkIntervalMs);
-    this.performCheck(); // initial check
-  }
-
-  public getStatus(): NetworkStatus {
-    return { ...this.status };
-  }
+  const body = await res.json();
+  const latestLedger = body._embedded?.records?.[0]?.sequence;
+  return { ledger: latestLedger, latencyMs };
 }
 
-export const networkMonitorService = new NetworkMonitor();
+async function evaluateNetwork() {
+  const errors: string[] = [];
+  let active: HorizonEndpoint = 'primary';
+  let ledger: number | undefined;
+  let latencyMs: number | undefined;
+
+  try {
+    const p = await fetchLatestLedger(horizonConfig.primary);
+    ledger = p.ledger;
+    latencyMs = p.latencyMs;
+    active = 'primary';
+    statusState = { ...statusState, status: 'ok', errors: [], activeHorizon: active, ledger, latencyMs, lastUpdate: new Date().toISOString() };
+    return;
+  } catch (err: any) {
+    errors.push(`Primary failed: ${err?.message}`);
+  }
+
+  try {
+    const b = await fetchLatestLedger(horizonConfig.backup);
+    ledger = b.ledger;
+    latencyMs = b.latencyMs;
+    active = 'backup';
+    statusState = { ...statusState, status: 'degraded', errors, activeHorizon: active, ledger, latencyMs, lastUpdate: new Date().toISOString() };
+    return;
+  } catch (err: any) {
+    errors.push(`Backup failed: ${err?.message}`);
+  }
+
+  statusState = { ...statusState, status: 'down', errors, activeHorizon: active, ledger, latencyMs, lastUpdate: new Date().toISOString() };
+}
+
+export function getNetworkStatus(): NetworkStatus {
+  return statusState;
+}
+
+export async function startNetworkMonitor(): Promise<void> {
+  await evaluateNetwork();
+  setInterval(evaluateNetwork, 15_000);
+  console.log('Network monitor started with primary', horizonConfig.primary, 'backup', horizonConfig.backup);
+}

@@ -11,6 +11,7 @@ import { eventIndexerRoutes } from "./routes/event-indexer.routes";
 import paymentRoutes from "./routes/payment.routes";
 import mentorWalletRoutes from "./routes/mentor-wallet.routes";
 import auditLogRoutes from "./routes/audit-log.routes";
+import { startNetworkMonitor, getNetworkStatus } from "./services/network-monitor.service";
 
 // Load environment variables
 dotenv.config();
@@ -64,9 +65,15 @@ app.get("/", (req, res) => {
       mentorWallet: "/api/mentor-wallet",
       auditLogs: "/api/audit-logs",
       health: "/health",
+      networkStatus: "/api/v1/network/status",
       websocket: "ws://localhost:" + PORT + "/ws/events",
     },
   });
+});
+
+// Network status endpoint
+app.get('/api/v1/network/status', (req, res) => {
+  res.json(getNetworkStatus());
 });
 
 // Initialize WebSocket gateway
@@ -134,6 +141,11 @@ httpServer.listen(PORT, () => {
         message: "Failed to connect to Horizon",
         details: err.message,
       });
+    });
+
+    // Start network monitor in parallel
+    startNetworkMonitor().catch((err) => {
+      console.error("[Startup] Failed to start network monitor:", err);
     });
   }, 2000);
 });

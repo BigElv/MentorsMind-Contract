@@ -7,7 +7,7 @@ export type OracleFeedJobOptions = {
 export class OracleFeedJob {
   private service: OracleFeederService;
   private intervalMs: number;
-  private timer: NodeJS.Timer | null = null;
+  private timer: NodeJS.Timeout | null = null;
   private running = false;
 
   constructor(service?: OracleFeederService, opts?: OracleFeedJobOptions) {

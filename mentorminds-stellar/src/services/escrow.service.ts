@@ -18,30 +18,33 @@ export class EscrowService {
   }
 
   async getEscrow(escrowId: number): Promise<Escrow> {
-    const response = await this.server.getContractData({
-      contract: this.contract.address(),
-      key: xdr.ScVal.scvVec([
+    const response = await this.server.getContractData(
+      this.contract.address(),
+      xdr.ScVal.scvVec([
         nativeToScVal('ESCROW', { type: 'symbol' }),
         nativeToScVal(escrowId, { type: 'u64' })
       ]),
-      durability: xdr.ContractDataDurability.persistent(),
-    });
+      rpc.Durability.Persistent,
+    );
 
     if (!response || !response.val) {
       throw new Error('Escrow not found');
     }
 
-    return this.parseEscrow(scValToNative(response.val));
+    const contractDataVal = response.val.contractData().val();
+    return this.parseEscrow(scValToNative(contractDataVal));
   }
 
   async getEscrowCount(): Promise<number> {
-    const response = await this.server.getContractData({
-      contract: this.contract.address(),
-      key: nativeToScVal('ESC_CNT', { type: 'symbol' }),
-      durability: xdr.ContractDataDurability.persistent(),
-    });
+    const response = await this.server.getContractData(
+      this.contract.address(),
+      nativeToScVal('ESC_CNT', { type: 'symbol' }),
+      rpc.Durability.Persistent,
+    );
 
-    return response ? Number(scValToNative(response.val)) : 0;
+    return response && response.val
+      ? Number(scValToNative(response.val.contractData().val()))
+      : 0;
   }
 
   private parseEscrow(val: any): Escrow {

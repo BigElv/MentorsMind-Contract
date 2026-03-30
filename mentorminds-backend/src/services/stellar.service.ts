@@ -1,7 +1,7 @@
-import { Horizon, Networks, Server, Keypair } from '@stellar/stellar-sdk';
+import { Horizon, Networks, Keypair } from '@stellar/stellar-sdk';
 
 export class StellarService {
-  private server: Server;
+  private server: Horizon.Server;
   private network: string;
 
   constructor() {
@@ -9,7 +9,7 @@ export class StellarService {
     const horizonUrl = process.env.HORIZON_URL || (this.network === 'mainnet' 
       ? 'https://horizon.stellar.org' 
       : 'https://horizon-testnet.stellar.org');
-    this.server = new Server(horizonUrl);
+    this.server = new Horizon.Server(horizonUrl);
   }
 
   /**

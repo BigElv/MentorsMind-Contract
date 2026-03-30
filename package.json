@@ -33,6 +33,13 @@
     "mentoring",
     "local-development"
   ],
+  "dependencies": {
+    "@stellar/freighter-api": "^1.7.1",
+    "@stellar/stellar-sdk": "^14.6.1",
+    "node-fetch": "^3.3.2",
+    "react": "^19.2.4",
+    "react-dom": "^19.2.4"
+  },
   "author": "MentorMinds Team",
   "license": "MIT",
   "repository": {
@@ -43,6 +50,10 @@
     "node": ">=18.0.0"
   },
   "devDependencies": {
-    "@types/node": "^20.0.0"
+    "@types/jest": "^30.0.0",
+    "@types/node": "^20.19.37",
+    "@types/react": "^19.2.14",
+    "@types/react-dom": "^19.2.3",
+    "typescript": "^6.0.2"
   }
 }

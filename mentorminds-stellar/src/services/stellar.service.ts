@@ -1,10 +1,10 @@
-import { Horizon, Networks, Server } from '@stellar/stellar-sdk';
+import { Horizon, Networks, Keypair } from '@stellar/stellar-sdk';
 import { stellarConfig } from '../config/stellar.config';
 import { StellarAccount, StellarNetwork } from '../types/stellar.types';
 import { isValidPublicKey } from '../utils/stellar.utils';
 
 export class StellarService {
-  private server: Server;
+  private server: Horizon.Server;
   private network: StellarNetwork;
 
   constructor(network: StellarNetwork = (stellarConfig.network as StellarNetwork)) {
@@ -12,7 +12,7 @@ export class StellarService {
     const horizonUrl = network === 'mainnet' 
       ? 'https://horizon.stellar.org' 
       : 'https://horizon-testnet.stellar.org';
-    this.server = new Server(horizonUrl);
+    this.server = new Horizon.Server(horizonUrl);
   }
 
   /**
@@ -24,7 +24,7 @@ export class StellarService {
     const horizonUrl = network === 'mainnet' 
       ? 'https://horizon.stellar.org' 
       : 'https://horizon-testnet.stellar.org';
-    this.server = new Server(horizonUrl);
+    this.server = new Horizon.Server(horizonUrl);
   }
 
   /**
