@@ -9,6 +9,7 @@ members = [
     "contracts/oracle",
     "contracts/payment_router",
     "contracts/referral",
+    "contracts/referral_leaderboard",
     "contracts/session_nft",
     "contracts/staking",
     "contracts/subscription_analytics",
