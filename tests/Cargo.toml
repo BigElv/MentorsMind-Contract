@@ -1,0 +1,41 @@
+[package]
+name = "mentorminds-integration-tests"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.70"
+
+[lib]
+name = "mentorminds_integration_tests"
+path = "lib.rs"
+
+[dependencies]
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+soroban-sdk = { workspace = true, features = ["testutils"] }
+mentorminds-escrow = { path = "../escrow", features = ["testutils"] }
+mentorminds-verification = { path = "../contracts/verification", features = ["testutils"] }
+shared = { path = "../contracts/shared" }
+mentorminds-governance = { path = "../contracts/governance", features = ["testutils"] }
+mentorminds-oracle = { path = "../contracts/oracle", features = ["testutils"] }
+mentorminds-reputation = { path = "../contracts/reputation", features = ["testutils"] }
+mentorminds-timelock = { path = "../contracts/timelock", features = ["testutils"] }
+mentorminds-credit-score = { path = "../contracts/credit_score", features = ["testutils"] }
+mentorminds-staking = { path = "../contracts/staking", features = ["testutils"] }
+
+[dev-dependencies]
+
+[[test]]
+name = "upgrade_test"
+path = "upgrade_test.rs"
+
+[[test]]
+name = "integration_test"
+path = "integration_test.rs"
+
+[[test]]
+name = "state_machine_tests"
+path = "state_machine_tests.rs"
+
+[[test]]
+name = "economic_attacks"
+path = "economic_attacks.rs"
