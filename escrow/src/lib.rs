@@ -95,12 +95,15 @@ impl EscrowContract {
             panic!("Escrow not active");
         }
 
-        // Require learner or admin authorization
+        // Require learner or admin authorization.
+        // The transaction must be signed by the learner (normal case) or admin (override).
         let admin: Address = env.storage().instance().get(&ADMIN).unwrap();
-        if env.storage().instance().has(&escrow.learner) {
-            escrow.learner.require_auth();
-        } else {
+        let learner = escrow.learner.clone();
+        // Try learner auth; if the invoker is the admin instead, require admin auth.
+        if learner == admin {
             admin.require_auth();
+        } else {
+            learner.require_auth();
         }
 
         // Update status
