@@ -59,9 +59,18 @@ async function pollPending(): Promise<void> {
   await paymentTrackerService.timeoutStalePending();
 }
 
+let stellarMonitorHandle: ReturnType<typeof setInterval> | null = null;
+
 export function startStellarMonitor(): void {
-  setInterval(pollPending, POLL_INTERVAL_MS);
+  stellarMonitorHandle = setInterval(pollPending, POLL_INTERVAL_MS);
   console.log(`Stellar monitor started (poll every ${POLL_INTERVAL_MS / 1000}s)`);
+}
+
+export function stopStellarMonitor(): void {
+  if (stellarMonitorHandle !== null) {
+    clearInterval(stellarMonitorHandle);
+    stellarMonitorHandle = null;
+  }
 }
 
 export async function processWebhookEvent(payload: {

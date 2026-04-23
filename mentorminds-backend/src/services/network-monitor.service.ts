@@ -68,8 +68,17 @@ export function getNetworkStatus(): NetworkStatus {
   return statusState;
 }
 
+let networkMonitorHandle: ReturnType<typeof setInterval> | null = null;
+
 export async function startNetworkMonitor(): Promise<void> {
   await evaluateNetwork();
-  setInterval(evaluateNetwork, 15_000);
+  networkMonitorHandle = setInterval(evaluateNetwork, 15_000);
   console.log('Network monitor started with primary', horizonConfig.primary, 'backup', horizonConfig.backup);
+}
+
+export function stopNetworkMonitor(): void {
+  if (networkMonitorHandle !== null) {
+    clearInterval(networkMonitorHandle);
+    networkMonitorHandle = null;
+  }
 }

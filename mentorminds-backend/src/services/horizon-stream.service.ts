@@ -3,8 +3,21 @@ import { ParsedEvent, ContractEvent } from "../types/event-indexer.types";
 
 const HORIZON_URL =
   process.env.HORIZON_URL ?? "https://horizon-testnet.stellar.org";
+const PLATFORM_STELLAR_ACCOUNT = process.env.PLATFORM_STELLAR_ACCOUNT ?? "";
+const USER_WALLET_ACCOUNTS = (process.env.HORIZON_STREAM_ACCOUNTS ?? "")
+  .split(",")
+  .map((value) => value.trim())
+  .filter(Boolean);
 const STREAM_RETRY_DELAY_MS = 5000;
 const MAX_RETRIES = 5;
+
+function splitAccountList(raw: string | undefined): string[] {
+  if (!raw) return [];
+  return raw
+    .split(",")
+    .map((value) => value.trim())
+    .filter(Boolean);
+}
 
 // Known MentorMinds contract IDs to monitor (update after deployment)
 const MONITORED_CONTRACTS = new Set<string>([
@@ -63,6 +76,50 @@ export class HorizonStreamService {
   private retryCount = 0;
 
   /**
+   * Stellar accounts that belong to the platform operator (ingress treasury,
+   * admin, etc.). Used for discovery and docs — not for opening one SSE stream
+   * per mentee/mentor wallet.
+   *
+   * Peer-to-peer user payments are confirmed via tx hash + payment webhook
+   * (see `stellar-stream.service` / `stellar-monitor.service`), not by listing
+   * every user public key here.
+   */
+  getPlatformAccounts(): string[] {
+    const seen = new Set<string>();
+    const out: string[] = [];
+
+    const primary = (process.env.PLATFORM_STELLAR_ACCOUNT ?? "").trim();
+    if (primary) {
+      seen.add(primary);
+      out.push(primary);
+    }
+
+    for (const id of splitAccountList(process.env.HORIZON_PLATFORM_EXTRA_ACCOUNTS)) {
+      if (!seen.has(id)) {
+        seen.add(id);
+        out.push(id);
+      }
+    }
+
+    return out;
+  }
+
+  /**
+   * Horizon `/events` URL. When `accountId` is set, scopes the stream to that
+   * account; otherwise all contract events (no account filter).
+   */
+  buildEventsUrl(cursor: string, accountId?: string): string {
+    const params = new URLSearchParams({
+      type: "contract",
+      cursor,
+    });
+    if (accountId) {
+      params.set("account", accountId);
+    }
+    return `${HORIZON_URL}/events?${params.toString()}`;
+  }
+
+  /**
    * Start streaming contract events from Horizon
    * Uses cursor-based pagination to avoid re-processing
    */
@@ -82,7 +139,20 @@ export class HorizonStreamService {
     console.log(`[HorizonStream] Starting stream from cursor: ${cursor}`);
 
     try {
-      await this.streamEvents(cursor);
+      const platformAccounts = this.getPlatformAccounts();
+      const streamAccount = (process.env.PLATFORM_STELLAR_ACCOUNT ?? "").trim();
+
+      if (streamAccount) {
+        console.log(
+          `[HorizonStream] SSE scoped to PLATFORM_STELLAR_ACCOUNT; operator wallet list length=${platformAccounts.length}`
+        );
+        await this.streamEvents(cursor, streamAccount);
+      } else {
+        console.warn(
+          "[HorizonStream] PLATFORM_STELLAR_ACCOUNT unset — streaming all contract events (set PLATFORM_STELLAR_ACCOUNT to scope ingress)"
+        );
+        await this.streamEvents(cursor);
+      }
     } catch (error) {
       console.error("[HorizonStream] Stream error:", error);
       this.handleStreamError();
@@ -104,8 +174,8 @@ export class HorizonStreamService {
   /**
    * Stream events from Horizon with exponential backoff
    */
-  private async streamEvents(cursor: string): Promise<void> {
-    const url = `${HORIZON_URL}/events?account=&type=contract&cursor=${cursor}`;
+  private async streamEvents(cursor: string, accountId?: string): Promise<void> {
+    const url = this.buildEventsUrl(cursor, accountId);
 
     try {
       const response = await fetch(url, {
@@ -158,6 +228,34 @@ export class HorizonStreamService {
         throw error;
       }
     }
+  }
+
+  buildEventsUrl(cursor: string, accountId?: string): string {
+    const params = new URLSearchParams({
+      type: "contract",
+      cursor,
+    });
+
+    if (accountId) {
+      params.set("account", accountId);
+    }
+
+    return `${HORIZON_URL}/events?${params.toString()}`;
+  }
+
+  private getStreamAccounts(): string[] {
+    const seen = new Set<string>();
+    const accounts: string[] = [];
+
+    for (const accountId of [PLATFORM_STELLAR_ACCOUNT, ...USER_WALLET_ACCOUNTS]) {
+      if (!accountId || seen.has(accountId)) {
+        continue;
+      }
+      seen.add(accountId);
+      accounts.push(accountId);
+    }
+
+    return accounts;
   }
 
   /**
@@ -288,9 +386,14 @@ export class HorizonStreamService {
 
     setTimeout(() => {
       if (this.isRunning) {
-        this.streamEvents(
-          eventIndexerService.getCursorState().lastCursor || "now"
-        );
+        const cursor =
+          eventIndexerService.getCursorState().lastCursor || "now";
+        const streamAccount = (process.env.PLATFORM_STELLAR_ACCOUNT ?? "").trim();
+        if (streamAccount) {
+          this.streamEvents(cursor, streamAccount);
+        } else {
+          this.streamEvents(cursor);
+        }
       }
     }, delay);
   }

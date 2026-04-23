@@ -43,7 +43,7 @@ members = [
     "contracts/pause_guardian",
     "contracts/insurance",
     "contracts/anomaly_detector",
-        "contracts/subscription",
+    "contracts/subscription",
 ]
 
 [workspace.package]

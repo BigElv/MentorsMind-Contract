@@ -20,6 +20,16 @@ This implementation provides a real-time event indexer service that streams cont
 ✅ **Event Filtering** - Monitor specific contracts or all contract events  
 ✅ **Historical Fetching** - Catch up on missed events via account endpoints
 
+### User payments vs contract event streaming
+
+- **Contract / platform ingress** — `HorizonStreamService` opens **one** Horizon SSE stream, scoped with `PLATFORM_STELLAR_ACCOUNT` when set. `getPlatformAccounts()` lists the platform primary plus optional operator wallets from `HORIZON_PLATFORM_EXTRA_ACCOUNTS` (comma-separated) for operations and documentation; it is **not** meant to enumerate every mentee or mentor wallet.
+- **Peer-to-peer user wallet payments** — Do **not** subscribe per-user over SSE (not scalable). Instead:
+  1. Client records the payment with `POST /api/payments` including `txHash`.
+  2. Horizon webhook calls `POST /api/payments/webhook` with `transaction_hash` / `successful` / `ledger` when available.
+  3. `stellar-stream.service` starts `stellar-monitor` polling as a backstop for pending rows (tx lookup by hash).
+
+This keeps a single SSE pipeline for indexer events and a separate, hash-driven path for payment confirmation.
+
 ---
 
 ## Architecture

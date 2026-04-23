@@ -6,12 +6,15 @@ import dotenv from "dotenv";
 // Import services
 import { webSocketGateway } from "./services/websocket-gateway";
 import { horizonStreamService } from "./services/horizon-stream.service";
+import { startStellarPaymentMonitoring } from "./services/stellar-stream.service";
 import { eventIndexerService } from "./services/event-indexer.service";
 import { eventIndexerRoutes } from "./routes/event-indexer.routes";
 import paymentRoutes from "./routes/payment.routes";
 import mentorWalletRoutes from "./routes/mentor-wallet.routes";
 import auditLogRoutes from "./routes/audit-log.routes";
-import { startNetworkMonitor, getNetworkStatus } from "./services/network-monitor.service";
+import { startNetworkMonitor, stopNetworkMonitor, getNetworkStatus } from "./services/network-monitor.service";
+import { stopStellarMonitor } from "./services/stellar-monitor.service";
+import { startRateRefresh, stopRateRefresh } from "./services/assetExchange.service";
 
 // Load environment variables
 dotenv.config();
@@ -131,6 +134,7 @@ httpServer.listen(PORT, () => {
 
   // Start Horizon streaming after server is ready
   setTimeout(() => {
+    startStellarPaymentMonitoring();
     console.log("Starting Horizon event streaming...");
     horizonStreamService.startStreaming().catch((err) => {
       console.error("[Startup] Failed to start streaming:", err);
@@ -147,6 +151,11 @@ httpServer.listen(PORT, () => {
     startNetworkMonitor().catch((err) => {
       console.error("[Startup] Failed to start network monitor:", err);
     });
+
+    // Start asset exchange rate refresh
+    startRateRefresh().catch((err) => {
+      console.error("[Startup] Failed to start rate refresh:", err);
+    });
   }, 2000);
 });
 
@@ -154,6 +163,9 @@ httpServer.listen(PORT, () => {
 process.on("SIGTERM", () => {
   console.log("SIGTERM received, shutting down gracefully...");
 
+  stopRateRefresh();
+  stopNetworkMonitor();
+  stopStellarMonitor();
   horizonStreamService.stopStreaming();
   webSocketGateway.close();
 
@@ -166,6 +178,9 @@ process.on("SIGTERM", () => {
 process.on("SIGINT", () => {
   console.log("SIGINT received, shutting down gracefully...");
 
+  stopRateRefresh();
+  stopNetworkMonitor();
+  stopStellarMonitor();
   horizonStreamService.stopStreaming();
   webSocketGateway.close();
 
