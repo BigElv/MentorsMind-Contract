@@ -3,6 +3,11 @@ import { ParsedEvent, ContractEvent } from "../types/event-indexer.types";
 
 const HORIZON_URL =
   process.env.HORIZON_URL ?? "https://horizon-testnet.stellar.org";
+const PLATFORM_STELLAR_ACCOUNT = process.env.PLATFORM_STELLAR_ACCOUNT ?? "";
+const USER_WALLET_ACCOUNTS = (process.env.HORIZON_STREAM_ACCOUNTS ?? "")
+  .split(",")
+  .map((value) => value.trim())
+  .filter(Boolean);
 const STREAM_RETRY_DELAY_MS = 5000;
 const MAX_RETRIES = 5;
 
@@ -82,7 +87,13 @@ export class HorizonStreamService {
     console.log(`[HorizonStream] Starting stream from cursor: ${cursor}`);
 
     try {
-      await this.streamEvents(cursor);
+      const accounts = this.getStreamAccounts();
+      if (accounts.length === 0) {
+        await this.streamEvents(cursor);
+        return;
+      }
+
+      await Promise.all(accounts.map((accountId) => this.streamEvents(cursor, accountId)));
     } catch (error) {
       console.error("[HorizonStream] Stream error:", error);
       this.handleStreamError();
@@ -104,8 +115,8 @@ export class HorizonStreamService {
   /**
    * Stream events from Horizon with exponential backoff
    */
-  private async streamEvents(cursor: string): Promise<void> {
-    const url = `${HORIZON_URL}/events?account=&type=contract&cursor=${cursor}`;
+  private async streamEvents(cursor: string, accountId?: string): Promise<void> {
+    const url = this.buildEventsUrl(cursor, accountId);
 
     try {
       const response = await fetch(url, {
@@ -158,6 +169,34 @@ export class HorizonStreamService {
         throw error;
       }
     }
+  }
+
+  buildEventsUrl(cursor: string, accountId?: string): string {
+    const params = new URLSearchParams({
+      type: "contract",
+      cursor,
+    });
+
+    if (accountId) {
+      params.set("account", accountId);
+    }
+
+    return `${HORIZON_URL}/events?${params.toString()}`;
+  }
+
+  private getStreamAccounts(): string[] {
+    const seen = new Set<string>();
+    const accounts: string[] = [];
+
+    for (const accountId of [PLATFORM_STELLAR_ACCOUNT, ...USER_WALLET_ACCOUNTS]) {
+      if (!accountId || seen.has(accountId)) {
+        continue;
+      }
+      seen.add(accountId);
+      accounts.push(accountId);
+    }
+
+    return accounts;
   }
 
   /**
@@ -288,9 +327,15 @@ export class HorizonStreamService {
 
     setTimeout(() => {
       if (this.isRunning) {
-        this.streamEvents(
-          eventIndexerService.getCursorState().lastCursor || "now"
-        );
+        const cursor = eventIndexerService.getCursorState().lastCursor || "now";
+        const accounts = this.getStreamAccounts();
+        if (accounts.length === 0) {
+          this.streamEvents(cursor);
+          return;
+        }
+        for (const accountId of accounts) {
+          this.streamEvents(cursor, accountId);
+        }
       }
     }, delay);
   }
