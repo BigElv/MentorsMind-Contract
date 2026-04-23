@@ -109,10 +109,24 @@ async function defaultSubmit(asset: AssetSymbol, price: number, timestamp: numbe
     // eslint-disable-next-line @typescript-eslint/no-var-requires
     const StellarSdk = require("stellar-sdk");
     const { Keypair, xdr } = StellarSdk;
+
+    // Verify Soroban capability — fail loudly rather than passing raw values
+    if (typeof StellarSdk.nativeToScVal !== 'function') {
+      throw new Error(
+        'stellar-sdk version does not support nativeToScVal — upgrade to v10.4+ ' +
+        '(current package.json pins "stellar-sdk": "10.4.0")'
+      );
+    }
+    const SorobanRpc = StellarSdk.rpc;
+    if (typeof SorobanRpc?.Server !== 'function') {
+      throw new Error(
+        'stellar-sdk version does not expose rpc.Server — Soroban RPC support ' +
+        'requires stellar-sdk v10.4+ (current package.json pins "stellar-sdk": "10.4.0")'
+      );
+    }
+
     const kp = Keypair.fromSecret(feederSecret);
-    // eslint-disable-next-line @typescript-eslint/no-var-requires
-    const SorobanClient = require("stellar-sdk").SorobanRpc || require("stellar-sdk").rpc;
-    const server = new SorobanClient.Server(rpcUrl, { allowHttp: rpcUrl.startsWith("http://") });
+    const server = new SorobanRpc.Server(rpcUrl, { allowHttp: rpcUrl.startsWith("http://"), timeout: RPC_TIMEOUT_MS });
     const contract = new StellarSdk.Contract(contractId);
     const source = await server.getAccount(kp.publicKey());
     const tx = new StellarSdk.TransactionBuilder(source, {
