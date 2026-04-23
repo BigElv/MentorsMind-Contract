@@ -39,8 +39,19 @@ export type OracleFeederOptions = {
 const DEFAULT_SOURCES: PriceSource[] = ["coingecko", "binance"];
 const DEFAULT_ASSETS: AssetSymbol[] = ["XLM", "USDC", "MNT"];
 
+const RPC_TIMEOUT_MS = 10_000;
+
 function sleep(ms: number) {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
+  return Promise.race([
+    promise,
+    new Promise<never>((_, reject) =>
+      setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms)
+    ),
+  ]);
 }
 
 function median(values: number[]): number {
@@ -128,7 +139,7 @@ async function defaultSubmit(asset: AssetSymbol, price: number, timestamp: numbe
     const kp = Keypair.fromSecret(feederSecret);
     const server = new SorobanRpc.Server(rpcUrl, { allowHttp: rpcUrl.startsWith("http://"), timeout: RPC_TIMEOUT_MS });
     const contract = new StellarSdk.Contract(contractId);
-    const source = await server.getAccount(kp.publicKey());
+    const source = await withTimeout(server.getAccount(kp.publicKey()), RPC_TIMEOUT_MS, 'getAccount');
     const tx = new StellarSdk.TransactionBuilder(source, {
       fee: "1000",
       networkPassphrase,
@@ -139,7 +150,7 @@ async function defaultSubmit(asset: AssetSymbol, price: number, timestamp: numbe
       .setTimeout(60)
       .build();
     tx.sign(kp);
-    const send = await server.sendTransaction(tx);
+    const send = await withTimeout(server.sendTransaction(tx), RPC_TIMEOUT_MS, 'sendTransaction');
     if (send.status === "PENDING" || send.status === "SUCCESS") {
       return send.hash;
     }
