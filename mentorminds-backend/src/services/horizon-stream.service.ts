@@ -3,6 +3,11 @@ import { ParsedEvent, ContractEvent } from "../types/event-indexer.types";
 
 const HORIZON_URL =
   process.env.HORIZON_URL ?? "https://horizon-testnet.stellar.org";
+const PLATFORM_STELLAR_ACCOUNT = process.env.PLATFORM_STELLAR_ACCOUNT ?? "";
+const USER_WALLET_ACCOUNTS = (process.env.HORIZON_STREAM_ACCOUNTS ?? "")
+  .split(",")
+  .map((value) => value.trim())
+  .filter(Boolean);
 const STREAM_RETRY_DELAY_MS = 5000;
 const MAX_RETRIES = 5;
 
@@ -223,6 +228,34 @@ export class HorizonStreamService {
         throw error;
       }
     }
+  }
+
+  buildEventsUrl(cursor: string, accountId?: string): string {
+    const params = new URLSearchParams({
+      type: "contract",
+      cursor,
+    });
+
+    if (accountId) {
+      params.set("account", accountId);
+    }
+
+    return `${HORIZON_URL}/events?${params.toString()}`;
+  }
+
+  private getStreamAccounts(): string[] {
+    const seen = new Set<string>();
+    const accounts: string[] = [];
+
+    for (const accountId of [PLATFORM_STELLAR_ACCOUNT, ...USER_WALLET_ACCOUNTS]) {
+      if (!accountId || seen.has(accountId)) {
+        continue;
+      }
+      seen.add(accountId);
+      accounts.push(accountId);
+    }
+
+    return accounts;
   }
 
   /**
