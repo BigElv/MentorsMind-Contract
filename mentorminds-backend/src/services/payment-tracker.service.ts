@@ -11,6 +11,7 @@ export class PaymentTrackerService {
       ...data,
       ledgerSequence: null,
       status: 'pending',
+      fee: data.fee ?? null,
       errorCode: null,
       errorMessage: null,
       createdAt: new Date(),
@@ -38,7 +39,7 @@ export class PaymentTrackerService {
   async updateStatus(
     id: string,
     status: PaymentStatus,
-    extra?: { ledgerSequence?: number; errorCode?: string; errorMessage?: string }
+    extra?: { ledgerSequence?: number; fee?: string; errorCode?: string; errorMessage?: string }
   ): Promise<Payment | null> {
     const payment = payments.get(id);
     if (!payment) return null;
@@ -60,6 +61,10 @@ export class PaymentTrackerService {
       }
     }
     return timedOut;
+  }
+
+  async getAll(): Promise<Payment[]> {
+    return [...payments.values()];
   }
 }
 

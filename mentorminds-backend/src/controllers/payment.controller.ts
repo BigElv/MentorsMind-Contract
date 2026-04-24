@@ -27,6 +27,7 @@ export async function createPayment(req: Request, res: Response): Promise<void> 
     amount,
     assetCode,
     txHash,
+    fee: null,
   });
 
   res.status(201).json(payment);

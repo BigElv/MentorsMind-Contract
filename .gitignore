@@ -29,3 +29,9 @@ Thumbs.db
 # Build artifacts
 dist/
 build/
+
+.agents/
+.claude/
+issue.md
+node_modules/
+package-lock.json.bk

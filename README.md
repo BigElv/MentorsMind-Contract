@@ -219,6 +219,58 @@ soroban contract invoke \
 - **Emergency Pause**: Implement pause mechanism
 - **Upgrade Path**: Plan for contract upgrades
 
+## 🔄 State Machine Methodology
+
+MentorMinds contracts use a formal state machine methodology to ensure secure and predictable state transitions.
+
+### 📐 Principles
+- **Explicit States**: All possible contract states are defined as `contracttype` enums.
+- **Valid Transitions**: Only pre-defined transitions between states are permitted.
+- **Shared Trait**: The `StateMachine` trait in `contracts/shared` enforces a consistent `is_valid_transition` method across all contracts.
+- **Exhaustive Testing**: State machine transitions are verified by exhaustive tests in `tests/state_machine_tests.rs`, covering every possible (from, to) state pair.
+
+### 📋 Usage Example
+```rust
+impl StateMachine for EscrowStatus {
+    fn is_valid_transition(env: &Env, from: &Self, to: &Self) -> bool {
+        match (from, to) {
+            (EscrowStatus::Active, EscrowStatus::Released) => true,
+            (EscrowStatus::Active, EscrowStatus::Disputed) => true,
+            // ... other valid transitions
+            _ => false,
+        }
+    }
+}
+```
+
+For detailed specifications and diagrams, see [docs/state-machines.md](docs/state-machines.md).
+
+## 🔁 Upgrade Procedure
+
+- Build the new version to WASM
+  ```bash
+  cd escrow
+  cargo build --target wasm32-unknown-unknown --release
+  ```
+- Upload the new WASM artifact
+  ```bash
+  soroban contract upload \
+    --source default \
+    --network testnet \
+    --wasm target/wasm32-unknown-unknown/release/escrow.wasm
+  ```
+- Invoke the contract’s admin-only upgrade entrypoint to switch code at the same contract ID
+  - Use the on-chain upgrade mechanism recommended in Soroban’s guide
+  - Do not call initialize again; the initialization guard prevents re-initialization
+- Verify existing escrows remain readable and new fields default correctly
+  - `dispute_reason` defaults to empty
+  - `resolved_at` defaults to `0`
+  - `auto_release_delay` uses the configured stored value or the 72h default
+- Validate new functions on old records
+  - Call `dispute`, `resolve_dispute`, and `try_auto_release` on pre-upgrade escrows
+
+Reference: Upgrading Wasm bytecode for a deployed contract (Stellar Docs)
+
 ## 📊 Gas Optimization
 
 - Minimize storage operations
