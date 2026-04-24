@@ -4,9 +4,20 @@ import {
   rpc, 
   scValToNative, 
   xdr, 
-  nativeToScVal 
+  nativeToScVal,
+  TransactionBuilder,
+  Networks,
+  BASE_FEE,
 } from '@stellar/stellar-sdk';
 import { CreateEscrowParams, Escrow, EscrowStatus } from '../types/escrow.types';
+
+export interface ReleaseFundsParams {
+  escrowId: number;
+  /** Stellar public key of the caller claiming to be the learner. */
+  releasedBy: string;
+  /** Keypair secret for signing the transaction. */
+  signerSecret: string;
+}
 
 export class EscrowService {
   private contract: Contract;
@@ -64,6 +75,57 @@ export class EscrowService {
       disputeReason: val.dispute_reason,
       resolvedAt: Number(val.resolved_at),
     };
+  }
+
+  /**
+   * Release escrow funds to the mentor.
+   *
+   * Defense-in-depth: fetches the escrow record from the contract and verifies
+   * that `releasedBy` matches the stored `learner` address before submitting
+   * the on-chain transaction. This prevents bypasses when the method is called
+   * from a new code path that omits the caller check.
+   *
+   * The Soroban contract enforces the same rule on-chain, so this is a
+   * belt-and-suspenders guard at the service layer.
+   */
+  async releaseFunds({ escrowId, releasedBy, signerSecret }: ReleaseFundsParams): Promise<string> {
+    // --- Defense-in-depth: verify caller is the escrow learner ---
+    const escrow = await this.getEscrow(escrowId);
+
+    if (escrow.learner !== releasedBy) {
+      throw new Error(
+        `Unauthorized: releasedBy (${releasedBy}) does not match escrow learner (${escrow.learner})`
+      );
+    }
+    // --- End guard ---
+
+    const { Keypair } = await import('@stellar/stellar-sdk');
+    const signer = Keypair.fromSecret(signerSecret);
+    const sourceAccount = await this.server.getAccount(signer.publicKey());
+
+    const operation = this.contract.call(
+      'release_funds',
+      new Address(releasedBy).toScVal(),
+      nativeToScVal(escrowId, { type: 'u64' }),
+    );
+
+    const tx = new TransactionBuilder(sourceAccount, {
+      fee: BASE_FEE,
+      networkPassphrase: Networks.TESTNET,
+    })
+      .addOperation(operation)
+      .setTimeout(30)
+      .build();
+
+    const prepared = await this.server.prepareTransaction(tx);
+    prepared.sign(signer);
+
+    const response = await this.server.sendTransaction(prepared);
+    if (response.status !== 'PENDING') {
+      throw new Error(`Transaction failed with status: ${response.status}`);
+    }
+
+    return response.hash;
   }
 
   // Transaction building methods would be implemented here or using a transaction builder helper
