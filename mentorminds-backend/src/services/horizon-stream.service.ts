@@ -1,5 +1,10 @@
 import { eventIndexerService } from "./event-indexer.service";
 import { ParsedEvent, ContractEvent } from "../types/event-indexer.types";
+import { paymentTrackerService } from "./payment-tracker.service";
+
+const LARGE_PAYMENT_THRESHOLD = parseFloat(
+  process.env.LARGE_PAYMENT_THRESHOLD_XLM ?? "10000"
+);
 
 const HORIZON_URL =
   process.env.HORIZON_URL ?? "https://horizon-testnet.stellar.org";
@@ -486,6 +491,64 @@ export class HorizonStreamService {
     } catch (error) {
       console.error("[HorizonStream] Error fetching transactions:", error);
       return [];
+    }
+  }
+
+  /**
+   * Process incoming payment operation.
+   * Checks if payment matches a pending transaction, and alerts only for unmatched large payments.
+   */
+  async processPaymentOperation(payment: {
+    from: string;
+    to: string;
+    amount: string;
+    asset: string;
+  }, account: string): Promise<void> {
+    // Check if this payment matches a pending transaction
+    const transaction = await paymentTrackerService.findPending().then(pending =>
+      pending.find(p =>
+        p.senderAddress === payment.from &&
+        p.receiverAddress === payment.to &&
+        p.amount === payment.amount
+      )
+    );
+
+    if (!transaction) {
+      // Only alert for large unmatched payments
+      await this.alertOnLargeIncomingTransaction(payment, account);
+    }
+  }
+
+  /**
+   * Alert admins about large incoming transactions that don't match any pending transaction.
+   * This helps detect anomalies like unexpected high-value payments.
+   */
+  private async alertOnLargeIncomingTransaction(
+    payment: { from: string; to: string; amount: string; asset: string },
+    account: string
+  ): Promise<void> {
+    const amountNum = parseFloat(payment.amount);
+
+    if (amountNum >= LARGE_PAYMENT_THRESHOLD) {
+      const reason = `Unrecognized large payment: no matching pending transaction found for sender ${payment.from}`;
+
+      console.warn(
+        `[HorizonStream] ALERT: Large unmatched payment detected`,
+        {
+          from: payment.from,
+          to: payment.to,
+          amount: payment.amount,
+          asset: payment.asset,
+          account,
+          reason,
+        }
+      );
+
+      // TODO: Send email alert to admins
+      // await emailService.sendAlert({
+      //   subject: 'Large Unmatched Payment Detected',
+      //   body: `${reason}\n\nDetails:\nFrom: ${payment.from}\nTo: ${payment.to}\nAmount: ${payment.amount} ${payment.asset}\nAccount: ${account}`,
+      // });
     }
   }
 }
