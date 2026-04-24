@@ -13,6 +13,7 @@ export interface EscrowRepository {
   deleteById(id: string): Promise<void>;
   markFunded(id: string, stellarTxHash: string): Promise<EscrowRecord>;
   findPendingOlderThan(cutoff: Date): Promise<EscrowRecord[]>;
+  findByUserId(userId: string, role: 'mentor' | 'learner', limit: number, offset: number, status?: string): Promise<{escrows: EscrowRecord[], total: number}>;
 }
 
 export interface SorobanEscrowService {
@@ -66,5 +67,14 @@ export class EscrowApiService {
   ): Promise<EscrowRecord[]> {
     const cutoff = new Date(now.getTime() - staleAfterMs);
     return this.escrowRepository.findPendingOlderThan(cutoff);
+  }
+
+  async listUserEscrows(
+    userId: string,
+    options: { status?: string; role: 'mentor' | 'learner' },
+    limit: number,
+    offset: number
+  ): Promise<{ escrows: EscrowRecord[]; total: number }> {
+    return this.escrowRepository.findByUserId(userId, options.role, limit, offset, options.status);
   }
 }
