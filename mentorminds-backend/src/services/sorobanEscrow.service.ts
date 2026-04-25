@@ -47,14 +47,123 @@ export function validateStellarAmount(amount: string): void {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Circuit Breaker
+// ---------------------------------------------------------------------------
+
+type CircuitState = "closed" | "open" | "half-open";
+
+interface CircuitBreakerOptions {
+  /** Consecutive failures before opening the circuit. Default: 5 */
+  failureThreshold: number;
+  /** Milliseconds to wait in open state before probing. Default: 30_000 */
+  recoveryTimeoutMs: number;
+}
+
+/**
+ * Lightweight counter-based circuit breaker.
+ *
+ * States:
+ *   closed    — calls pass through normally
+ *   open      — calls fast-fail immediately (RPC node is known unhealthy)
+ *   half-open — one probe call is allowed; success → closed, failure → open
+ */
+export class SorobanCircuitBreaker {
+  private state: CircuitState = "closed";
+  private consecutiveFailures = 0;
+  private openedAt: number | null = null;
+
+  constructor(private readonly options: CircuitBreakerOptions = {
+    failureThreshold: 5,
+    recoveryTimeoutMs: 30_000,
+  }) {}
+
+  get isOpen(): boolean {
+    return this.state === "open";
+  }
+
+  /**
+   * Wraps an async call with circuit-breaker logic.
+   * Throws immediately when the circuit is open (and not yet ready to probe).
+   */
+  async call<T>(fn: () => Promise<T>): Promise<T> {
+    if (this.state === "open") {
+      const elapsed = Date.now() - (this.openedAt ?? 0);
+      if (elapsed < this.options.recoveryTimeoutMs) {
+        throw Object.assign(
+          new Error("Soroban RPC circuit breaker is OPEN — fast-failing request"),
+          { statusCode: 503, circuitOpen: true }
+        );
+      }
+      // Transition to half-open to allow one probe
+      this.state = "half-open";
+      console.warn("[SorobanCircuitBreaker] Transitioning to HALF-OPEN — probing RPC node");
+    }
+
+    try {
+      const result = await fn();
+      this.onSuccess();
+      return result;
+    } catch (err) {
+      this.onFailure();
+      throw err;
+    }
+  }
+
+  private onSuccess(): void {
+    if (this.state !== "closed") {
+      console.info("[SorobanCircuitBreaker] RPC node recovered — circuit CLOSED");
+    }
+    this.state = "closed";
+    this.consecutiveFailures = 0;
+    this.openedAt = null;
+  }
+
+  private onFailure(): void {
+    this.consecutiveFailures++;
+    if (
+      this.state !== "open" &&
+      this.consecutiveFailures >= this.options.failureThreshold
+    ) {
+      this.state = "open";
+      this.openedAt = Date.now();
+      // Emit metric/alert — replace with your observability hook (e.g. Datadog, Prometheus)
+      console.error(
+        `[SorobanCircuitBreaker] Circuit OPENED after ${this.consecutiveFailures} consecutive failures. ` +
+        `Fast-failing all Soroban calls for ${this.options.recoveryTimeoutMs / 1000}s.`
+      );
+    }
+  }
+}
+
+/** Shared circuit breaker instance for all Soroban RPC calls. */
+export const sorobanCircuitBreaker = new SorobanCircuitBreaker({
+  failureThreshold: parseInt(process.env.SOROBAN_CB_FAILURE_THRESHOLD ?? "5", 10),
+  recoveryTimeoutMs: parseInt(process.env.SOROBAN_CB_RECOVERY_MS ?? "30000", 10),
+});
+
+// ---------------------------------------------------------------------------
+// SorobanEscrowServiceImpl
+// ---------------------------------------------------------------------------
+
 /**
  * Concrete SorobanEscrowService implementation that validates the amount
- * before passing it to the Soroban contract.
+ * before passing it to the Soroban contract, and wraps every RPC call with
+ * the shared circuit breaker so a failing node fast-fails instead of
+ * blocking the async queue.
  *
- * Extend this class (or inject a contract client) to wire up the actual
- * Soroban RPC call.
+ * isConfigured() returns false when the circuit is open so the system can
+ * degrade gracefully to off-chain-only mode.
  */
 export class SorobanEscrowServiceImpl implements SorobanEscrowService {
+  /**
+   * Returns false when the Soroban RPC circuit is open, signalling callers
+   * to fall back to off-chain-only mode.
+   */
+  isConfigured(): boolean {
+    return !sorobanCircuitBreaker.isOpen;
+  }
+
   async createEscrow(input: {
     escrowId: string;
     mentorId: string;
@@ -63,10 +172,12 @@ export class SorobanEscrowServiceImpl implements SorobanEscrowService {
   }): Promise<{ txHash: string }> {
     validateStellarAmount(input.amount);
 
-    // TODO: invoke the Soroban contract here
-    // const result = await sorobanClient.invoke('create_escrow', { ... });
-    // return { txHash: result.hash };
+    return sorobanCircuitBreaker.call(async () => {
+      // TODO: invoke the Soroban contract here
+      // const result = await sorobanClient.invoke('create_escrow', { ... });
+      // return { txHash: result.hash };
 
-    throw new Error("SorobanEscrowServiceImpl: contract invocation not yet wired up");
+      throw new Error("SorobanEscrowServiceImpl: contract invocation not yet wired up");
+    });
   }
 }
