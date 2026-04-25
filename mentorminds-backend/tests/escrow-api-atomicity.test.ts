@@ -2,6 +2,7 @@ import {
   EscrowApiService,
   EscrowRecord,
   EscrowRepository,
+  EscrowStatus,
   SorobanEscrowService,
 } from "../src/services/escrow-api.service";
 
@@ -49,12 +50,12 @@ class InMemoryEscrowRepository implements EscrowRepository {
 
   async findByUserId(
     userId: string,
-    role: 'mentor' | 'learner',
+    role: "mentor" | "learner",
     limit: number,
     offset: number,
     status?: string
   ): Promise<{ escrows: EscrowRecord[]; total: number }> {
-    const userField = role === 'mentor' ? 'mentorId' : 'learnerId';
+    const userField = role === "mentor" ? "mentorId" : "learnerId";
     let filtered = [...this.store.values()].filter(
       (record) => record[userField] === userId
     );
@@ -64,6 +65,20 @@ class InMemoryEscrowRepository implements EscrowRepository {
     const total = filtered.length;
     const escrows = filtered.slice(offset, offset + limit);
     return { escrows, total };
+  }
+
+  async findById(id: string): Promise<EscrowRecord | null> {
+    return this.store.get(id) ?? null;
+  }
+
+  async updateStatus(id: string, status: EscrowStatus): Promise<EscrowRecord> {
+    const record = this.store.get(id);
+    if (!record) {
+      throw new Error("Escrow not found");
+    }
+    const updated: EscrowRecord = { ...record, status };
+    this.store.set(id, updated);
+    return updated;
   }
 
   getById(id: string): EscrowRecord | undefined {
