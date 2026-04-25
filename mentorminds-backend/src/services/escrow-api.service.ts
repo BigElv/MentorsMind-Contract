@@ -6,12 +6,17 @@ export interface EscrowRecord {
   status: "pending" | "funded";
   createdAt: Date;
   stellarTxHash: string | null;
+  sorobanContractVersion: string | null;
 }
 
 export interface EscrowRepository {
   create(input: Omit<EscrowRecord, "createdAt">): Promise<EscrowRecord>;
   deleteById(id: string): Promise<void>;
-  markFunded(id: string, stellarTxHash: string): Promise<EscrowRecord>;
+  markFunded(
+    id: string,
+    stellarTxHash: string,
+    sorobanContractVersion: string | null
+  ): Promise<EscrowRecord>;
   findPendingOlderThan(cutoff: Date): Promise<EscrowRecord[]>;
   findByUserId(userId: string, role: 'mentor' | 'learner', limit: number, offset: number, status?: string): Promise<{escrows: EscrowRecord[], total: number}>;
 }
@@ -22,7 +27,7 @@ export interface SorobanEscrowService {
     mentorId: string;
     learnerId: string;
     amount: string;
-  }): Promise<{ txHash: string }>;
+  }): Promise<{ txHash: string; contractVersion: string | null }>;
 }
 
 export class EscrowApiService {
@@ -44,6 +49,7 @@ export class EscrowApiService {
       amount: input.amount,
       status: "pending",
       stellarTxHash: null,
+      sorobanContractVersion: null,
     });
 
     try {
@@ -54,7 +60,11 @@ export class EscrowApiService {
         amount: created.amount,
       });
 
-      return this.escrowRepository.markFunded(created.id, chainResult.txHash);
+      return this.escrowRepository.markFunded(
+        created.id,
+        chainResult.txHash,
+        chainResult.contractVersion
+      );
     } catch (error) {
       await this.escrowRepository.deleteById(created.id);
       throw error;

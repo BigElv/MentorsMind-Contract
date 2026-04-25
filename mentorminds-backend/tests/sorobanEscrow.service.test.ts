@@ -1,4 +1,7 @@
-import { validateStellarAmount } from "../src/services/sorobanEscrow.service";
+import {
+  SorobanEscrowServiceImpl,
+  validateStellarAmount,
+} from "../src/services/sorobanEscrow.service";
 
 describe("validateStellarAmount", () => {
   it("accepts valid positive amounts", () => {
@@ -62,5 +65,51 @@ describe("validateStellarAmount", () => {
     } catch (error: any) {
       expect(error.statusCode).toBe(400);
     }
+  });
+});
+
+describe("SorobanEscrowServiceImpl contract version checks", () => {
+  const originalEnv = process.env.SOROBAN_CONTRACT_VERSION;
+
+  afterEach(() => {
+    process.env.SOROBAN_CONTRACT_VERSION = originalEnv;
+  });
+
+  it("marks service unconfigured when detected version mismatches expected", async () => {
+    process.env.SOROBAN_CONTRACT_VERSION = "v2.0.0";
+    const service = new SorobanEscrowServiceImpl(async () => "v1.9.0");
+
+    const isValid = await service.verifyContractVersion();
+
+    expect(isValid).toBe(false);
+    expect(service.isConfigured()).toBe(false);
+    expect(service.getExpectedContractVersion()).toBe("v2.0.0");
+    expect(service.getResolvedContractVersion()).toBe("v1.9.0");
+  });
+
+  it("marks service configured when detected version matches expected", async () => {
+    process.env.SOROBAN_CONTRACT_VERSION = "v2.0.0";
+    const service = new SorobanEscrowServiceImpl(async () => "v2.0.0");
+
+    const isValid = await service.verifyContractVersion();
+
+    expect(isValid).toBe(true);
+    expect(service.isConfigured()).toBe(true);
+    expect(service.getResolvedContractVersion()).toBe("v2.0.0");
+  });
+
+  it("disables createEscrow when service is not configured", async () => {
+    process.env.SOROBAN_CONTRACT_VERSION = "v2.0.0";
+    const service = new SorobanEscrowServiceImpl(async () => "v1.0.0");
+    await service.verifyContractVersion();
+
+    await expect(
+      service.createEscrow({
+        escrowId: "escrow-1",
+        mentorId: "mentor-1",
+        learnerId: "learner-1",
+        amount: "10",
+      })
+    ).rejects.toThrow("disabled due to contract version mismatch");
   });
 });

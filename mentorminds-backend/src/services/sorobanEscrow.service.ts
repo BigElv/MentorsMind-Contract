@@ -55,17 +55,81 @@ export function validateStellarAmount(amount: string): void {
  * Soroban RPC call.
  */
 export class SorobanEscrowServiceImpl implements SorobanEscrowService {
+  private readonly expectedContractVersion =
+    process.env.SOROBAN_CONTRACT_VERSION?.trim() || null;
+  private resolvedContractVersion: string | null = null;
+  private configured = true;
+
+  constructor(
+    private readonly resolveVersion: (() => Promise<string | null>) | null = null
+  ) {}
+
+  async verifyContractVersion(): Promise<boolean> {
+    if (!this.expectedContractVersion) {
+      return true;
+    }
+
+    const fetchVersion =
+      this.resolveVersion ??
+      (async (): Promise<string | null> => {
+        return null;
+      });
+
+    let detectedVersion: string | null;
+    try {
+      detectedVersion = await fetchVersion();
+    } catch (error) {
+      this.configured = false;
+      throw Object.assign(
+        new Error(
+          `Soroban contract version check failed: ${(error as Error).message}`
+        ),
+        { statusCode: 503 }
+      );
+    }
+
+    this.resolvedContractVersion = detectedVersion;
+    if (!detectedVersion || detectedVersion !== this.expectedContractVersion) {
+      this.configured = false;
+      return false;
+    }
+
+    this.configured = true;
+    return true;
+  }
+
+  isConfigured(): boolean {
+    return this.configured;
+  }
+
+  getExpectedContractVersion(): string | null {
+    return this.expectedContractVersion;
+  }
+
+  getResolvedContractVersion(): string | null {
+    return this.resolvedContractVersion;
+  }
+
   async createEscrow(input: {
     escrowId: string;
     mentorId: string;
     learnerId: string;
     amount: string;
-  }): Promise<{ txHash: string }> {
+  }): Promise<{ txHash: string; contractVersion: string | null }> {
     validateStellarAmount(input.amount);
+
+    if (this.expectedContractVersion && !this.configured) {
+      throw Object.assign(
+        new Error(
+          "Soroban escrow integration disabled due to contract version mismatch"
+        ),
+        { statusCode: 503 }
+      );
+    }
 
     // TODO: invoke the Soroban contract here
     // const result = await sorobanClient.invoke('create_escrow', { ... });
-    // return { txHash: result.hash };
+    // return { txHash: result.hash, contractVersion: this.resolvedContractVersion };
 
     throw new Error("SorobanEscrowServiceImpl: contract invocation not yet wired up");
   }
