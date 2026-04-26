@@ -11,7 +11,20 @@ import { stellarFeesService } from './stellarFees.service';
 import { horizonConfig } from '../config/horizon.config';
 
 const MAX_FEE_STROOPS = '10000';
-const STARTING_BALANCE = '10.0';
+
+/**
+ * Stellar reserve model:
+ *   base reserve = 1 XLM per account
+ *   0.5 XLM per trustline (each non-native asset requires one)
+ *   0.5 XLM safety buffer
+ *
+ * For 2 non-native assets (USDC, PYUSD): 1 + (0.5 * 2) + 0.5 = 2.5 XLM
+ *
+ * Override via STELLAR_STARTING_BALANCE env var.
+ */
+const NUM_TRUSTLINES = 2; // USDC + PYUSD
+const MINIMUM_STARTING_BALANCE = (1 + 0.5 * NUM_TRUSTLINES + 0.5).toFixed(1); // "2.5"
+const STARTING_BALANCE = process.env.STELLAR_STARTING_BALANCE ?? MINIMUM_STARTING_BALANCE;
 
 /**
  * Wait for a Stellar account to become visible on Horizon after funding.
@@ -200,5 +213,51 @@ export class StellarAccountService {
    */
   async activateExistingWallet(destination: string, userId: string) {
     await this.fundAccount(destination, userId);
+  }
+
+  /**
+   * Verifies that an account has sufficient XLM reserve to hold all required
+   * trustlines. Stellar requires 1 XLM base + 0.5 XLM per trustline entry.
+   *
+   * @param publicKey The account public key to check.
+   * @returns An object indicating whether the reserve is sufficient and the
+   *          current balance, required balance, and missing amount (if any).
+   */
+  async verifyActivation(publicKey: string): Promise<{
+    sufficient: boolean;
+    currentBalance: number;
+    requiredBalance: number;
+    missingXlm: number;
+  }> {
+    const account = await this.server.loadAccount(publicKey);
+
+    const xlmBalance = account.balances.find(
+      (b: any) => b.asset_type === 'native'
+    );
+    const currentBalance = xlmBalance ? parseFloat(xlmBalance.balance) : 0;
+
+    // Count existing trustlines (all non-native balance entries)
+    const existingTrustlines = account.balances.filter(
+      (b: any) => b.asset_type !== 'native'
+    ).length;
+
+    // Required reserve: 1 XLM base + 0.5 per trustline + 0.5 buffer
+    const requiredBalance = 1 + 0.5 * Math.max(existingTrustlines, NUM_TRUSTLINES) + 0.5;
+    const missingXlm = Math.max(0, requiredBalance - currentBalance);
+
+    if (missingXlm > 0) {
+      console.warn(
+        `[StellarAccountService] Account ${publicKey} has insufficient reserve. ` +
+        `Current: ${currentBalance} XLM, Required: ${requiredBalance} XLM, ` +
+        `Missing: ${missingXlm} XLM`
+      );
+    }
+
+    return {
+      sufficient: missingXlm === 0,
+      currentBalance,
+      requiredBalance,
+      missingXlm,
+    };
   }
 }
