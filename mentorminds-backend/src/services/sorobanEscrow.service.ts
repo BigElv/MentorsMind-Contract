@@ -1,5 +1,6 @@
 import { SorobanEscrowService } from "./escrow-api.service";
 import { StellarFeesService } from "./stellarFees.service";
+import { Networks, rpc as SorobanRpc } from '@stellar/stellar-sdk';
 
 // Max Stellar amount: 2^63 - 1 stroops = 922337203685.4775807 XLM
 const MAX_STELLAR_AMOUNT = 922337203685.4775807;
@@ -147,6 +148,16 @@ export class SorobanEscrowServiceImpl implements SorobanEscrowService {
   ) {}
 
   async verifyContractVersion(): Promise<boolean> {
+    // Check network configuration
+    const network = process.env.STELLAR_NETWORK || 'testnet';
+    const networkPassphrase = network === 'mainnet' ? Networks.PUBLIC : Networks.TESTNET;
+    const rpcUrl = process.env.SOROBAN_RPC_URL || 'https://soroban-testnet.stellar.org';
+    const rpcServer = new SorobanRpc.Server(rpcUrl, { allowHttp: rpcUrl.startsWith("http://") });
+    const networkInfo = await rpcServer.getNetwork();
+    if (networkInfo.passphrase !== networkPassphrase) {
+      throw new Error("SOROBAN_RPC_URL network passphrase does not match STELLAR_NETWORK configuration");
+    }
+
     if (!this.expectedContractVersion) {
       return true;
     }
