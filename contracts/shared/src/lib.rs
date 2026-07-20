@@ -8,6 +8,7 @@ use soroban_sdk::contracterror;
 /// behavior aligned across contracts that make the same safety assumptions.
 pub mod escrow;
 pub mod events;
+pub mod pause_guard;
 pub mod reentrancy_guard;
 pub mod sig_validation;
 pub mod state_machine;
@@ -15,6 +16,7 @@ pub mod storage;
 pub mod ttl_utils;
 
 pub use escrow::{EscrowRecord, EscrowStatus};
+pub use pause_guard::{ContractPaused, is_paused, require_not_paused};
 pub use reentrancy_guard::ReentrancyGuard;
 pub use sig_validation::{
     current_nonce, is_deadline_valid, validate_and_consume_nonce, validate_deadline,

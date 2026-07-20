@@ -1,6 +1,6 @@
 #![no_std]
 
-use shared::ReentrancyGuard;
+use shared::{ReentrancyGuard, require_not_paused};
 use soroban_sdk::{contract, contractimpl, contracttype, Address, Env, IntoVal, Symbol};
 
 #[contracttype]
@@ -48,6 +48,8 @@ pub enum DataKey {
     Admin,
     MNTToken,
     LeaderboardContract,
+    /// Optional pause guardian contract for circuit-breaker functionality.
+    PauseGuardian,
     Config,
     Referral(Address),       // referee -> ReferralInfo
     ReferrerCount(Address),
@@ -72,13 +74,16 @@ pub struct ReferralContract;
 
 #[contractimpl]
 impl ReferralContract {
-    pub fn initialize(env: Env, admin: Address, mnt_token: Address, leaderboard: Address) {
+    pub fn initialize(env: Env, admin: Address, mnt_token: Address, leaderboard: Address, pause_guardian: Option<Address>) {
         if env.storage().persistent().has(&DataKey::Admin) {
             panic!("Already initialized");
         }
         env.storage().persistent().set(&DataKey::Admin, &admin);
         env.storage().persistent().set(&DataKey::MNTToken, &mnt_token);
         env.storage().persistent().set(&DataKey::LeaderboardContract, &leaderboard);
+        if let Some(guardian) = pause_guardian {
+            env.storage().persistent().set(&DataKey::PauseGuardian, &guardian);
+        }
 
         let config = ReferralConfig {
             max_multiplier_bps: DEFAULT_MAX_MULTIPLIER_BPS,
@@ -87,6 +92,17 @@ impl ReferralContract {
         };
         env.storage().instance().set(&DataKey::Config, &config);
         env.storage().instance().set(&DataKey::GlobalMinted, &0i128);
+    }
+
+    /// Set or update the pause guardian contract address (admin only).
+    pub fn set_pause_guardian(env: Env, guardian: Address) {
+        let admin: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Admin)
+            .expect("Not initialized");
+        admin.require_auth();
+        env.storage().persistent().set(&DataKey::PauseGuardian, &guardian);
     }
 
     /// Update referral config. Admin only.
@@ -218,6 +234,11 @@ impl ReferralContract {
     }
 
     pub fn claim_reward(env: Env, referrer: Address) {
+        // Check pause guardian before any state mutation
+        if let Some(guardian) = env.storage().persistent().get::<DataKey, Address>(&DataKey::PauseGuardian) {
+            require_not_paused(&env, &guardian);
+        }
+
         let _guard = ReentrancyGuard::enter(&env, Symbol::new(&env, "claim_reward"));
         referrer.require_auth();
 
