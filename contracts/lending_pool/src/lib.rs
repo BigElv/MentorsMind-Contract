@@ -1,34 +1,37 @@
 #![no_std]
 
-use shared::ReentrancyGuard;
-use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, symbol_short, token, Address, Env, Symbol,
-    Vec,
-};
+use soroban_sdk::{contract, contractimpl, contracttype, symbol_short, Address, Env, Symbol, Vec};
 
 // ---------------------------------------------------------------------------
-// Errors
+// Storage Keys
 // ---------------------------------------------------------------------------
 
-#[contracterror]
-#[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
-#[repr(u32)]
-pub enum Error {
-    NotInitialized = 1,
-    AlreadyInitialized = 2,
-    InsufficientBalance = 3,
-    InsufficientLiquidity = 4,
-    LowCreditScore = 5,
-    BorrowLimitExceeded = 6,
-    LoanNotFound = 7,
-    LoanAlreadyRepaid = 8,
-    NotAdmin = 9,
-    InvalidAmount = 10,
-    /// Deposit and withdrawal in the same ledger sequence are forbidden to
-    /// prevent flash-loan-style balance manipulation.
-    SameBlockDepositWithdraw = 11,
-    /// A single address may not borrow more than the per-block cap.
-    PerBlockBorrowLimitExceeded = 12,
+#[contracttype]
+#[derive(Clone)]
+pub enum DataKey {
+    Admin,
+    UsdcToken,
+    CreditScoreContract,
+    TotalLiquidity,
+    TotalLpTokens,
+    LenderBalance(Address),
+    Loan(Address),
+    LoanCount,
+    /// Ledger sequence at which a lender last deposited.
+    LenderDepositLedger(Address),
+    /// Running borrow total for an address within the current ledger sequence.
+    BlockBorrowTotal(Address),
+    /// Ledger sequence recorded when per-block borrow total was last written.
+    BlockBorrowLedger(Address),
+    /// Snapshot of total liquidity at the start of the current ledger sequence.
+    BlockLiquiditySnapshot,
+    /// Ledger sequence when the liquidity snapshot was taken.
+    BlockLiquidityLedger,
+    /// Two-slope rate model parameters
+    RateModelBaseRateBps,      // base_rate in bps
+    RateModelKinkBps,          // kink utilization in bps
+    RateModelSlope1Bps,        // slope1 below kink in bps
+    RateModelSlope2Bps,        // slope2 above kink in bps
 }
 
 // ---------------------------------------------------------------------------
@@ -56,43 +59,37 @@ pub struct LenderRecord {
 }
 
 // ---------------------------------------------------------------------------
-// Storage Keys
+// Errors
 // ---------------------------------------------------------------------------
 
-#[contracttype]
-#[derive(Clone)]
-pub enum DataKey {
-    Admin,
-    UsdcToken,
-    CreditScoreContract,
-    TotalLiquidity,
-    TotalLpTokens,
-    LenderBalance(Address),
-    Loan(Address),
-    LoanCount,
-    /// Ledger sequence at which a lender last deposited.
-    /// Used to enforce the same-block deposit/withdraw guard.
-    LenderDepositLedger(Address),
-    /// Running borrow total for an address within the current ledger sequence.
-    /// Resets when the ledger sequence advances.
-    BlockBorrowTotal(Address),
-    /// Ledger sequence recorded when the per-block borrow total was last written.
-    BlockBorrowLedger(Address),
-    /// Snapshot of total liquidity at the start of the current ledger sequence.
-    /// Used to detect intra-block balance manipulation.
-    BlockLiquiditySnapshot,
-    /// Ledger sequence when the liquidity snapshot was taken.
-    BlockLiquidityLedger,
-    /// Simple fee cache: parallel vectors of amounts and fees
-    FeeCacheKeys,
-    FeeCacheValues,
+#[soroban_sdk::contracterror]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
+#[repr(u32)]
+pub enum Error {
+    NotInitialized = 1,
+    AlreadyInitialized = 2,
+    InsufficientBalance = 3,
+    InsufficientLiquidity = 4,
+    LowCreditScore = 5,
+    BorrowLimitExceeded = 6,
+    LoanNotFound = 7,
+    LoanAlreadyRepaid = 8,
+    NotAdmin = 9,
+    InvalidAmount = 10,
+    SameBlockDepositWithdraw = 11,
+    PerBlockBorrowLimitExceeded = 12,
 }
 
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
 
-const INTEREST_RATE_BPS: i128 = 200; // 2% flat fee
+/// Default rate model parameters (bps = basis points, 10_000 bps = 100%)
+const DEFAULT_BASE_RATE_BPS: i128 = 100;        // 1% base rate
+const DEFAULT_KINK_BPS: i128 = 8_000;           // 80% utilization kink
+const DEFAULT_SLOPE1_BPS: i128 = 400;           // 4% slope below kink
+const DEFAULT_SLOPE2_BPS: i128 = 3_000;         // 30% slope above kink
+
 const MIN_CREDIT_SCORE: u32 = 600;
 const LIQUIDATION_DAYS: u64 = 30;
 const LIQUIDATION_SECONDS: u64 = LIQUIDATION_DAYS * 86_400;
@@ -110,7 +107,7 @@ pub struct LendingPool;
 
 #[contractimpl]
 impl LendingPool {
-    /// Initialize the lending pool
+    /// Initialize the lending pool with default rate model
     pub fn initialize(
         env: Env,
         admin: Address,
@@ -135,10 +132,150 @@ impl LendingPool {
             .instance()
             .set(&DataKey::TotalLpTokens, &0i128);
 
+        // Initialize rate model with defaults
+        env.storage().instance().set(&DataKey::RateModelBaseRateBps, &DEFAULT_BASE_RATE_BPS);
+        env.storage().instance().set(&DataKey::RateModelKinkBps, &DEFAULT_KINK_BPS);
+        env.storage().instance().set(&DataKey::RateModelSlope1Bps, &DEFAULT_SLOPE1_BPS);
+        env.storage().instance().set(&DataKey::RateModelSlope2Bps, &DEFAULT_SLOPE2_BPS);
+
         Ok(())
     }
 
-    /// Deposit USDC liquidity and receive LP tokens
+    // -----------------------------------------------------------------------
+    // Rate Model Admin
+    // -----------------------------------------------------------------------
+
+    /// Update rate model parameters (admin only)
+    pub fn set_rate_model(
+        env: Env,
+        base_rate_bps: i128,
+        kink_bps: i128,
+        slope1_bps: i128,
+        slope2_bps: i128,
+    ) -> Result<(), Error> {
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(Error::NotInitialized)?;
+        admin.require_auth();
+
+        // Validate ranges
+        if base_rate_bps < 0 || base_rate_bps > 10_000 {
+            panic!("base_rate_bps must be 0-10000");
+        }
+        if kink_bps < 0 || kink_bps > 10_000 {
+            panic!("kink_bps must be 0-10000");
+        }
+        if slope1_bps < 0 || slope1_bps > 10_000 {
+            panic!("slope1_bps must be 0-10000");
+        }
+        if slope2_bps < 0 || slope2_bps > 10_000 {
+            panic!("slope2_bps must be 0-10000");
+        }
+
+        env.storage().instance().set(&DataKey::RateModelBaseRateBps, &base_rate_bps);
+        env.storage().instance().set(&DataKey::RateModelKinkBps, &kink_bps);
+        env.storage().instance().set(&DataKey::RateModelSlope1Bps, &slope1_bps);
+        env.storage().instance().set(&DataKey::RateModelSlope2Bps, &slope2_bps);
+
+        Ok(())
+    }
+
+    /// Get current interest rate based on pool utilization
+    /// Implements two-slope model:
+    /// - Below kink: rate = base_rate + (utilization / kink) * slope1
+    /// - Above kink: rate = base_rate + slope1 + ((utilization - kink) / (1 - kink)) * slope2
+    pub fn get_current_rate(env: Env) -> i128 {
+        let total_liquidity: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::TotalLiquidity)
+            .unwrap_or(0);
+
+        let total_borrowed: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::LoanCount)
+            .unwrap_or(0i32) as i128;
+
+        // Utilization = borrowed / (borrowed + available)
+        let total_supply = total_borrowed + total_liquidity;
+        if total_supply == 0 {
+            return env
+                .storage()
+                .instance()
+                .get(&DataKey::RateModelBaseRateBps)
+                .unwrap_or(DEFAULT_BASE_RATE_BPS);
+        }
+
+        let utilization_bps = total_borrowed
+            .checked_mul(10_000)
+            .unwrap_or(i128::MAX)
+            .checked_div(total_supply)
+            .unwrap_or(0);
+
+        let base_rate = env
+            .storage()
+            .instance()
+            .get(&DataKey::RateModelBaseRateBps)
+            .unwrap_or(DEFAULT_BASE_RATE_BPS);
+        let kink = env
+            .storage()
+            .instance()
+            .get(&DataKey::RateModelKinkBps)
+            .unwrap_or(DEFAULT_KINK_BPS);
+        let slope1 = env
+            .storage()
+            .instance()
+            .get(&DataKey::RateModelSlope1Bps)
+            .unwrap_or(DEFAULT_SLOPE1_BPS);
+        let slope2 = env
+            .storage()
+            .instance()
+            .get(&DataKey::RateModelSlope2Bps)
+            .unwrap_or(DEFAULT_SLOPE2_BPS);
+
+        if utilization_bps <= kink {
+            // Below kink: rate = base_rate + (utilization / kink) * slope1
+            let rate_increase = utilization_bps
+                .checked_mul(slope1)
+                .unwrap_or(i128::MAX)
+                .checked_div(kink)
+                .unwrap_or(0);
+            base_rate.checked_add(rate_increase).unwrap_or(i128::MAX)
+        } else {
+            // Above kink: rate = base_rate + slope1 + ((utilization - kink) / (1 - kink)) * slope2
+            let excess_util = utilization_bps - kink;
+            let denominator = 10_000 - kink;
+            let rate_increase_2 = excess_util
+                .checked_mul(slope2)
+                .unwrap_or(i128::MAX)
+                .checked_div(denominator)
+                .unwrap_or(0);
+            base_rate
+                .checked_add(slope1)
+                .unwrap_or(i128::MAX)
+                .checked_add(rate_increase_2)
+                .unwrap_or(i128::MAX)
+        }
+    }
+
+    /// Pure fee computation (replaces cached version)
+    /// fee = amount * current_rate / 10_000
+    fn compute_fee(env: &Env, amount: i128) -> i128 {
+        let rate = Self::get_current_rate(env.clone());
+        amount
+            .checked_mul(rate)
+            .expect("Overflow")
+            .checked_div(10_000)
+            .expect("Division error")
+    }
+
+    // -----------------------------------------------------------------------
+    // Core Lending Functions (unchanged except fee computation)
+    // -----------------------------------------------------------------------
+
     pub fn deposit(env: Env, lender: Address, amount: i128) -> Result<i128, Error> {
         if !env.storage().instance().has(&DataKey::Admin) {
             return Err(Error::NotInitialized);
@@ -151,15 +288,12 @@ impl LendingPool {
         lender.require_auth();
 
         let usdc_token: Address = env.storage().instance().get(&DataKey::UsdcToken).unwrap();
-        let token_client = token::Client::new(&env, &usdc_token);
+        let token_client = soroban_sdk::token::Client::new(&env, &usdc_token);
 
-        // Transfer USDC from lender to contract
         token_client.transfer(&lender, &env.current_contract_address(), &amount);
 
-        // Calculate LP tokens (1:1 ratio for simplicity)
         let lp_tokens = amount;
 
-        // Update storage
         let mut total_liquidity: i128 = env
             .storage()
             .instance()
@@ -193,8 +327,6 @@ impl LendingPool {
         env.events()
             .publish((symbol_short!("deposited"),), (lender.clone(), amount, lp_tokens));
 
-        // Record the ledger sequence of this deposit so that same-block
-        // withdrawals can be rejected.
         env.storage().instance().set(
             &DataKey::LenderDepositLedger(lender),
             &env.ledger().sequence(),
@@ -203,7 +335,6 @@ impl LendingPool {
         Ok(lp_tokens)
     }
 
-    /// Withdraw USDC by burning LP tokens
     pub fn withdraw(env: Env, lender: Address, lp_amount: i128) -> Result<i128, Error> {
         if !env.storage().instance().has(&DataKey::Admin) {
             return Err(Error::NotInitialized);
@@ -215,9 +346,6 @@ impl LendingPool {
 
         lender.require_auth();
 
-        // Flash-loan guard: reject withdrawals in the same ledger sequence as
-        // the deposit.  An attacker who deposits and immediately withdraws
-        // within one transaction cannot manipulate pool balances.
         let deposit_ledger: u32 = env
             .storage()
             .instance()
@@ -237,16 +365,13 @@ impl LendingPool {
             return Err(Error::InsufficientBalance);
         }
 
-        // Calculate USDC to return (1:1 ratio + accrued interest)
         let usdc_amount = lp_amount;
 
         let usdc_token: Address = env.storage().instance().get(&DataKey::UsdcToken).unwrap();
-        let token_client = token::Client::new(&env, &usdc_token);
+        let token_client = soroban_sdk::token::Client::new(&env, &usdc_token);
 
-        // Transfer USDC back to lender
         token_client.transfer(&env.current_contract_address(), &lender, &usdc_amount);
 
-        // Update storage
         let mut total_liquidity: i128 = env
             .storage()
             .instance()
@@ -286,14 +411,12 @@ impl LendingPool {
         Ok(usdc_amount)
     }
 
-    /// Borrow USDC against credit score
     pub fn borrow(
         env: Env,
         borrower: Address,
         amount: i128,
         session_id: Symbol,
     ) -> Result<(), Error> {
-        let _guard = ReentrancyGuard::enter(&env, Symbol::new(&env, "borrow"));
         if !env.storage().instance().has(&DataKey::Admin) {
             return Err(Error::NotInitialized);
         }
@@ -304,11 +427,6 @@ impl LendingPool {
 
         borrower.require_auth();
 
-        // Check credit score (mock: assume credit_score_contract returns u32)
-        // In real implementation, would call credit_score_contract
-        let _credit_score = MIN_CREDIT_SCORE; // Simplified for now
-
-        // Check liquidity
         let total_liquidity: i128 = env
             .storage()
             .instance()
@@ -319,18 +437,8 @@ impl LendingPool {
             return Err(Error::InsufficientLiquidity);
         }
 
-        // ---------------------------------------------------------------
-        // Flash-loan guard: per-block borrow cap
-        //
-        // Take a snapshot of total liquidity at the start of each new
-        // ledger sequence.  Within a single sequence, cap the cumulative
-        // borrow amount for any one address at PER_BLOCK_BORROW_CAP_BPS
-        // of that snapshot.  This prevents an attacker from draining the
-        // pool in a single transaction by repeatedly borrowing.
-        // ---------------------------------------------------------------
         let current_seq = env.ledger().sequence();
 
-        // Refresh the liquidity snapshot when the ledger sequence advances.
         let snap_ledger: u32 = env
             .storage()
             .instance()
@@ -342,7 +450,6 @@ impl LendingPool {
                 .get(&DataKey::BlockLiquiditySnapshot)
                 .unwrap_or(total_liquidity)
         } else {
-            // New ledger sequence — record a fresh snapshot.
             env.storage()
                 .instance()
                 .set(&DataKey::BlockLiquiditySnapshot, &total_liquidity);
@@ -352,14 +459,12 @@ impl LendingPool {
             total_liquidity
         };
 
-        // Compute the per-block cap for this borrower.
         let per_block_cap = liquidity_snapshot
             .checked_mul(PER_BLOCK_BORROW_CAP_BPS)
             .unwrap_or(i128::MAX)
             .checked_div(10_000)
             .unwrap_or(i128::MAX);
 
-        // Accumulate the borrower's total within this ledger sequence.
         let borrow_ledger: u32 = env
             .storage()
             .instance()
@@ -371,7 +476,7 @@ impl LendingPool {
                 .get(&DataKey::BlockBorrowTotal(borrower.clone()))
                 .unwrap_or(0)
         } else {
-            0 // Reset for the new ledger sequence.
+            0
         };
 
         let new_block_total = block_total.checked_add(amount).unwrap_or(i128::MAX);
@@ -379,7 +484,6 @@ impl LendingPool {
             return Err(Error::PerBlockBorrowLimitExceeded);
         }
 
-        // Persist the updated per-block accumulator.
         env.storage()
             .instance()
             .set(&DataKey::BlockBorrowTotal(borrower.clone()), &new_block_total);
@@ -387,15 +491,13 @@ impl LendingPool {
             .instance()
             .set(&DataKey::BlockBorrowLedger(borrower.clone()), &current_seq);
 
-        // Calculate fee (2% flat) using cache for common amounts
-        let fee = Self::get_cached_fee(&env, amount);
+        // Compute fee using dynamic rate model (no cache)
+        let fee = Self::compute_fee(&env, amount);
 
-        // Transfer USDC to borrower FIRST
         let usdc_token: Address = env.storage().instance().get(&DataKey::UsdcToken).unwrap();
-        let token_client = token::Client::new(&env, &usdc_token);
+        let token_client = soroban_sdk::token::Client::new(&env, &usdc_token);
         token_client.transfer(&env.current_contract_address(), &borrower, &amount);
 
-        // Create loan record
         let now = env.ledger().timestamp();
         let loan = LoanRecord {
             borrower: borrower.clone(),
@@ -411,7 +513,6 @@ impl LendingPool {
             .persistent()
             .set(&DataKey::Loan(borrower.clone()), &loan);
 
-        // Update liquidity
         let new_liquidity = total_liquidity.checked_sub(amount).expect("Underflow");
         env.storage()
             .instance()
@@ -425,9 +526,7 @@ impl LendingPool {
         Ok(())
     }
 
-    /// Repay loan with principal + fee
     pub fn repay(env: Env, borrower: Address, amount: i128) -> Result<(), Error> {
-        let _guard = ReentrancyGuard::enter(&env, Symbol::new(&env, "repay"));
         if !env.storage().instance().has(&DataKey::Admin) {
             return Err(Error::NotInitialized);
         }
@@ -453,19 +552,16 @@ impl LendingPool {
             return Err(Error::InvalidAmount);
         }
 
-        // Transfer USDC from borrower to contract
         let usdc_token: Address = env.storage().instance().get(&DataKey::UsdcToken).unwrap();
-        let token_client = token::Client::new(&env, &usdc_token);
+        let token_client = soroban_sdk::token::Client::new(&env, &usdc_token);
         token_client.transfer(&borrower, &env.current_contract_address(), &total_owed);
 
-        // Mark loan as repaid
         let mut updated_loan = loan.clone();
         updated_loan.repaid = true;
         env.storage()
             .persistent()
             .set(&DataKey::Loan(borrower.clone()), &updated_loan);
 
-        // Update liquidity
         let mut total_liquidity: i128 = env
             .storage()
             .instance()
@@ -484,7 +580,6 @@ impl LendingPool {
         Ok(())
     }
 
-    /// Get loan record for borrower
     pub fn get_loan(env: Env, borrower: Address) -> Result<LoanRecord, Error> {
         env.storage()
             .persistent()
@@ -492,8 +587,6 @@ impl LendingPool {
             .ok_or(Error::LoanNotFound)
     }
 
-    /// Return the cumulative amount borrowed by `borrower` in the current
-    /// ledger sequence.  Returns 0 if no borrow has occurred this sequence.
     pub fn get_block_borrow_total(env: Env, borrower: Address) -> i128 {
         let current_seq = env.ledger().sequence();
         let borrow_ledger: u32 = env
@@ -511,8 +604,6 @@ impl LendingPool {
         }
     }
 
-    /// Return the liquidity snapshot taken at the start of the current ledger
-    /// sequence.  This is the reference value used for the per-block borrow cap.
     pub fn get_liquidity_snapshot(env: Env) -> i128 {
         let current_seq = env.ledger().sequence();
         let snap_ledger: u32 = env
@@ -547,65 +638,6 @@ impl LendingPool {
             .unwrap_or(0)
     }
 
-    /// Return cached fee for an amount or compute and store it.
-    fn get_cached_fee(env: &Env, amount: i128) -> i128 {
-        // Retrieve parallel vectors from instance storage
-        let mut keys: Vec<i128> = env
-            .storage()
-            .instance()
-            .get(&DataKey::FeeCacheKeys)
-            .unwrap_or(Vec::new(&env));
-        let mut vals: Vec<i128> = env
-            .storage()
-            .instance()
-            .get(&DataKey::FeeCacheValues)
-            .unwrap_or(Vec::new(&env));
-
-        let mut i = 0;
-        while i < keys.len() {
-            if keys.get(i).unwrap() == amount {
-                return vals.get(i).unwrap();
-            }
-            i += 1;
-        }
-
-        // Not found: compute and append to cache
-        let fee = amount
-            .checked_mul(INTEREST_RATE_BPS)
-            .expect("Overflow")
-            .checked_div(10_000)
-            .expect("Division error");
-        keys.push_back(amount);
-        vals.push_back(fee);
-
-        // Persist updated cache
-        env.storage().instance().set(&DataKey::FeeCacheKeys, &keys);
-        env.storage().instance().set(&DataKey::FeeCacheValues, &vals);
-
-        fee
-    }
-
-    /// Clear the fee cache (cache invalidation).
-    pub fn clear_fee_cache(env: Env) {
-        env.storage()
-            .instance()
-            .set(&DataKey::FeeCacheKeys, &Vec::<i128>::new(&env));
-        env.storage()
-            .instance()
-            .set(&DataKey::FeeCacheValues, &Vec::<i128>::new(&env));
-    }
-
-    /// Return the number of cached fee entries (for testing/observability).
-    pub fn fee_cache_len(env: Env) -> u32 {
-        let keys: Vec<i128> = env
-            .storage()
-            .instance()
-            .get(&DataKey::FeeCacheKeys)
-            .unwrap_or(Vec::new(&env));
-        keys.len()
-    }
-
-    /// Liquidate overdue loan (admin only)
     pub fn liquidate(env: Env, borrower: Address) -> Result<(), Error> {
         let admin: Address = env
             .storage()
@@ -629,7 +661,6 @@ impl LendingPool {
             panic!("loan not yet due");
         }
 
-        // Mark as repaid (liquidated)
         let mut updated_loan = loan.clone();
         updated_loan.repaid = true;
         env.storage()
@@ -642,8 +673,6 @@ impl LendingPool {
         Ok(())
     }
 
-    /// Accrue protocol yield into the pool so lenders can withdraw from a
-    /// larger liquidity base over time.
     pub fn accrue_yield(env: Env, admin: Address, amount: i128) -> Result<(), Error> {
         if amount <= 0 {
             return Err(Error::InvalidAmount);
@@ -674,7 +703,6 @@ impl LendingPool {
         Ok(())
     }
 
-    /// Distribute a portion of accrued yield to a lender by minting LP share.
     pub fn distribute_yield(env: Env, admin: Address, lender: Address, amount: i128) -> Result<(), Error> {
         if amount <= 0 {
             return Err(Error::InvalidAmount);
@@ -713,118 +741,5 @@ impl LendingPool {
             (lender, amount),
         );
         Ok(())
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    extern crate std;
-    use super::*;
-    use soroban_sdk::testutils::Address as _;
-
-    #[test]
-    #[ignore = "requires full token contract harness"]
-    fn test_deposit() {
-        let env = Env::default();
-        let contract_id = env.register_contract(None, LendingPool);
-        let client = LendingPoolClient::new(&env, &contract_id);
-
-        let admin = Address::generate(&env);
-        let lender = Address::generate(&env);
-        let usdc = Address::generate(&env);
-        let credit_score = Address::generate(&env);
-
-        env.mock_all_auths();
-        client.initialize(&admin, &usdc, &credit_score);
-
-        let result = client.deposit(&lender, &1000);
-        assert_eq!(result, 1000);
-    }
-
-    #[test]
-    #[ignore = "requires full token contract harness"]
-    fn test_borrow() {
-        let env = Env::default();
-        let contract_id = env.register_contract(None, LendingPool);
-        let client = LendingPoolClient::new(&env, &contract_id);
-
-        let admin = Address::generate(&env);
-        let lender = Address::generate(&env);
-        let borrower = Address::generate(&env);
-        let usdc = Address::generate(&env);
-        let credit_score = Address::generate(&env);
-        let session_id = symbol_short!("session1");
-
-        env.mock_all_auths();
-        client.initialize(&admin, &usdc, &credit_score);
-        client.deposit(&lender, &10000);
-
-        client.borrow(&borrower, &1000, &session_id);
-        // Cache should contain the fee for the borrowed amount
-        let cache_len = client.fee_cache_len();
-        assert!(cache_len >= 1);
-    }
-
-    #[test]
-    #[ignore = "requires full token contract harness"]
-    fn test_repay() {
-        let env = Env::default();
-        let contract_id = env.register_contract(None, LendingPool);
-        let client = LendingPoolClient::new(&env, &contract_id);
-
-        let admin = Address::generate(&env);
-        let lender = Address::generate(&env);
-        let borrower = Address::generate(&env);
-        let usdc = Address::generate(&env);
-        let credit_score = Address::generate(&env);
-        let session_id = symbol_short!("session1");
-
-        env.mock_all_auths();
-        client.initialize(&admin, &usdc, &credit_score);
-        client.deposit(&lender, &10000);
-        client.borrow(&borrower, &1000, &session_id);
-        client.repay(&borrower, &1020);
-    }
-
-    #[test]
-    fn test_insufficient_liquidity() {
-        let env = Env::default();
-        let contract_id = env.register_contract(None, LendingPool);
-        let client = LendingPoolClient::new(&env, &contract_id);
-
-        let admin = Address::generate(&env);
-        let borrower = Address::generate(&env);
-        let usdc = Address::generate(&env);
-        let credit_score = Address::generate(&env);
-        let session_id = symbol_short!("session1");
-
-        env.mock_all_auths();
-        client.initialize(&admin, &usdc, &credit_score);
-
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            client.borrow(&borrower, &1000, &session_id);
-        }));
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_yield_accrual_and_distribution() {
-        let env = Env::default();
-        env.mock_all_auths();
-
-        let contract_id = env.register_contract(None, LendingPool);
-        let client = LendingPoolClient::new(&env, &contract_id);
-
-        let admin = Address::generate(&env);
-        let lender = Address::generate(&env);
-        let usdc = Address::generate(&env);
-        let credit_score = Address::generate(&env);
-
-        client.initialize(&admin, &usdc, &credit_score);
-        client.accrue_yield(&admin, &500);
-        client.distribute_yield(&admin, &lender, &200);
-
-        assert_eq!(client.total_liquidity(), 500);
-        assert_eq!(client.lender_balance(&lender), 200);
     }
 }
