@@ -26,7 +26,8 @@ mentorminds-upgrade-registry = { path = "../contracts/upgrade_registry", feature
 mentorminds-pause-guardian = { path = "../contracts/pause_guardian", features = ["testutils"] }
 mentorminds-dispute-evidence = { path = "../contracts/dispute_evidence", features = ["testutils"] }
 mentorminds-referral = { path = "../contracts/referral", features = ["testutils"] }
-mentorminds-payment-router = { path = "../contracts/payment_router", features = ["testutils"] }
+payment_router = { path = "../contracts/payment_router", features = ["testutils"] }
+mentorminds-snapshot = { path = "../contracts/snapshot", features = ["testutils"] }
 
 [dev-dependencies]
 
@@ -73,3 +74,7 @@ path = "fee_precision_tests.rs"
 [[test]]
 name = "upgrade_safety_tests"
 path = "upgrade_safety_tests.rs"
+
+[[test]]
+name = "disaster_recovery"
+path = "disaster_recovery.rs"

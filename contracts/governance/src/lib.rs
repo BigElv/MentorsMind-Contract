@@ -601,7 +601,7 @@ impl GovernanceContract {
         appellant.require_auth();
         let appeal = AppealRecord {
             proposal_id,
-            appellant,
+            appellant: appellant.clone(),
             reason,
             submitted_at: env.ledger().timestamp(),
             resolved: false,
