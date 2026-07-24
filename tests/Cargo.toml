@@ -25,6 +25,7 @@ mentorminds-lending-pool = { path = "../contracts/lending_pool", features = ["te
 mentorminds-upgrade-registry = { path = "../contracts/upgrade_registry", features = ["testutils"] }
 mentorminds-pause-guardian = { path = "../contracts/pause_guardian", features = ["testutils"] }
 mentorminds-dispute-evidence = { path = "../contracts/dispute_evidence", features = ["testutils"] }
+mentorminds-insurance = { path = "../contracts/insurance", features = ["testutils"] }
 mentorminds-referral = { path = "../contracts/referral", features = ["testutils"] }
 payment_router = { path = "../contracts/payment_router", features = ["testutils"] }
 mentorminds-snapshot = { path = "../contracts/snapshot", features = ["testutils"] }
@@ -78,3 +79,7 @@ path = "upgrade_safety_tests.rs"
 [[test]]
 name = "disaster_recovery"
 path = "disaster_recovery.rs"
+
+[[test]]
+name = "dispute_flow"
+path = "dispute_flow.rs"
