@@ -62,6 +62,11 @@ impl KycRegistry {
     ) {
         Self::require_operator(&env, &operator);
 
+        let now = env.ledger().timestamp();
+        if expiry <= now {
+            panic!("KYC expiry must be in the future");
+        }
+
         let record = KycRecord {
             level,
             expiry,
@@ -120,7 +125,7 @@ impl KycRegistry {
             .get(&DataKey::Admin)
             .expect("Not initialized");
         if stored_admin != *admin {
-            panic!("Not authorized");
+            panic!("Admin address mismatch");
         }
     }
 
@@ -143,7 +148,7 @@ impl KycRegistry {
         if !RbacContractClient::new(env, &rbac)
             .has_role(&Symbol::new(env, "KYC_OPERATOR"), operator)
         {
-            panic!("Not authorized");
+            panic!("KYC_OPERATOR role required");
         }
     }
 }

@@ -1,5 +1,6 @@
 #![no_std]
 
+use shared::events::{emit_staking_event, evt_staking_staked, evt_staking_unstaked};
 use shared::ReentrancyGuard;
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, token, Address, Env, Symbol,
@@ -32,6 +33,7 @@ pub struct StakeRecord {
     pub amount: i128,
     pub staked_at: u64,
     pub unlock_at: u64,
+    pub unlock_cooldown_until: Option<u64>,
     pub tier: u32,
 }
 
@@ -45,6 +47,7 @@ pub struct StakedEventData {
     pub mentor: Address,
     pub amount: i128,
     pub unlock_at: u64,
+    pub unlock_cooldown_until: Option<u64>,
     pub tier: u32,
 }
 
@@ -65,8 +68,12 @@ pub enum DataKey {
     Admin,
     MNTToken,
     Stake(Address),
+    StakerAt(u32),
+    StakerCount,
+    StakerIndex(Address),
     Stakers,
     TotalStaked,
+    PendingRewards(Address),
 }
 
 // ---------------------------------------------------------------------------
@@ -153,8 +160,8 @@ impl StakingContract {
         token_client.transfer(&mentor, &env.current_contract_address(), &amount);
 
         let now = env.ledger().timestamp();
-        let lock_seconds = (lock_period_days as u64) * 86_400u64;
-        let unlock_at = now + lock_seconds;
+        let lock_seconds = (lock_period_days as u64).checked_mul(86_400u64).expect("Overflow");
+        let unlock_at = now.checked_add(lock_seconds).expect("Timestamp overflow");
         let tier = compute_tier(amount);
 
         let record = StakeRecord {
@@ -162,6 +169,7 @@ impl StakingContract {
             amount,
             staked_at: now,
             unlock_at,
+            unlock_cooldown_until: None,
             tier,
         };
 
@@ -170,14 +178,12 @@ impl StakingContract {
             .set(&DataKey::Stake(mentor.clone()), &record);
 
         // Update stakers list and total staked
-        let mut stakers: soroban_sdk::Vec<Address> = env
-            .storage()
-            .persistent()
-            .get(&DataKey::Stakers)
-            .unwrap_or_else(|| soroban_sdk::Vec::new(&env));
-        if !stakers.contains(&mentor) {
-            stakers.push_back(mentor.clone());
-            env.storage().persistent().set(&DataKey::Stakers, &stakers);
+        let key = DataKey::StakerIndex(mentor.clone());
+        if !env.storage().persistent().has(&key) {
+            let count: u32 = env.storage().persistent().get(&DataKey::StakerCount).unwrap_or(0);
+            env.storage().persistent().set(&DataKey::StakerAt(count), &mentor);
+            env.storage().persistent().set(&key, &count);
+            env.storage().persistent().set(&DataKey::StakerCount, &(count + 1));
         }
 
         let total_staked: i128 = env
@@ -187,18 +193,16 @@ impl StakingContract {
             .unwrap_or(0);
         env.storage()
             .persistent()
-            .set(&DataKey::TotalStaked, &(total_staked + amount));
+            .set(&DataKey::TotalStaked, &(total_staked.checked_add(amount).expect("Overflow")));
 
-        env.events().publish(
-            (
-                Symbol::new(&env, "Staking"),
-                Symbol::new(&env, "staked"),
-                mentor.clone(),
-            ),
+        emit_staking_event(
+            &env,
+            evt_staking_staked(&env),
             StakedEventData {
                 mentor,
                 amount,
                 unlock_at,
+                unlock_cooldown_until: None,
                 tier,
             },
         );
@@ -245,14 +249,20 @@ impl StakingContract {
             .remove(&DataKey::Stake(mentor.clone()));
 
         // Update stakers list and total staked
-        let mut stakers: soroban_sdk::Vec<Address> = env
-            .storage()
-            .persistent()
-            .get(&DataKey::Stakers)
-            .unwrap_or_else(|| soroban_sdk::Vec::new(&env));
-        if let Some(index) = stakers.first_index_of(&mentor) {
-            stakers.remove(index);
-            env.storage().persistent().set(&DataKey::Stakers, &stakers);
+        let key = DataKey::StakerIndex(mentor.clone());
+        if let Some(index) = env.storage().persistent().get::<_, u32>(&key) {
+            let count: u32 = env.storage().persistent().get(&DataKey::StakerCount).unwrap_or(0);
+            let last_index = count - 1;
+            
+            if index != last_index {
+                let last_mentor: Address = env.storage().persistent().get(&DataKey::StakerAt(last_index)).unwrap();
+                env.storage().persistent().set(&DataKey::StakerAt(index), &last_mentor);
+                env.storage().persistent().set(&DataKey::StakerIndex(last_mentor), &index);
+            }
+            
+            env.storage().persistent().remove(&DataKey::StakerAt(last_index));
+            env.storage().persistent().remove(&key);
+            env.storage().persistent().set(&DataKey::StakerCount, &last_index);
         }
 
         let total_staked: i128 = env
@@ -262,14 +272,11 @@ impl StakingContract {
             .unwrap_or(0);
         env.storage()
             .persistent()
-            .set(&DataKey::TotalStaked, &(total_staked - record.amount));
+            .set(&DataKey::TotalStaked, &(total_staked.checked_sub(record.amount).expect("Underflow")));
 
-        env.events().publish(
-            (
-                Symbol::new(&env, "Staking"),
-                Symbol::new(&env, "unstaked"),
-                mentor.clone(),
-            ),
+        emit_staking_event(
+            &env,
+            evt_staking_unstaked(&env),
             UnstakedEventData {
                 mentor,
                 amount: record.amount,
@@ -297,12 +304,20 @@ impl StakingContract {
             .unwrap_or(0)
     }
 
-    /// Return all current stakers.
+    pub fn get_staker_count(env: Env) -> u32 {
+        env.storage().persistent().get(&DataKey::StakerCount).unwrap_or(0)
+    }
+
+    /// Return all current stakers (Paginated).
     pub fn get_stakers(env: Env) -> soroban_sdk::Vec<Address> {
-        env.storage()
-            .persistent()
-            .get(&DataKey::Stakers)
-            .unwrap_or_else(|| soroban_sdk::Vec::new(&env))
+        let count = Self::get_staker_count(env.clone());
+        let mut out = soroban_sdk::Vec::new(&env);
+        for i in 0..count {
+            if let Some(addr) = env.storage().persistent().get::<_, Address>(&DataKey::StakerAt(i)) {
+                out.push_back(addr);
+            }
+        }
+        out
     }
 
     /// Return the total amount staked in the contract.
@@ -310,6 +325,102 @@ impl StakingContract {
         env.storage()
             .persistent()
             .get(&DataKey::TotalStaked)
+            .unwrap_or(0)
+    }
+
+    /// Distribute rewards to stakers pro-rata based on their stake amounts.
+    /// Processes a window of stakers.
+    pub fn distribute_revenue_batch(env: Env, token: Address, amount: i128, offset: u32, limit: u32) {
+        let total_staked: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::TotalStaked)
+            .unwrap_or(0);
+
+        if total_staked == 0 {
+            return;
+        }
+
+        let count = Self::get_staker_count(env.clone());
+        let end = (offset + limit).min(count);
+
+        for i in offset..end {
+            if let Some(staker) = env.storage().persistent().get::<_, Address>(&DataKey::StakerAt(i)) {
+                let record: StakeRecord = env
+                    .storage()
+                    .persistent()
+                    .get(&DataKey::Stake(staker.clone()))
+                    .unwrap();
+
+                let share = (record.amount * amount) / total_staked;
+
+                if share > 0 {
+                    let pending: i128 = env
+                        .storage()
+                        .persistent()
+                        .get(&DataKey::PendingRewards(staker.clone()))
+                        .unwrap_or(0);
+                    env.storage()
+                        .persistent()
+                        .set(&DataKey::PendingRewards(staker.clone()), &(pending + share));
+                }
+            }
+        }
+    }
+
+    pub fn migrate_stakers(env: Env) {
+        if !env.storage().instance().has(&DataKey::Admin) {
+            panic!("Not initialized");
+        }
+        if let Some(list) = env.storage().persistent().get::<_, soroban_sdk::Vec<Address>>(&DataKey::Stakers) {
+            let mut count: u32 = env.storage().persistent().get(&DataKey::StakerCount).unwrap_or(0);
+            for staker in list.iter() {
+                if !env.storage().persistent().has(&DataKey::StakerIndex(staker.clone())) {
+                    env.storage().persistent().set(&DataKey::StakerAt(count), &staker);
+                    env.storage().persistent().set(&DataKey::StakerIndex(staker.clone()), &count);
+                    count += 1;
+                }
+            }
+            env.storage().persistent().set(&DataKey::StakerCount, &count);
+            env.storage().persistent().remove(&DataKey::Stakers);
+        }
+    }
+
+    /// Claim pending rewards for a staker.
+    /// Transfers the pending rewards to the staker's address.
+    pub fn claim_rewards(env: Env, staker: Address, token: Address) -> Result<(), Error> {
+        let _guard = ReentrancyGuard::enter(&env, Symbol::new(&env, "claim_rewards"));
+        if !env.storage().instance().has(&DataKey::Admin) {
+            return Err(Error::NotInitialized);
+        }
+
+        staker.require_auth();
+
+        let pending: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::PendingRewards(staker.clone()))
+            .unwrap_or(0);
+
+        if pending == 0 {
+            return Err(Error::InvalidAmount);
+        }
+
+        let token_client = token::Client::new(&env, &token);
+        token_client.transfer(&env.current_contract_address(), &staker, &pending);
+
+        env.storage()
+            .persistent()
+            .remove(&DataKey::PendingRewards(staker.clone()));
+
+        Ok(())
+    }
+
+    /// Get the pending rewards for a staker.
+    pub fn get_pending_rewards(env: Env, staker: Address) -> i128 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::PendingRewards(staker))
             .unwrap_or(0)
     }
 }
@@ -584,5 +695,20 @@ mod test {
         let f = Fixture::setup();
         let result = f.client().try_initialize(&f.admin, &f.mnt_id);
         assert_eq!(result, Err(Ok(Error::AlreadyInitialized)));
+    }
+
+    #[test]
+    fn test_distribute_revenue_batch_benchmark() {
+        let f = Fixture::setup();
+        // create 50 stakers to fit within normal instruction budget if iterating, but we batch 10
+        for i in 0..50 {
+            let mentor = Address::generate(&f.env);
+            f.fund(&mentor, 1000);
+            f.client().stake(&mentor, &100, &30);
+        }
+        
+        f.env.budget().reset_unlimited();
+        f.client().distribute_revenue_batch(&f.mnt_id, &10000, &0, &10);
+        f.env.budget().print();
     }
 }

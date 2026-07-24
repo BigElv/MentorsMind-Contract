@@ -1,7 +1,12 @@
 #![no_std]
 use soroban_sdk::{
-    contract, contractclient, contractimpl, contracttype, symbol_short, Address, Env, Symbol, Vec,
+    contract, contractclient, contractimpl, contracttype, symbol_short, Address, Env, IntoVal,
+    Map, Symbol, Vec,
 };
+
+// ---------------------------------------------------------------------------
+// Storage key constants
+// ---------------------------------------------------------------------------
 
 const ADMIN: Symbol = symbol_short!("ADMIN");
 const FEEDERS: Symbol = symbol_short!("FEEDERS");
@@ -18,6 +23,29 @@ const MAX_STALENESS_SECS: u64 = 3_600;
 // Data types
 // ---------------------------------------------------------------------------
 
+/// Number of price points used for the TWAP rolling window.
+const TWAP_WINDOW: u32 = 5;
+
+/// Default circuit-breaker threshold: 50 % deviation from TWAP.
+/// Stored as basis points (10 000 bps = 100 %).
+const DEFAULT_CB_THRESHOLD_BPS: i128 = 5_000;
+
+/// Maximum number of secondary oracle sources that can be registered.
+const MAX_SECONDARY_SOURCES: u32 = 5;
+
+/// Minimum number of secondary sources that must agree before
+/// `get_aggregated_price` returns a value.
+const MIN_SECONDARY_CONSENSUS: u32 = 2;
+
+/// Maximum deviation (bps) allowed between the primary price and the
+/// secondary-source median before the aggregated call is rejected.
+const MAX_SOURCE_DIVERGENCE_BPS: i128 = 1_000; // 10 %
+
+// ---------------------------------------------------------------------------
+// Data types
+// ---------------------------------------------------------------------------
+
+/// A single price observation submitted by a feeder.
 #[contracttype]
 #[derive(Clone)]
 pub struct PricePoint {
@@ -69,12 +97,55 @@ impl OracleContract {
         env.storage()
             .persistent()
             .set(&FEEDERS, &Vec::<Address>::new(&env));
+        // Initialise secondary sources list as empty.
+        let sources_key = symbol_short!("SEC_SRCS");
+        env.storage()
+            .persistent()
+            .set(&sources_key, &Vec::<OracleSource>::new(&env));
+        // Store default circuit-breaker threshold.
+        let cb_key = symbol_short!("CB_BPS");
+        env.storage()
+            .persistent()
+            .set(&cb_key, &DEFAULT_CB_THRESHOLD_BPS);
     }
+
+    // -----------------------------------------------------------------------
+    // Admin: RBAC
+    // -----------------------------------------------------------------------
 
     pub fn set_rbac_contract(env: Env, admin: Address, rbac: Address) {
         Self::require_admin_or_role(&env, &admin, Symbol::new(&env, "ORACLE_ADMIN"));
         env.storage().persistent().set(&RBAC, &rbac);
     }
+
+    // -----------------------------------------------------------------------
+    // Admin: circuit-breaker threshold
+    // -----------------------------------------------------------------------
+
+    /// Update the circuit-breaker threshold (basis points).
+    /// Only the admin or ORACLE_ADMIN role may call this.
+    /// `threshold_bps` must be in the range [100, 9_000] (1 %–90 %).
+    pub fn set_circuit_breaker_threshold(env: Env, admin: Address, threshold_bps: i128) {
+        Self::require_admin_or_role(&env, &admin, Symbol::new(&env, "ORACLE_ADMIN"));
+        if threshold_bps < 100 || threshold_bps > 9_000 {
+            panic!("threshold_bps must be between 100 and 9000");
+        }
+        let cb_key = symbol_short!("CB_BPS");
+        env.storage().persistent().set(&cb_key, &threshold_bps);
+    }
+
+    /// Return the current circuit-breaker threshold in basis points.
+    pub fn get_circuit_breaker_threshold(env: Env) -> i128 {
+        let cb_key = symbol_short!("CB_BPS");
+        env.storage()
+            .persistent()
+            .get(&cb_key)
+            .unwrap_or(DEFAULT_CB_THRESHOLD_BPS)
+    }
+
+    // -----------------------------------------------------------------------
+    // Admin: primary feeders
+    // -----------------------------------------------------------------------
 
     pub fn add_feeder(env: Env, admin: Address, feeder: Address) {
         Self::require_admin_or_role(&env, &admin, Symbol::new(&env, "ORACLE_ADMIN"));
@@ -116,8 +187,42 @@ impl OracleContract {
         {
             panic!("unauthorized feeder");
         }
+
+        if price <= 0 {
+            panic!("price must be positive");
+        }
+
+        // -------------------------------------------------------------------
+        // Circuit breaker: reject prices that deviate more than the configured
+        // threshold from the current TWAP.
+        // -------------------------------------------------------------------
+        let cb_threshold = Self::get_circuit_breaker_threshold(env.clone());
+        let twap_key = (symbol_short!("TWAP"), asset.clone());
+        if let Some(twap_state) = env
+            .storage()
+            .persistent()
+            .get::<_, TwapState>(&twap_key)
+        {
+            if twap_state.twap > 0 {
+                let diff = if price > twap_state.twap {
+                    price - twap_state.twap
+                } else {
+                    twap_state.twap - price
+                };
+                let deviation_bps = diff
+                    .checked_mul(10_000)
+                    .unwrap_or(i128::MAX)
+                    .checked_div(twap_state.twap)
+                    .unwrap_or(i128::MAX);
+                if deviation_bps > cb_threshold {
+                    panic!("price deviation exceeds circuit breaker threshold");
+                }
+            }
+        }
+
+        // Store the feeder's latest price in the per-asset map (one entry per feeder).
         let key = (symbol_short!("PRICES"), asset.clone());
-        let mut points: Vec<PricePoint> = env
+        let mut price_map: Map<Address, PricePoint> = env
             .storage()
             .persistent()
             .get(&key)
@@ -217,7 +322,7 @@ impl OracleContract {
     pub fn is_price_stale(env: Env, asset: Symbol) -> bool {
         let now = env.ledger().timestamp();
         let key = (symbol_short!("PRICES"), asset);
-        let points: Vec<PricePoint> = env
+        let price_map: Map<Address, PricePoint> = env
             .storage()
             .persistent()
             .get(&key)
@@ -294,8 +399,8 @@ impl OracleContract {
                     values.set(j, b);
                     values.set(j + 1, a);
                 }
-                j += 1;
             }
+            values.set(j, key);
             i += 1;
         }
         values.get(n / 2).unwrap()

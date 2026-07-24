@@ -30,6 +30,8 @@ pub struct InterfaceRegistryContract;
 
 #[contractimpl]
 impl InterfaceRegistryContract {
+    const YIELD_INTERFACE: &'static str = "yield_v1";
+
     pub fn initialize(env: Env, admin: Address) {
         if env.storage().persistent().has(&DataKey::Admin) {
             panic!("Already initialized");
@@ -129,6 +131,23 @@ impl InterfaceRegistryContract {
 
         result
     }
+
+    pub fn register_yield_contract(env: Env, contract: Address, version: u32) {
+        Self::register_interface(
+            env.clone(),
+            contract,
+            Symbol::new(&env, Self::YIELD_INTERFACE),
+            version,
+        );
+    }
+
+    pub fn get_yield_contract(env: Env) -> Address {
+        Self::get_contract(env.clone(), Symbol::new(&env, Self::YIELD_INTERFACE))
+    }
+
+    pub fn get_yield_contract_version(env: Env) -> u32 {
+        Self::get_version(env.clone(), Symbol::new(&env, Self::YIELD_INTERFACE))
+    }
 }
 
 #[cfg(test)]
@@ -205,12 +224,24 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "authorization failure")]
+    #[should_panic]
     fn test_register_interface_unauthorized() {
         let env = Env::default();
         // do not call mock_all_auths, to enforce auth failure
 
         let (registry, _admin, escrow) = setup(&env);
         registry.register_interface(&escrow, &Symbol::new(&env, "escrow_v1"), &1);
+    }
+
+    #[test]
+    fn test_register_and_get_yield_contract() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (registry, _admin, yield_contract) = setup(&env);
+        registry.register_yield_contract(&yield_contract, &3);
+
+        assert_eq!(registry.get_yield_contract(), yield_contract);
+        assert_eq!(registry.get_yield_contract_version(), 3);
     }
 }

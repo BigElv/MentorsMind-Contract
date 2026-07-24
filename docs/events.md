@@ -179,3 +179,4 @@ All events emitted by the MentorsMind smart contracts adhere to a standardized t
         pub mentor: Address,
     }
     ```
+\n\n## Escrow Notification Events\n- `meta_upd`: Escrow metadata updated\n- `rated`: Rating submitted\n

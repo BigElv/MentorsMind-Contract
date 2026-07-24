@@ -78,6 +78,8 @@ impl VerificationContract {
         env.storage().persistent().set(&key, &rec);
         let tkey = DataKey::Tier(mentor.clone());
         if !env.storage().persistent().has(&tkey) {
+            // New mentors start from the base tier until a separate promotion
+            // path raises their score.
             env.storage().persistent().set(&tkey, &0i32);
         }
         env.events().publish(
@@ -131,6 +133,8 @@ impl VerificationContract {
         let rec: Option<VerificationRecord> = env.storage().persistent().get(&key);
         match rec {
             None => false,
+            // Verification is only valid while the record is active and the
+            // recorded expiry has not been reached yet.
             Some(r) => r.is_active && env.ledger().timestamp() <= r.expiry,
         }
     }

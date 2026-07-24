@@ -27,7 +27,7 @@
 
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, symbol_short, Address, BytesN, Env,
-    Symbol, Vec,
+    IntoVal, Symbol, Vec,
 };
 
 // ---------------------------------------------------------------------------
@@ -81,6 +81,28 @@ pub struct PendingUpgrade {
 // Storage keys
 // ---------------------------------------------------------------------------
 
+/// A pending (time-locked) upgrade waiting for the delay to elapse.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PendingUpgrade {
+    /// WASM hash to apply when the timelock expires.
+    pub new_wasm_hash: BytesN<32>,
+    /// Human-readable contract name for registry bookkeeping.
+    pub contract_name: Symbol,
+    /// New version number (must be > current version).
+    pub new_version: u32,
+    /// Changelog hash for audit trail.
+    pub changelog_hash: BytesN<32>,
+    /// Ledger timestamp at which this upgrade was scheduled.
+    pub scheduled_at: u64,
+    /// Earliest timestamp at which `execute_pending_upgrade` may be called.
+    pub executable_after: u64,
+    /// Admin that initiated the upgrade.
+    pub admin: Address,
+    /// Signers that approved scheduling this upgrade.
+    pub approved_signers: Vec<Address>,
+}
+
 #[contracttype]
 #[derive(Clone)]
 pub enum DataKey {
@@ -92,6 +114,9 @@ pub enum DataKey {
     Subscribers(Symbol),
     PendingUpgrade(Symbol),
 }
+
+/// Default upgrade timelock: 48 hours.
+const DEFAULT_UPGRADE_DELAY: u64 = 48 * 60 * 60;
 
 // ---------------------------------------------------------------------------
 // Contract
@@ -285,6 +310,8 @@ impl UpgradeRegistryContract {
             .get(&DataKey::UpgradeHistory(contract_name.clone()))
             .unwrap_or(Vec::new(&env));
 
+        // Append before persisting so the upgrade trail remains ordered and
+        // replayable by downstream indexers.
         history.push_back(record);
 
         env.storage()
@@ -303,7 +330,6 @@ impl UpgradeRegistryContract {
             ),
             (old_version, new_version, changelog_hash),
         );
-
         Ok(())
     }
 
@@ -418,8 +444,9 @@ impl UpgradeRegistryContract {
             }
         }
 
+        // Keep the subscriber list unique so the same address does not receive
+        // duplicate upgrade notifications.
         subscribers.push_back(subscriber.clone());
-
         env.storage()
             .persistent()
             .set(&DataKey::Subscribers(contract_name.clone()), &subscribers);
@@ -428,7 +455,6 @@ impl UpgradeRegistryContract {
             (symbol_short!("sub"), symbol_short!("added"), contract_name),
             subscriber,
         );
-
         Ok(())
     }
 
@@ -443,7 +469,6 @@ impl UpgradeRegistryContract {
 
         let mut found = false;
         let mut new_subscribers = Vec::new(&env);
-
         for addr in subscribers.iter() {
             if addr != subscriber {
                 new_subscribers.push_back(addr);
@@ -456,6 +481,8 @@ impl UpgradeRegistryContract {
             return Err(Error::NotSubscribed);
         }
 
+        // Rebuild the list instead of mutating in place; the intent is clearer
+        // and the resulting state stays deterministic.
         env.storage().persistent().set(
             &DataKey::Subscribers(contract_name.clone()),
             &new_subscribers,
@@ -469,7 +496,6 @@ impl UpgradeRegistryContract {
             ),
             subscriber,
         );
-
         Ok(())
     }
 
@@ -538,7 +564,6 @@ mod test {
     ) {
         let env = Env::default();
         env.mock_all_auths();
-
         let admin = Address::generate(&env);
         let contract_id = env.register_contract(None, UpgradeRegistryContract);
         let client = UpgradeRegistryContractClient::new(&env, &contract_id);

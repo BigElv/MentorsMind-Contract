@@ -1,5 +1,8 @@
 #![no_std]
 
+use shared::events::{
+    emit_anomaly_event, evt_anomaly_detected, evt_anomaly_hold_cleared, evt_anomaly_hold_placed,
+};
 use soroban_sdk::{
     contract, contractimpl, contracterror, contracttype, symbol_short, Address, Env, Symbol,
 };
@@ -160,18 +163,11 @@ impl AnomalyDetectorContract {
         // Persist updated metrics
         env.storage().persistent().set(&DataKey::Metrics(user.clone()), &metrics);
 
-        // Place hold if needed
         if result == AnomalyResult::Hold {
             env.storage().persistent().set(&DataKey::Hold(user.clone()), &true);
-            env.events().publish(
-                (symbol_short!("anomaly"), Symbol::new(&env, "hold_placed"), user.clone()),
-                (env.ledger().timestamp(),),
-            );
+            emit_anomaly_event(&env, evt_anomaly_hold_placed(&env), (user.clone(), env.ledger().timestamp()));
         } else if result == AnomalyResult::Warning {
-            env.events().publish(
-                (symbol_short!("anomaly"), Symbol::new(&env, "anomaly_detected"), user.clone()),
-                (env.ledger().timestamp(),),
-            );
+            emit_anomaly_event(&env, evt_anomaly_detected(&env), (user.clone(), env.ledger().timestamp()));
         }
 
         Ok(result)
@@ -186,10 +182,7 @@ impl AnomalyDetectorContract {
 
         env.storage().persistent().remove(&DataKey::Hold(user.clone()));
 
-        env.events().publish(
-            (symbol_short!("anomaly"), Symbol::new(&env, "hold_cleared"), user.clone()),
-            (env.ledger().timestamp(),),
-        );
+        emit_anomaly_event(&env, evt_anomaly_hold_cleared(&env), (user.clone(), env.ledger().timestamp()));
 
         Ok(())
     }

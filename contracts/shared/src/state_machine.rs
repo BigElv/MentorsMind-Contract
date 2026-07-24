@@ -7,6 +7,49 @@ pub trait StateMachine {
     fn is_valid_transition(env: &Env, from: &Self::State, to: &Self::State) -> bool;
 }
 
+// ---------------------------------------------------------------------------
+// EscrowStatus state machine
+// ---------------------------------------------------------------------------
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum EscrowStatus {
+    /// Escrow created but funds not yet deposited (pre-funding state).
+    Pending,
+    /// Funds locked; session in progress.
+    Active,
+    /// Funds released to mentor.
+    Released,
+    /// Participant raised a dispute; funds frozen.
+    Disputed,
+    /// Admin refunded funds to learner.
+    Refunded,
+    /// Dispute resolved by admin arbitration.
+    Resolved,
+}
+
+impl StateMachine for EscrowStatus {
+    type State = Self;
+
+    fn is_valid_transition(_env: &Env, from: &Self::State, to: &Self::State) -> bool {
+        matches!(
+            (from, to),
+            // Funding path
+            (EscrowStatus::Pending,  EscrowStatus::Active)
+            // Normal release
+            | (EscrowStatus::Active,   EscrowStatus::Released)
+            // Dispute flow
+            | (EscrowStatus::Active,   EscrowStatus::Disputed)
+            | (EscrowStatus::Disputed, EscrowStatus::Resolved)
+            | (EscrowStatus::Disputed, EscrowStatus::Refunded)
+            // Admin refund from active
+            | (EscrowStatus::Active,   EscrowStatus::Refunded)
+            // Pending cancellation before funding
+            | (EscrowStatus::Pending,  EscrowStatus::Refunded)
+        )
+    }
+}
+
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum SubscriptionStatus {

@@ -242,6 +242,17 @@ impl SessionRegistry {
             .get(&BACKEND)
             .expect("Not initialized")
     }
+
+
+    pub fn update_session_metadata(env: Env, session_id: u64, tags: soroban_sdk::Vec<String>) {
+        let key = (symbol_short!("SessMeta"), session_id);
+        env.storage().persistent().set(&key, &tags);
+    }
+    
+    pub fn get_sessions_by_participant(env: Env, participant: Address) -> soroban_sdk::Vec<u64> {
+        soroban_sdk::Vec::new(&env)
+    }
+
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────

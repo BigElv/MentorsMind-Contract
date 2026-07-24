@@ -1,5 +1,9 @@
 #![no_std]
 
+use shared::events::{
+    emit_bounty_event, evt_bounty_claimed, evt_bounty_disputed, evt_bounty_posted,
+    evt_bounty_refunded, evt_bounty_verified,
+};
 use soroban_sdk::{
     contract, contractimpl, contracttype, symbol_short, token, Address, BytesN, Env, IntoVal,
     Symbol, Val, Vec,
@@ -208,8 +212,9 @@ impl BountyContract {
             .extend_ttl(&DataKey::BountyCount, TTL_THRESHOLD, TTL_BUMP);
         env.storage().instance().extend_ttl(TTL_THRESHOLD, TTL_BUMP);
 
-        env.events().publish(
-            (symbol_short!("bounty"), symbol_short!("posted")),
+        emit_bounty_event(
+            &env,
+            evt_bounty_posted(&env),
             BountyPostedEvent {
                 id: count,
                 poster,
@@ -270,8 +275,9 @@ impl BountyContract {
 
         env.storage().instance().extend_ttl(TTL_THRESHOLD, TTL_BUMP);
 
-        env.events().publish(
-            (symbol_short!("bounty"), symbol_short!("claimed")),
+        emit_bounty_event(
+            &env,
+            evt_bounty_claimed(&env),
             BountyClaimedEvent {
                 bounty_id,
                 learner,
@@ -345,8 +351,9 @@ impl BountyContract {
             .extend_ttl(&DataKey::Bounty(bounty_id), TTL_THRESHOLD, TTL_BUMP);
         env.storage().instance().extend_ttl(TTL_THRESHOLD, TTL_BUMP);
 
-        env.events().publish(
-            (symbol_short!("bounty"), symbol_short!("verified")),
+        emit_bounty_event(
+            &env,
+            evt_bounty_verified(&env),
             BountyVerifiedEvent {
                 bounty_id,
                 learner,
@@ -405,8 +412,9 @@ impl BountyContract {
             .extend_ttl(&DataKey::Bounty(bounty_id), TTL_THRESHOLD, TTL_BUMP);
         env.storage().instance().extend_ttl(TTL_THRESHOLD, TTL_BUMP);
 
-        env.events().publish(
-            (symbol_short!("bounty"), symbol_short!("disputed")),
+        emit_bounty_event(
+            &env,
+            evt_bounty_disputed(&env),
             BountyDisputedEvent {
                 bounty_id,
                 learner,
@@ -451,8 +459,9 @@ impl BountyContract {
             .extend_ttl(&DataKey::Bounty(bounty_id), TTL_THRESHOLD, TTL_BUMP);
         env.storage().instance().extend_ttl(TTL_THRESHOLD, TTL_BUMP);
 
-        env.events().publish(
-            (symbol_short!("bounty"), symbol_short!("refunded")),
+        emit_bounty_event(
+            &env,
+            evt_bounty_refunded(&env),
             BountyRefundedEvent {
                 bounty_id,
                 poster: bounty.poster.clone(),
@@ -859,5 +868,54 @@ mod test {
         let id = f.post_default_bounty();
         f.client().claim_bounty(&f.learner, &id);
         f.client().claim_bounty(&f.learner, &id);
+    }
+
+    #[test]
+    fn test_ttl_renewal_preserves_claim_and_bounty_state() {
+        let f = TestFixture::setup();
+        let id = f.post_default_bounty();
+        f.client().claim_bounty(&f.learner, &id);
+
+        // Jump the ledger sequence substantially; entries should still be
+        // available because write operations bump persistent TTL.
+        f.env.ledger().set(LedgerInfo {
+            timestamp: f.env.ledger().timestamp() + 60,
+            protocol_version: 21,
+            sequence_number: 500_100,
+            network_id: Default::default(),
+            base_reserve: 10,
+            min_temp_entry_ttl: 1,
+            min_persistent_entry_ttl: 1,
+            max_entry_ttl: 10_000_000,
+        });
+
+        let bounty = f.client().get_bounty(&id);
+        assert_eq!(bounty.status, BountyStatus::Claimed);
+        let claim = f.client().get_claim(&id, &f.learner);
+        assert_eq!(claim.status, ClaimStatus::Pending);
+    }
+
+    #[test]
+    fn test_ttl_persistence_for_admin_and_count_keys() {
+        let f = TestFixture::setup();
+
+        // Move to a later sequence while staying within configured max TTL.
+        f.env.ledger().set(LedgerInfo {
+            timestamp: f.env.ledger().timestamp() + 120,
+            protocol_version: 21,
+            sequence_number: 700_200,
+            network_id: Default::default(),
+            base_reserve: 10,
+            min_temp_entry_ttl: 1,
+            min_persistent_entry_ttl: 1,
+            max_entry_ttl: 10_000_000,
+        });
+
+        // If admin and counter keys were not renewed in initialize, posting
+        // would fail due missing configuration. Successful post implies key
+        // persistence across the ledger jump.
+        let id = f.post_default_bounty();
+        assert_eq!(id, 1);
+        assert_eq!(f.client().get_bounty_count(), 1);
     }
 }

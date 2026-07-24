@@ -57,10 +57,10 @@ impl SnapshotContract {
                 pub amount: i128,
                 pub staked_at: u64,
                 pub unlock_at: u64,
-                pub tier: u8,
+                pub tier: u32,
             }
             
-            let record: StakeRecord = env.from_val(stake_record);
+            let record: StakeRecord = FromVal::from_val(&env, &stake_record);
             let key = DataKey::Snapshot(snapshot_id, staker.clone());
             env.storage().persistent().set(&key, &record.amount);
             
@@ -98,7 +98,7 @@ mod test {
         pub amount: i128,
         pub staked_at: u64,
         pub unlock_at: u64,
-        pub tier: u8,
+        pub tier: u32,
     }
 
     #[contract]

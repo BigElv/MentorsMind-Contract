@@ -2,16 +2,12 @@
   "name": "mentorminds-contracts",
   "version": "1.0.0",
   "description": "MentorMinds Stellar Smart Contracts - Local Development Environment",
-  "workspaces": [
-    "packages/contracts-sdk",
-    "mentorminds-backend"
-  ],
   "main": "index.js",
   "scripts": {
     "local:start": "bash scripts/setup-local.sh",
     "local:start:windows": "scripts\\setup-local.bat",
     "local:stop": "docker-compose down",
-    "local:reset": "npm run local:stop && docker volume rm mentorminds-contract_stellar_data 2>/dev/null || true && npm run local:start",
+    "local:reset": "pnpm run local:stop && docker volume rm mentorminds-contract_stellar_data 2>/dev/null || true && pnpm run local:start",
     "local:seed": "bash scripts/seed-local.sh",
     "local:status": "docker-compose ps && echo '--- Horizon: http://localhost:8000' && echo '--- Soroban RPC: http://localhost:8003' && echo '--- Friendbot: http://localhost:8002'",
     "local:logs": "docker-compose logs -f",
