@@ -195,7 +195,7 @@ impl ReputationContract {
         let current: u32 = env.storage().persistent().get(&key).unwrap_or(0u32);
         let updated = if current == 0 { new_rating } else { (current + new_rating) / 2 };
         env.storage().persistent().set(&key, &updated);
-        env.events().publish((symbol_short!("Reputation"), symbol_short!("updated")), (user, updated));
+        env.events().publish((symbol_short!("Reput"), symbol_short!("updated")), (user, updated));
     }
 
 }
