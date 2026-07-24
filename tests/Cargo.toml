@@ -14,13 +14,14 @@ path = "lib.rs"
 soroban-sdk = { workspace = true, features = ["testutils"] }
 mentorminds-escrow = { path = "../escrow", features = ["testutils"] }
 mentorminds-verification = { path = "../contracts/verification", features = ["testutils"] }
-shared = { path = "../contracts/shared" }
+shared = { path = "../contracts/shared", features = ["testutils"] }
 mentorminds-governance = { path = "../contracts/governance", features = ["testutils"] }
 mentorminds-oracle = { path = "../contracts/oracle", features = ["testutils"] }
 mentorminds-reputation = { path = "../contracts/reputation", features = ["testutils"] }
 mentorminds-timelock = { path = "../contracts/timelock", features = ["testutils"] }
 mentorminds-credit-score = { path = "../contracts/credit_score", features = ["testutils"] }
 mentorminds-staking = { path = "../contracts/staking", features = ["testutils"] }
+mentorminds-delegation = { path = "../contracts/delegation", features = ["testutils"] }
 
 [dev-dependencies]
 
@@ -39,3 +40,7 @@ path = "state_machine_tests.rs"
 [[test]]
 name = "economic_attacks"
 path = "economic_attacks.rs"
+
+[[test]]
+name = "fixture_factory_example"
+path = "fixture_factory_example.rs"
