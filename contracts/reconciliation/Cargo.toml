@@ -1,5 +1,5 @@
 [package]
-name = "mentorminds-snapshot"
+name = "mentorminds-reconciliation"
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.70"
@@ -9,7 +9,7 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 soroban-sdk = { workspace = true }
-shared = { path = "../shared" }
+soroban-token-sdk = { workspace = true }
 
 [dev-dependencies]
 soroban-sdk = { workspace = true, features = ["testutils"] }

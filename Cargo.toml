@@ -12,6 +12,7 @@ members = [
     "contracts/verification",
     "contracts/referral",
     "contracts/referral_leaderboard",
+    "contracts/reconciliation",
     "benchmarks",
     "contracts/treasury",
     "contracts/timelock",
