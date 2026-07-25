@@ -12,6 +12,7 @@ members = [
     "contracts/verification",
     "contracts/referral",
     "contracts/referral_leaderboard",
+    "contracts/reconciliation",
     "benchmarks",
     "contracts/treasury",
     "contracts/timelock",
@@ -21,6 +22,11 @@ members = [
     "contracts/velocity_limits",
     "contracts/isa",
     "contracts/bridge_receiver",
+    "contracts/subscription",
+    "contracts/lending_pool",
+    "tools/storage_scanner",
+    "contracts/delegation",
+    "contracts/escrow_factory",
     "tests",
 ]
 
