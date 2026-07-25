@@ -1,5 +1,11 @@
 #![no_std]
-use soroban_sdk::{contract, contractimpl, contracttype, symbol_short, token, Address, Env, Symbol};
+use soroban_sdk::{contract, contractimpl, contracttype, symbol_short, token, Address, Env, Symbol, Vec};
+
+use shared::{
+    get_all_params, get_param, init_protocol_params, set_param,
+    key_sub_expiry_grace,
+    DEFAULT_SUB_EXPIRY_GRACE,
+};
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -20,9 +26,8 @@ pub const RENEWAL_GRACE_SECS: u64 = 60; // 1 minute
 /// Maximum time after `next_billing_date` that a subscription is still
 /// considered Active before it transitions to Expired.  After this window
 /// the subscription must be explicitly renewed or it is treated as lapsed.
-/// This prevents a subscription from remaining "Active" indefinitely if the
-/// learner never renews.
-pub const SUBSCRIPTION_EXPIRY_GRACE_SECS: u64 = 7 * 24 * 60 * 60; // 7 days
+/// Compile-time default — live value is governed via `key_sub_expiry_grace()`.
+pub const SUBSCRIPTION_EXPIRY_GRACE_SECS: u64 = DEFAULT_SUB_EXPIRY_GRACE as u64; // 7 days
 
 // ---------------------------------------------------------------------------
 // Types
@@ -77,6 +82,8 @@ pub enum DataKey {
     StreamPlan(u32),
     /// A live streaming subscription keyed by subscription ID.
     StreamSub(u32),
+    /// Protocol parameter: `Param(key) -> i128`.
+    Param(Symbol),
 }
 
 // ---------------------------------------------------------------------------
@@ -153,7 +160,7 @@ pub struct SubscriptionContract;
 #[contractimpl]
 impl SubscriptionContract {
     /// One-time initialization. Sets admin and escrow wallet.
-    pub fn initialize(env: Env, admin: Address, escrow: Address) {
+    pub fn initialize(env: Env, admin: Address, escrow: Address, rbac_contract: Address) {
         if env.storage().persistent().has(&DataKey::Admin) {
             panic!("already initialized");
         }
@@ -161,6 +168,26 @@ impl SubscriptionContract {
         env.storage().persistent().set(&DataKey::Escrow, &escrow);
         env.storage().persistent().set(&DataKey::PlanCounter, &0u32);
         env.storage().persistent().set(&DataKey::SubCounter, &0u32);
+        init_protocol_params(&env, &rbac_contract);
+    }
+
+    // -----------------------------------------------------------------------
+    // Protocol parameter registry
+    // -----------------------------------------------------------------------
+
+    /// Read a protocol parameter by key, with compile-time default fallback.
+    pub fn get_param(env: Env, key: Symbol, default: i128) -> i128 {
+        get_param(&env, &key, default)
+    }
+
+    /// Update a protocol parameter. Caller must hold `GOVERNANCE_ADMIN`.
+    pub fn set_param(env: Env, caller: Address, key: Symbol, value: i128) {
+        set_param(&env, &caller, &key, value);
+    }
+
+    /// Return all current `(Symbol, i128)` parameter pairs for monitoring.
+    pub fn get_all_params(env: Env) -> Vec<(Symbol, i128)> {
+        get_all_params(&env)
     }
 
     // -----------------------------------------------------------------------

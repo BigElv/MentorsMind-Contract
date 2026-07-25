@@ -8,6 +8,7 @@ use soroban_sdk::contracterror;
 /// behavior aligned across contracts that make the same safety assumptions.
 pub mod escrow;
 pub mod events;
+pub mod params;
 pub mod reentrancy_guard;
 pub mod sig_validation;
 pub mod state_machine;
@@ -15,6 +16,14 @@ pub mod storage;
 pub mod ttl_utils;
 
 pub use escrow::{EscrowRecord, EscrowStatus};
+pub use params::{
+    get_all_params, get_param, governance_admin_role, init_protocol_params, set_param,
+    key_cooldown_days, key_interest_rate_bps, key_min_bond, key_min_credit_score,
+    key_platform_fee_bps, key_sub_expiry_grace, key_tier_bronze, key_tier_gold, key_tier_silver,
+    DEFAULT_COOLDOWN_DAYS, DEFAULT_INTEREST_RATE_BPS, DEFAULT_MIN_BOND, DEFAULT_MIN_CREDIT_SCORE,
+    DEFAULT_PLATFORM_FEE_BPS, DEFAULT_SUB_EXPIRY_GRACE, DEFAULT_TIER_BRONZE, DEFAULT_TIER_GOLD,
+    DEFAULT_TIER_SILVER,
+};
 pub use reentrancy_guard::ReentrancyGuard;
 pub use sig_validation::{
     current_nonce, is_deadline_valid, validate_and_consume_nonce, validate_deadline,

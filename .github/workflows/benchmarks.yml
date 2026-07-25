@@ -20,6 +20,9 @@ on:
       - 'contracts/timelock/**'
       - 'contracts/shared/**'
       - 'benchmarks/**'
+  # Nightly scheduled run on main to catch drift over time.
+  schedule:
+    - cron: '0 3 * * *'
   workflow_dispatch:
     inputs:
       update_baseline:
@@ -35,11 +38,18 @@ jobs:
   benchmark:
     name: Run Benchmarks
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
+    # Allow the job to push history commits back to the repo on main/schedule.
+    permissions:
+      contents: write
+      pull-requests: write
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          # Fetch full history so we can commit history records back.
+          fetch-depth: 0
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
@@ -47,7 +57,7 @@ jobs:
           toolchain: '1.85'
           targets: wasm32-unknown-unknown
 
-      # Layered caching: registry index, downloaded crates, compiled artifacts
+      # Layered caching: registry index, downloaded crates, compiled artifacts.
       - name: Cache cargo registry
         uses: actions/cache@v4
         with:
@@ -68,7 +78,7 @@ jobs:
             ${{ runner.os }}-cargo-build-bench-${{ hashFiles('**/Cargo.lock') }}-
             ${{ runner.os }}-cargo-build-bench-
 
-      # Build WASM binaries first so wasm_bytes metrics are populated
+      # Build WASM binaries first so wasm_bytes metrics are populated.
       - name: Build WASM binaries (release)
         run: |
           cargo build \
@@ -79,12 +89,32 @@ jobs:
             -p mentorminds-governance \
             -p mentorminds-timelock
 
-      # Run the benchmark binary; exits 1 on >10% regression
+      # Expose run metadata to the benchmark binary via env vars.
+      - name: Set benchmark environment
+        run: |
+          echo "BENCH_DATE=$(date -u '+%Y-%m-%d')" >> "$GITHUB_ENV"
+          echo "GITHUB_SHA=${{ github.sha }}" >> "$GITHUB_ENV"
+          echo "GITHUB_REF_NAME=${{ github.ref_name }}" >> "$GITHUB_ENV"
+
+      # Run the benchmark binary; exits 1 on >10% regression.
       - name: Run benchmarks
         id: bench
         run: cargo run -p mentorminds-benchmarks 2>&1 | tee benchmarks/results/bench.log
 
-      # On workflow_dispatch with update_baseline=true, commit the new baseline
+      # Commit history record and (optionally) new baseline back to the repo.
+      # Only runs on pushes/schedules to main — not on PRs (read-only forks).
+      - name: Commit history record
+        if: >
+          github.event_name != 'pull_request' &&
+          (github.ref == 'refs/heads/main' || github.event_name == 'schedule')
+        uses: stefanzweifel/git-auto-commit-action@v5
+        with:
+          commit_message: 'chore(bench): record performance history [${{ github.sha }}]'
+          file_pattern: benchmarks/history/*.json
+          commit_user_name: 'github-actions[bot]'
+          commit_user_email: 'github-actions[bot]@users.noreply.github.com'
+
+      # On workflow_dispatch with update_baseline=true, commit the new baseline.
       - name: Update baseline (manual trigger only)
         if: >
           github.event_name == 'workflow_dispatch' &&
@@ -101,8 +131,10 @@ jobs:
         with:
           commit_message: 'chore(bench): update performance baselines'
           file_pattern: benchmarks/baselines.json
+          commit_user_name: 'github-actions[bot]'
+          commit_user_email: 'github-actions[bot]@users.noreply.github.com'
 
-      # Always upload reports so they're accessible from the Actions summary
+      # Always upload reports so they're accessible from the Actions summary.
       - name: Upload benchmark reports
         if: always()
         uses: actions/upload-artifact@v4
@@ -114,7 +146,7 @@ jobs:
             benchmarks/results/bench.log
           retention-days: 90
 
-      # Post a summary table to the PR as a comment
+      # Post (or update) a summary table comment on the PR.
       - name: Post PR comment
         if: github.event_name == 'pull_request' && always()
         uses: actions/github-script@v7
@@ -130,27 +162,29 @@ jobs:
             const results = JSON.parse(fs.readFileSync(reportPath, 'utf8'));
             const passed = '${{ steps.bench.outcome }}' === 'success';
             const icon = passed ? '✅' : '❌';
+            const status = passed ? 'All metrics within baseline' : 'Performance regressions detected — see annotations';
 
-            // Build markdown table
             let table = '| Contract | Entry Point | CPU Instructions | Memory (bytes) | WASM Size |\n';
             table    += '|----------|-------------|-----------------|---------------|----------|\n';
 
             let prevContract = '';
             for (const r of results) {
-              const sep = r.contract !== prevContract ? `**${r.contract}**` : '';
+              const contractLabel = r.contract !== prevContract ? `**${r.contract}**` : '';
               prevContract = r.contract;
               const wasm = r.wasm_bytes > 0
                 ? (r.wasm_bytes > 65536 ? `⚠️ ${Math.round(r.wasm_bytes/1024)} KB` : `${Math.round(r.wasm_bytes/1024)} KB`)
                 : 'N/A';
-              table += `| ${sep} | \`${r.entry_point}\` | ${r.cpu_instructions.toLocaleString()} | ${r.mem_bytes.toLocaleString()} | ${wasm} |\n`;
+              table += `| ${contractLabel} | \`${r.entry_point}\` | ${r.cpu_instructions.toLocaleString()} | ${r.mem_bytes.toLocaleString()} | ${wasm} |\n`;
             }
 
             const body = `## ${icon} Soroban Benchmark Results
 
-            ${table}
+**Status:** ${status}
 
-            > Baselines gated at **±10%**. WASM alert at **> 64 KB**.
-            > [Full HTML report](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})`;
+${table}
+
+> Baselines gated at **±10%**. WASM alert at **> 64 KB**.
+> [Full HTML report with trend charts](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})`;
 
             const { data: comments } = await github.rest.issues.listComments({
               owner: context.repo.owner,

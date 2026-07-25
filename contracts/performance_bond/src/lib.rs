@@ -1,7 +1,13 @@
 #![no_std]
 
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, symbol_short, token, Address, Env, Symbol,
+    contract, contracterror, contractimpl, contracttype, symbol_short, token, Address, Env, Symbol, Vec,
+};
+
+use shared::{
+    get_all_params, get_param, init_protocol_params, set_param,
+    key_min_bond, key_cooldown_days,
+    DEFAULT_MIN_BOND, DEFAULT_COOLDOWN_DAYS,
 };
 
 // ---------------------------------------------------------------------------
@@ -37,24 +43,6 @@ pub struct BondRecord {
     pub slash_count: u32,
 }
 
-// ---------------------------------------------------------------------------
-// Constants
-// ---------------------------------------------------------------------------
-
-const MINIMUM_BOND: i128 = 100_000_000; // 100 MNT (with 7 decimals)
-const COOLDOWN_DAYS: u64 = 30;
-const COOLDOWN_SECONDS: u64 = COOLDOWN_DAYS * 86_400;
-
-// Slash amounts (with 7 decimals)
-#[allow(dead_code)]
-const SLASH_NO_SHOW: i128 = 10_000_000; // 10 MNT
-#[allow(dead_code)]
-const SLASH_DISPUTE_LOST: i128 = 50_000_000; // 50 MNT
-
-// ---------------------------------------------------------------------------
-// Storage Keys
-// ---------------------------------------------------------------------------
-
 #[contracttype]
 #[derive(Clone)]
 pub enum DataKey {
@@ -62,7 +50,20 @@ pub enum DataKey {
     MntToken,
     InsurancePool,
     Bond(Address),
+    /// Protocol parameter: `Param(key) -> i128`.
+    Param(Symbol),
 }
+
+// ---------------------------------------------------------------------------
+// Compile-time fallbacks (used when governance hasn't acted)
+// ---------------------------------------------------------------------------
+const COOLDOWN_SECONDS_DEFAULT: u64 = (DEFAULT_COOLDOWN_DAYS as u64) * 86_400;
+
+// Slash amounts (with 7 decimals)
+#[allow(dead_code)]
+const SLASH_NO_SHOW: i128 = 10_000_000; // 10 MNT
+#[allow(dead_code)]
+const SLASH_DISPUTE_LOST: i128 = 50_000_000; // 50 MNT
 
 // ---------------------------------------------------------------------------
 // Contract
@@ -79,6 +80,7 @@ impl PerformanceBondContract {
         admin: Address,
         mnt_token: Address,
         insurance_pool: Address,
+        rbac_contract: Address,
     ) -> Result<(), Error> {
         if env.storage().instance().has(&DataKey::Admin) {
             return Err(Error::AlreadyInitialized);
@@ -88,7 +90,27 @@ impl PerformanceBondContract {
         env.storage()
             .instance()
             .set(&DataKey::InsurancePool, &insurance_pool);
+        init_protocol_params(&env, &rbac_contract);
         Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // Protocol parameter registry
+    // -----------------------------------------------------------------------
+
+    /// Read a protocol parameter by key, with compile-time default fallback.
+    pub fn get_param(env: Env, key: Symbol, default: i128) -> i128 {
+        get_param(&env, &key, default)
+    }
+
+    /// Update a protocol parameter. Caller must hold `GOVERNANCE_ADMIN`.
+    pub fn set_param(env: Env, caller: Address, key: Symbol, value: i128) {
+        set_param(&env, &caller, &key, value);
+    }
+
+    /// Return all current `(Symbol, i128)` parameter pairs for monitoring.
+    pub fn get_all_params(env: Env) -> Vec<(Symbol, i128)> {
+        get_all_params(&env)
     }
 
     /// Post a performance bond.
@@ -104,7 +126,8 @@ impl PerformanceBondContract {
             return Err(Error::InvalidAmount);
         }
 
-        if amount < MINIMUM_BOND {
+        let minimum_bond = get_param(&env, &key_min_bond(), DEFAULT_MIN_BOND);
+        if amount < minimum_bond {
             return Err(Error::BelowMinimum);
         }
 
@@ -249,12 +272,14 @@ impl PerformanceBondContract {
         let now = env.ledger().timestamp();
 
         // Check cooldown period since last slash
-        if record.last_slash_at > 0 && now < record.last_slash_at + COOLDOWN_SECONDS {
+        let cooldown_secs = (get_param(&env, &key_cooldown_days(), DEFAULT_COOLDOWN_DAYS) as u64)
+            .saturating_mul(86_400);
+        if record.last_slash_at > 0 && now < record.last_slash_at + cooldown_secs {
             return Err(Error::StillInCooldown);
         }
 
         // Also check from posting time if no slashes
-        if record.last_slash_at == 0 && now < record.posted_at + COOLDOWN_SECONDS {
+        if record.last_slash_at == 0 && now < record.posted_at + cooldown_secs {
             return Err(Error::StillInCooldown);
         }
 
@@ -376,6 +401,7 @@ mod test {
                 &admin,
                 &mnt_id,
                 &insurance_pool,
+                &admin,  // rbac_contract — use admin address in tests
             );
 
             Fixture {

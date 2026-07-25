@@ -2,8 +2,13 @@
 
 use shared::events::{emit_staking_event, evt_staking_staked, evt_staking_unstaked};
 use shared::ReentrancyGuard;
+use shared::{
+    get_all_params, get_param, init_protocol_params, set_param,
+    key_tier_bronze, key_tier_silver, key_tier_gold,
+    DEFAULT_TIER_BRONZE, DEFAULT_TIER_SILVER, DEFAULT_TIER_GOLD,
+};
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, token, Address, Env, Symbol,
+    contract, contracterror, contractimpl, contracttype, token, Address, Env, Symbol, Vec,
 };
 
 // ---------------------------------------------------------------------------
@@ -89,27 +94,24 @@ pub enum DataKey {
     /// Next un-claimed epoch id for a given staker — avoids re-scanning
     /// already-claimed epochs on every `claim_rewards` call.
     StakerNextClaimEpoch(Address),
+    /// Protocol parameter: `Param(key) -> i128`.
+    /// Keys are defined in `shared::params`.
+    Param(Symbol),
 }
 
 // ---------------------------------------------------------------------------
-// Tier thresholds (raw i128, no decimals assumed — callers pass raw amounts)
-// Thresholds: Bronze ≥ 100, Silver ≥ 500, Gold ≥ 2000
+// Tier thresholds — read from the parameter registry at runtime.
+// Compile-time defaults are used when governance has not acted.
 // ---------------------------------------------------------------------------
 
-const TIER_BRONZE: i128 = 100;
-const TIER_SILVER: i128 = 500;
-const TIER_GOLD: i128 = 2_000;
-
-fn compute_tier(amount: i128) -> u32 {
-    if amount >= TIER_GOLD {
-        3
-    } else if amount >= TIER_SILVER {
-        2
-    } else if amount >= TIER_BRONZE {
-        1
-    } else {
-        0
-    }
+fn compute_tier(env: &Env, amount: i128) -> u32 {
+    let bronze = get_param(env, &key_tier_bronze(), DEFAULT_TIER_BRONZE);
+    let silver = get_param(env, &key_tier_silver(), DEFAULT_TIER_SILVER);
+    let gold   = get_param(env, &key_tier_gold(),   DEFAULT_TIER_GOLD);
+    if amount >= gold   { 3 }
+    else if amount >= silver { 2 }
+    else if amount >= bronze { 1 }
+    else { 0 }
 }
 
 // ---------------------------------------------------------------------------
@@ -122,14 +124,42 @@ pub struct StakingContract;
 #[contractimpl]
 impl StakingContract {
     /// Initialize the staking contract.
-    /// Must be called once before any other function.
-    pub fn initialize(env: Env, admin: Address, mnt_token: Address) -> Result<(), Error> {
+    /// `rbac_contract` — address of the deployed RBAC contract used to gate
+    /// `set_param`. Pass `admin` here for single-signer setups; production
+    /// deployments should pass the real RBAC contract.
+    pub fn initialize(
+        env: Env,
+        admin: Address,
+        mnt_token: Address,
+        rbac_contract: Address,
+    ) -> Result<(), Error> {
         if env.storage().instance().has(&DataKey::Admin) {
             return Err(Error::AlreadyInitialized);
         }
         env.storage().instance().set(&DataKey::Admin, &admin);
         env.storage().instance().set(&DataKey::MNTToken, &mnt_token);
+        init_protocol_params(&env, &rbac_contract);
         Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // Protocol parameter registry
+    // -----------------------------------------------------------------------
+
+    /// Read a protocol parameter by key, with compile-time default fallback.
+    pub fn get_param(env: Env, key: Symbol, default: i128) -> i128 {
+        get_param(&env, &key, default)
+    }
+
+    /// Update a protocol parameter. Caller must hold the `GOVERNANCE_ADMIN`
+    /// role in the RBAC contract registered during `initialize`.
+    pub fn set_param(env: Env, caller: Address, key: Symbol, value: i128) {
+        set_param(&env, &caller, &key, value);
+    }
+
+    /// Return all current `(Symbol, i128)` parameter pairs for monitoring.
+    pub fn get_all_params(env: Env) -> Vec<(Symbol, i128)> {
+        get_all_params(&env)
     }
 
     /// Stake MNT tokens for a given lock period.
@@ -177,7 +207,7 @@ impl StakingContract {
         let now = env.ledger().timestamp();
         let lock_seconds = (lock_period_days as u64).checked_mul(86_400u64).expect("Overflow");
         let unlock_at = now.checked_add(lock_seconds).expect("Timestamp overflow");
-        let tier = compute_tier(amount);
+        let tier = compute_tier(&env, amount);
 
         let record = StakeRecord {
             mentor: mentor.clone(),
@@ -682,7 +712,7 @@ mod test {
             let mnt_id = env.register_contract(None, MockMNT);
 
             let staking_id = env.register_contract(None, StakingContract);
-            StakingContractClient::new(&env, &staking_id).initialize(&admin, &mnt_id);
+            StakingContractClient::new(&env, &staking_id).initialize(&admin, &mnt_id, &admin);
 
             Fixture {
                 env,
