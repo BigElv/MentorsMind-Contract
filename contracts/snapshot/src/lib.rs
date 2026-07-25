@@ -2,7 +2,7 @@
 
 use shared::StakeRecord;
 use soroban_sdk::{
-    contract, contractimpl, contracttype, Address, Env, Symbol, Vec, IntoVal, FromVal,
+    contract, contractimpl, contracttype, Address, Env, FromVal, IntoVal, Symbol, Vec,
 };
 
 #[contracttype]
@@ -10,7 +10,8 @@ use soroban_sdk::{
 pub enum DataKey {
     Admin,
     StakingContract,
-    Snapshot(u32, Address), // (snapshot_id, voter)
+    DelegationContract,
+    Snapshot(u32, Address),   // (snapshot_id, voter)
     SnapshotTotalSupply(u32), // snapshot_id
 }
 
@@ -20,25 +21,54 @@ pub struct SnapshotContract;
 #[contractimpl]
 impl SnapshotContract {
     /// Initialize the snapshot contract.
-    pub fn initialize(env: Env, admin: Address, staking_contract: Address) {
+    pub fn initialize(
+        env: Env,
+        admin: Address,
+        staking_contract: Address,
+        delegation_contract: Address,
+    ) {
         if env.storage().persistent().has(&DataKey::Admin) {
             panic!("already initialized");
         }
         env.storage().persistent().set(&DataKey::Admin, &admin);
-        env.storage().persistent().set(&DataKey::StakingContract, &staking_contract);
+        env.storage()
+            .persistent()
+            .set(&DataKey::StakingContract, &staking_contract);
+        env.storage()
+            .persistent()
+            .set(&DataKey::DelegationContract, &delegation_contract);
     }
 
-    /// records all staked MNT balances at current ledger
+    /// records all staked MNT balances at current ledger and snapshots delegation state
     pub fn record_snapshot(env: Env, snapshot_id: u32) {
-        let staking_contract: Address = env.storage().persistent().get(&DataKey::StakingContract).expect("not initialized");
-        
+        let staking_contract: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::StakingContract)
+            .expect("not initialized");
+        let delegation_contract: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::DelegationContract)
+            .expect("delegation contract not set");
+
         // 1. Get total supply at this snapshot
-        let total_supply: i128 = env.invoke_contract(&staking_contract, &Symbol::new(&env, "get_total_staked"), Vec::new(&env));
-        env.storage().persistent().set(&DataKey::SnapshotTotalSupply(snapshot_id), &total_supply);
+        let total_supply: i128 = env.invoke_contract(
+            &staking_contract,
+            &Symbol::new(&env, "get_total_staked"),
+            Vec::new(&env),
+        );
+        env.storage()
+            .persistent()
+            .set(&DataKey::SnapshotTotalSupply(snapshot_id), &total_supply);
 
         // 2. Get all stakers and record their balances
-        let stakers: Vec<Address> = env.invoke_contract(&staking_contract, &Symbol::new(&env, "get_stakers"), Vec::new(&env));
-        
+        let stakers: Vec<Address> = env.invoke_contract(
+            &staking_contract,
+            &Symbol::new(&env, "get_stakers"),
+            Vec::new(&env),
+        );
+
         let thirty_days_ledgers = 30 * 24 * 60 * 60 / 5; // Approx 5s per ledger
 
         for staker in stakers.iter() {
@@ -47,28 +77,76 @@ impl SnapshotContract {
             // positional layout here is GUARANTEED to match what the
             // staking contract emitted on get_stake — no silent tier
             // corruption caused by mismatched field counts/types.
-            let stake_record: soroban_sdk::Val = env.invoke_contract(&staking_contract, &Symbol::new(&env, "get_stake"), (staker.clone(),).into_val(&env));
+            let stake_record: soroban_sdk::Val = env.invoke_contract(
+                &staking_contract,
+                &Symbol::new(&env, "get_stake"),
+                (staker.clone(),).into_val(&env),
+            );
             let record: StakeRecord = FromVal::from_val(&env, &stake_record);
             let key = DataKey::Snapshot(snapshot_id, staker.clone());
             env.storage().persistent().set(&key, &record.amount);
-            
+
             // Auto-expire: extend TTL for 30 days
-            env.storage().persistent().extend_ttl(&key, thirty_days_ledgers, thirty_days_ledgers);
+            env.storage()
+                .persistent()
+                .extend_ttl(&key, thirty_days_ledgers, thirty_days_ledgers);
         }
-        
+
         // Also extend TTL for total supply
         let ts_key = DataKey::SnapshotTotalSupply(snapshot_id);
-        env.storage().persistent().extend_ttl(&ts_key, thirty_days_ledgers, thirty_days_ledgers);
+        env.storage()
+            .persistent()
+            .extend_ttl(&ts_key, thirty_days_ledgers, thirty_days_ledgers);
+
+        // 3. Snapshot delegation state for this proposal
+        env.invoke_contract::<()>(
+            &delegation_contract,
+            &Symbol::new(&env, "snapshot_delegations"),
+            (snapshot_id,).into_val(&env),
+        );
     }
 
     /// returns the voting power for a voter at a specific snapshot
+    /// accounts for delegation state at snapshot time: if voter delegated away,
+    /// returns 0; otherwise returns their staked balance
     pub fn get_voting_power(env: Env, snapshot_id: u32, voter: Address) -> i128 {
-        env.storage().persistent().get(&DataKey::Snapshot(snapshot_id, voter)).unwrap_or(0)
+        let delegation_contract: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::DelegationContract)
+            .unwrap_or_else(|| {
+                // Fallback for contracts initialized before delegation support
+                env.storage()
+                    .persistent()
+                    .get(&DataKey::DelegationContract)
+                    .expect("delegation contract not set")
+            });
+
+        // Check if voter delegated away at snapshot time
+        let delegated_to: Option<Address> = env.invoke_contract(
+            &delegation_contract,
+            &Symbol::new(&env, "get_delegation_at_snapshot"),
+            (snapshot_id, voter.clone()).into_val(&env),
+        );
+
+        if delegated_to.is_some() {
+            // Voter delegated away - their voting power is 0
+            return 0;
+        }
+
+        // Voter did not delegate - return their staked balance
+        env.storage()
+            .persistent()
+            .get(&DataKey::Snapshot(snapshot_id, voter))
+            .unwrap_or(0)
     }
 
     /// returns the total supply at a specific snapshot for quorum calculation
     pub fn get_total_supply_at(env: Env, snapshot_id: u32) -> i128 {
-        env.storage().persistent().get(&DataKey::SnapshotTotalSupply(snapshot_id)).unwrap_or(0)
+        env.storage()
+            .persistent()
+            .get(&DataKey::SnapshotTotalSupply(snapshot_id))
+            .unwrap_or(0)
     }
 }
 
@@ -77,8 +155,8 @@ mod test {
     extern crate std;
     use super::*;
     use shared::StakeRecord as SharedStakeRecord;
-    use soroban_sdk::testutils::{Address as _};
-    use soroban_sdk::{Env, IntoVal, symbol_short};
+    use soroban_sdk::testutils::Address as _;
+    use soroban_sdk::{symbol_short, Env, IntoVal};
 
     // -----------------------------------------------------------------------
     // NOTE: StakeRecord is NOT re-defined here. MockStaking imports the same
@@ -96,19 +174,32 @@ mod test {
     #[contractimpl]
     impl MockStaking {
         pub fn get_total_staked(env: Env) -> i128 {
-            env.storage().persistent().get(&symbol_short!("TOT_STK")).unwrap_or(0)
+            env.storage()
+                .persistent()
+                .get(&symbol_short!("TOT_STK"))
+                .unwrap_or(0)
         }
         pub fn set_total_staked(env: Env, amount: i128) {
-            env.storage().persistent().set(&symbol_short!("TOT_STK"), &amount);
+            env.storage()
+                .persistent()
+                .set(&symbol_short!("TOT_STK"), &amount);
         }
         pub fn get_stakers(env: Env) -> Vec<Address> {
-            env.storage().persistent().get(&symbol_short!("STAKERS")).unwrap_or_else(|| Vec::new(&env))
+            env.storage()
+                .persistent()
+                .get(&symbol_short!("STAKERS"))
+                .unwrap_or_else(|| Vec::new(&env))
         }
         pub fn set_stakers(env: Env, stakers: Vec<Address>) {
-            env.storage().persistent().set(&symbol_short!("STAKERS"), &stakers);
+            env.storage()
+                .persistent()
+                .set(&symbol_short!("STAKERS"), &stakers);
         }
         pub fn get_stake(env: Env, mentor: Address) -> StakeRecord {
-            env.storage().persistent().get(&(symbol_short!("STAKE"), mentor)).unwrap()
+            env.storage()
+                .persistent()
+                .get(&(symbol_short!("STAKE"), mentor))
+                .unwrap()
         }
         pub fn set_stake(env: Env, mentor: Address, amount: i128) {
             // Use shared StakeRecord — includes unlock_cooldown_until field
@@ -130,17 +221,36 @@ mod test {
                 unlock_cooldown_until: None,
                 tier,
             };
-            env.storage().persistent().set(&(symbol_short!("STAKE"), mentor), &record);
+            env.storage()
+                .persistent()
+                .set(&(symbol_short!("STAKE"), mentor), &record);
         }
         /// Diagnostic: return the tier of a mentor as computed by the mock
         /// staking contract. Snapshot reads the same record through a
         /// shared StakeRecord type; this helper lets us verify snapshot
         /// reads the exact same tier value (the exact regression of #646).
         pub fn get_mock_tier(env: Env, mentor: Address) -> u32 {
-            let r: StakeRecord = env.storage().persistent()
+            let r: StakeRecord = env
+                .storage()
+                .persistent()
                 .get(&(symbol_short!("STAKE"), mentor))
                 .unwrap();
             r.tier
+        }
+    }
+
+    #[contract]
+    pub struct MockDelegation;
+
+    #[contractimpl]
+    impl MockDelegation {
+        pub fn snapshot_delegations(_env: Env, _snapshot_id: u32) {}
+        pub fn get_delegation_at_snapshot(
+            _env: Env,
+            _snapshot_id: u32,
+            _delegator: Address,
+        ) -> Option<Address> {
+            None // No delegations in mock
         }
     }
 
@@ -151,15 +261,16 @@ mod test {
 
         let snapshot_id = env.register_contract(None, SnapshotContract);
         let staking_id = env.register_contract(None, MockStaking);
+        let delegation_id = env.register_contract(None, MockDelegation);
         let client = SnapshotContractClient::new(&env, &snapshot_id);
         let staking = MockStakingClient::new(&env, &staking_id);
 
         let admin = Address::generate(&env);
-        client.initialize(&admin, &staking_id);
+        client.initialize(&admin, &staking_id, &delegation_id);
 
         let voter1 = Address::generate(&env);
         let voter2 = Address::generate(&env);
-        
+
         staking.set_total_staked(&1000);
         staking.set_stakers(&Vec::from_array(&env, [voter1.clone(), voter2.clone()]));
         staking.set_stake(&voter1, &400);
@@ -201,36 +312,38 @@ mod test {
 
         let snapshot_id = env.register_contract(None, SnapshotContract);
         let staking_id = env.register_contract(None, MockStaking);
+        let delegation_id = env.register_contract(None, MockDelegation);
         let client = SnapshotContractClient::new(&env, &snapshot_id);
         let staking = MockStakingClient::new(&env, &staking_id);
 
         let admin = Address::generate(&env);
-        client.initialize(&admin, &staking_id);
+        client.initialize(&admin, &staking_id, &delegation_id);
 
         // Three mentors with exact thresholds.
         // Bronze: >= 100 (threshold)
         // Silver: >= 500 (threshold)
         // Gold:   >= 2000 (threshold)
-        let none   = Address::generate(&env);   // 50 → tier 0
-        let bronze = Address::generate(&env);   // 100 → tier 1
-        let silver = Address::generate(&env);   // 500 → tier 2
-        let gold   = Address::generate(&env);   // 2000 → tier 3
+        let none = Address::generate(&env); // 50 → tier 0
+        let bronze = Address::generate(&env); // 100 → tier 1
+        let silver = Address::generate(&env); // 500 → tier 2
+        let gold = Address::generate(&env); // 2000 → tier 3
 
         staking.set_total_staked(&2650); // 50+100+500+2000
-        staking.set_stakers(&Vec::from_array(&env, [
-            none.clone(), bronze.clone(), silver.clone(), gold.clone(),
-        ]));
-        staking.set_stake(&none,   &50);
+        staking.set_stakers(&Vec::from_array(
+            &env,
+            [none.clone(), bronze.clone(), silver.clone(), gold.clone()],
+        ));
+        staking.set_stake(&none, &50);
         staking.set_stake(&bronze, &100);
         staking.set_stake(&silver, &500);
-        staking.set_stake(&gold,   &2000);
+        staking.set_stake(&gold, &2000);
 
         // --- BEFORE snapshot: the mock staking contract itself must report
         // correct tiers. This is the baseline.
-        assert_eq!(staking.get_mock_tier(&none),   0);
+        assert_eq!(staking.get_mock_tier(&none), 0);
         assert_eq!(staking.get_mock_tier(&bronze), 1);
         assert_eq!(staking.get_mock_tier(&silver), 2);
-        assert_eq!(staking.get_mock_tier(&gold),   3);
+        assert_eq!(staking.get_mock_tier(&gold), 3);
 
         // --- Record snapshot. Snapshot deserializes StakeRecord via shared
         // crate type and stores voting power.
@@ -257,10 +370,10 @@ mod test {
         }
 
         // --- Voting powers (amount at snapshot time)
-        assert_eq!(client.get_voting_power(&1, &none),   50);
+        assert_eq!(client.get_voting_power(&1, &none), 50);
         assert_eq!(client.get_voting_power(&1, &bronze), 100);
         assert_eq!(client.get_voting_power(&1, &silver), 500);
-        assert_eq!(client.get_voting_power(&1, &gold),   2000);
+        assert_eq!(client.get_voting_power(&1, &gold), 2000);
         assert_eq!(client.get_total_supply_at(&1), 2650);
     }
 
@@ -340,10 +453,10 @@ mod test {
         // cannot happen because the shared struct forces the same layout.
         // This assert ensures field order hasn't silently changed in shared:
         let fields: [i128; 4] = [
-            a_back.amount,  // 123456
-            b_back.amount,  // 5_000_000
-            c_back.amount,  // 250
-            d_back.amount,  // 750
+            a_back.amount, // 123456
+            b_back.amount, // 5_000_000
+            c_back.amount, // 250
+            d_back.amount, // 750
         ];
         assert_eq!(fields, [123_456, 5_000_000, 250, 750]);
     }

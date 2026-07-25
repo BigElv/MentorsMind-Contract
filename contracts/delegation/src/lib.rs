@@ -9,16 +9,18 @@ use soroban_sdk::{
 pub enum DataKey {
     Admin,
     MNTToken,
-    Delegate(Address),             // mapping: delegator -> delegate
-    Delegators,                    // Vec<Address>
-    MaxDelegationDepth,            // u32: configurable max depth for cycle detection
-    DelegatedPowerCache(Address),  // eager cache: ultimate delegate -> sum of delegator balances
+    Delegate(Address),            // mapping: delegator -> delegate
+    Delegators,                   // Vec<Address>
+    MaxDelegationDepth,           // u32: configurable max depth for cycle detection
+    DelegatedPowerCache(Address), // eager cache: ultimate delegate -> sum of delegator balances
     /// Eager subtree weight: `SubtreeWeight(X)` = own balance (if X is a
     /// delegator) + the subtree weight of everyone whose delegate link
     /// points directly at X. This lets a re-delegation move an entire
     /// subtree of followers to a new ultimate target in O(1), instead of
     /// having to walk every follower.
     SubtreeWeight(Address),
+    /// Historical delegation snapshot: (snapshot_id, delegator) -> delegate address at that snapshot
+    DelegationAtSnapshot(u32, Address),
 }
 
 #[contracterror]
@@ -54,7 +56,9 @@ impl DelegationContract {
         env.storage().instance().set(&DataKey::Admin, &admin);
         env.storage().instance().set(&DataKey::MNTToken, &mnt_token);
         // Set default max delegation depth to 10
-        env.storage().instance().set(&DataKey::MaxDelegationDepth, &10u32);
+        env.storage()
+            .instance()
+            .set(&DataKey::MaxDelegationDepth, &10u32);
     }
 
     pub fn set_max_delegation_depth(env: Env, admin: Address, depth: u32) {
@@ -70,7 +74,9 @@ impl DelegationContract {
         if depth < 2 || depth > 100 {
             panic!("depth must be between 2 and 100");
         }
-        env.storage().instance().set(&DataKey::MaxDelegationDepth, &depth);
+        env.storage()
+            .instance()
+            .set(&DataKey::MaxDelegationDepth, &depth);
     }
 
     pub fn get_max_delegation_depth(env: Env) -> u32 {
@@ -160,17 +166,18 @@ impl DelegationContract {
         // re-delegation never needs to touch each individual follower.
         let weight = Self::get_subtree_weight(&env, &delegator);
 
-        let previous_delegate: Option<Address> =
-            env.storage().persistent().get(&DataKey::Delegate(delegator.clone()));
+        let previous_delegate: Option<Address> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Delegate(delegator.clone()));
 
         if let Some(prev) = previous_delegate {
             Self::propagate_weight_change(&env, &prev, -weight, max_depth);
         }
 
-        env.storage().persistent().set(
-            &DataKey::Delegate(delegator.clone()),
-            &delegate.clone(),
-        );
+        env.storage()
+            .persistent()
+            .set(&DataKey::Delegate(delegator.clone()), &delegate.clone());
 
         // Add delegator to delegators list if not present
         let mut delegators: soroban_sdk::Vec<Address> = env
@@ -180,7 +187,9 @@ impl DelegationContract {
             .unwrap_or_else(|| soroban_sdk::Vec::new(&env));
         if !delegators.contains(&delegator) {
             delegators.push_back(delegator.clone());
-            env.storage().persistent().set(&DataKey::Delegators, &delegators);
+            env.storage()
+                .persistent()
+                .set(&DataKey::Delegators, &delegators);
         }
 
         Self::propagate_weight_change(&env, &delegate, weight, max_depth);
@@ -191,14 +200,19 @@ impl DelegationContract {
                 Symbol::new(&env, "delegated"),
                 delegator.clone(),
             ),
-            DelegatedEventData { delegator, delegate },
+            DelegatedEventData {
+                delegator,
+                delegate,
+            },
         );
     }
 
     pub fn undelegate(env: Env, delegator: Address) {
         delegator.require_auth();
-        let existing: Option<Address> =
-            env.storage().persistent().get(&DataKey::Delegate(delegator.clone()));
+        let existing: Option<Address> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Delegate(delegator.clone()));
         let delegate = match existing {
             Some(d) => d,
             None => return,
@@ -219,7 +233,9 @@ impl DelegationContract {
             .unwrap_or_else(|| soroban_sdk::Vec::new(&env));
         if let Some(index) = delegators.first_index_of(&delegator) {
             delegators.remove(index);
-            env.storage().persistent().set(&DataKey::Delegators, &delegators);
+            env.storage()
+                .persistent()
+                .set(&DataKey::Delegators, &delegators);
         }
 
         Self::propagate_weight_change(&env, &delegate, -weight, max_depth);
@@ -267,7 +283,12 @@ impl DelegationContract {
     /// `old_balance`/`new_balance` describe `delegator`'s balance before/after
     /// the change; the delta is propagated up `delegator`'s chain, updating
     /// every ancestor's subtree weight and the ultimate delegate's cache.
-    pub fn invalidate_power_cache(env: Env, delegator: Address, old_balance: i128, new_balance: i128) {
+    pub fn invalidate_power_cache(
+        env: Env,
+        delegator: Address,
+        old_balance: i128,
+        new_balance: i128,
+    ) {
         let token: Address = env
             .storage()
             .instance()
@@ -292,6 +313,49 @@ impl DelegationContract {
             let max_depth = Self::get_max_delegation_depth(env.clone());
             Self::propagate_weight_change(&env, &delegate, delta, max_depth);
         }
+    }
+
+    /// Snapshot current delegation state at a specific proposal snapshot.
+    /// Stores (snapshot_id, delegator) -> delegate for all current delegations.
+    /// Called by snapshot contract at proposal creation time.
+    /// TTL: delegation snapshot entries expire after 90 days.
+    pub fn snapshot_delegations(env: Env, snapshot_id: u32) {
+        let delegators: soroban_sdk::Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Delegators)
+            .unwrap_or_else(|| soroban_sdk::Vec::new(&env));
+
+        let ninety_days_ledgers = 90 * 24 * 60 * 60 / 5; // ~5s per ledger
+
+        for delegator in delegators.iter() {
+            if let Some(delegate) = env
+                .storage()
+                .persistent()
+                .get::<_, Address>(&DataKey::Delegate(delegator.clone()))
+            {
+                let key = DataKey::DelegationAtSnapshot(snapshot_id, delegator.clone());
+                env.storage().persistent().set(&key, &delegate);
+                // Auto-expire: extend TTL for 90 days
+                env.storage().persistent().extend_ttl(
+                    &key,
+                    ninety_days_ledgers,
+                    ninety_days_ledgers,
+                );
+            }
+        }
+    }
+
+    /// Get the delegate of a delegator at a specific snapshot.
+    /// Returns None if delegator had no delegation at snapshot time.
+    pub fn get_delegation_at_snapshot(
+        env: Env,
+        snapshot_id: u32,
+        delegator: Address,
+    ) -> Option<Address> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::DelegationAtSnapshot(snapshot_id, delegator))
     }
 
     /// Subtree weight of `addr`: its own token balance plus the subtree
