@@ -1,7 +1,7 @@
 #![no_std]
 
 use shared::events::{emit_staking_event, evt_staking_staked, evt_staking_unstaked};
-use shared::ReentrancyGuard;
+use shared::{ReentrancyGuard, StakeRecord, StakedEventData};
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, token, Address, Env, Symbol,
 };
@@ -23,33 +23,17 @@ pub enum Error {
 }
 
 // ---------------------------------------------------------------------------
-// Storage types
+// Storage types — StakeRecord is defined in the shared crate at
+// shared/src/staking.rs. Do NOT redefine it here: the snapshot crate
+// imports the same struct and Soroban serializes #[contracttype] structs
+// by positional field order in XDR, so any divergence in field count,
+// order, or type produces silent corrupted deserialization.
+// See issue #646 for the snapshot-tier bug that motivated this extraction.
 // ---------------------------------------------------------------------------
 
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct StakeRecord {
-    pub mentor: Address,
-    pub amount: i128,
-    pub staked_at: u64,
-    pub unlock_at: u64,
-    pub unlock_cooldown_until: Option<u64>,
-    pub tier: u32,
-}
-
 // ---------------------------------------------------------------------------
-// Event data types
+// Event data types — StakedEventData also lives in shared::staking.
 // ---------------------------------------------------------------------------
-
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct StakedEventData {
-    pub mentor: Address,
-    pub amount: i128,
-    pub unlock_at: u64,
-    pub unlock_cooldown_until: Option<u64>,
-    pub tier: u32,
-}
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
