@@ -20,6 +20,8 @@ members = [
     "contracts/subscription",
     "contracts/lending_pool",
     "tools/storage_scanner",
+    "contracts/delegation",
+    "contracts/escrow_factory",
     "tests",
 ]
 
