@@ -722,6 +722,7 @@ fn require_upgrade_approvals(env: &Env, approvers: Vec<Address>) -> Result<Vec<A
     Ok(approvers)
 }
 
+#[allow(dead_code)]
 fn require_upgrade_approvals_for_pending(
     env: &Env,
     approvers: Vec<Address>,

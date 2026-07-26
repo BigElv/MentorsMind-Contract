@@ -35,7 +35,7 @@
 /// 4. If this is a breaking payload change, increment `EVENT_SCHEMA_VERSION`.
 #[allow(dead_code)]
 
-use soroban_sdk::{symbol_short, Env, IntoVal, Symbol, Val, Vec};
+use soroban_sdk::{Env, IntoVal, Symbol, Val};
 
 // ---------------------------------------------------------------------------
 // Schema version — increment when topic layout or required fields change.
