@@ -30,6 +30,7 @@ pub enum DataKey {
     Bounty(u32),
     Claim(u32, Address), // (bounty_id, learner)
     ClaimEvidence(u32, Address), // (bounty_id, learner)
+    BountyLock(u32),
 }
 
 // ---------------------------------------------------------------------------
@@ -335,11 +336,18 @@ impl BountyContract {
         learner: Address,
         reviewer_notes_hash: BytesN<32>,
     ) {
+        let lock_key = DataKey::BountyLock(bounty_id);
+        if env.storage().persistent().get(&lock_key).unwrap_or(false) {
+            panic!("Bounty is locked");
+        }
+        env.storage().persistent().set(&lock_key, &true);
+
         mentor.require_auth();
 
         // Validate reviewer notes hash is not zero
         let zero_hash = BytesN::from_array(&env, &[0u8; 32]);
         if reviewer_notes_hash == zero_hash {
+            env.storage().persistent().set(&lock_key, &false);
             panic!("Reviewer notes hash cannot be zero");
         }
 
@@ -356,6 +364,7 @@ impl BountyContract {
                 args
             });
         if !is_verified {
+            env.storage().persistent().set(&lock_key, &false);
             panic!("Mentor is not verified");
         }
 
@@ -366,9 +375,11 @@ impl BountyContract {
             .expect("Bounty not found");
 
         if bounty.status == BountyStatus::Verified {
+            env.storage().persistent().set(&lock_key, &false);
             panic!("Bounty already verified");
         }
         if bounty.status == BountyStatus::Refunded {
+            env.storage().persistent().set(&lock_key, &false);
             panic!("Bounty already refunded");
         }
 
@@ -380,13 +391,11 @@ impl BountyContract {
             .expect("No claim found for this learner");
 
         if claim.status == ClaimStatus::Disputed {
+            env.storage().persistent().set(&lock_key, &false);
             panic!("Claim is disputed");
         }
 
-        // Release reward to learner
-        let token_client = token::Client::new(&env, &bounty.token);
-        token_client.transfer(&env.current_contract_address(), &learner, &bounty.reward);
-
+        // Checks-Effects-Interactions: Update state to Verified BEFORE token transfer
         claim.status = ClaimStatus::Verified;
         env.storage().persistent().set(&claim_key, &claim);
         env.storage()
@@ -402,6 +411,13 @@ impl BountyContract {
             .persistent()
             .extend_ttl(&DataKey::Bounty(bounty_id), TTL_THRESHOLD, TTL_BUMP);
         env.storage().instance().extend_ttl(TTL_THRESHOLD, TTL_BUMP);
+
+        // Release reward to learner after state update
+        let token_client = token::Client::new(&env, &bounty.token);
+        token_client.transfer(&env.current_contract_address(), &learner, &bounty.reward);
+
+        // Unlock bounty lock
+        env.storage().persistent().set(&lock_key, &false);
 
         emit_bounty_event(
             &env,

@@ -122,6 +122,8 @@ pub enum DataKey {
     DisputeOpenedAt(u64),
     /// Whether the anti-spam cooldown is enabled (default: true).
     CooldownEnabled,
+    AnomalyDetector,
+    BypassAnomalyCheck,
 }
 
 #[contractclient(name = "EscrowContractClient")]
@@ -192,6 +194,18 @@ impl DisputeEvidenceContract {
     pub fn set_cooldown_enabled(env: Env, admin: Address, enabled: bool) -> Result<(), Error> {
         Self::require_admin(&env, &admin)?;
         env.storage().instance().set(&DataKey::CooldownEnabled, &enabled);
+        Ok(())
+    }
+
+    pub fn set_anomaly_detector(env: Env, admin: Address, detector: Address) -> Result<(), Error> {
+        Self::require_admin(&env, &admin)?;
+        env.storage().instance().set(&DataKey::AnomalyDetector, &detector);
+        Ok(())
+    }
+
+    pub fn set_bypass_anomaly_check(env: Env, admin: Address, bypass: bool) -> Result<(), Error> {
+        Self::require_admin(&env, &admin)?;
+        env.storage().instance().set(&DataKey::BypassAnomalyCheck, &bypass);
         Ok(())
     }
 
@@ -386,6 +400,23 @@ impl DisputeEvidenceContract {
         note: Symbol,
     ) -> Result<(), Error> {
         arbitrator.require_auth();
+
+        let bypass: bool = env.storage().instance().get(&DataKey::BypassAnomalyCheck).unwrap_or(false);
+        if !bypass {
+            if let Some(anomaly_detector) = env.storage().instance().get::<_, Address>(&DataKey::AnomalyDetector) {
+                let res: u32 = env.invoke_contract(
+                    &anomaly_detector,
+                    &Symbol::new(&env, "check_anomaly"),
+                    (arbitrator.clone(), 1u32, 0i128).into_val(&env), // 1u32 = OpenDispute
+                );
+                if res == 2 {
+                    panic!("UserOnHold");
+                } else if res == 1 {
+                    env.events().publish((Symbol::new(&env, "anomaly_warning"), arbitrator.clone()), 0i128);
+                }
+            }
+        }
+
         let escrow = Self::load_escrow(&env, escrow_id);
         if escrow.status != EscrowStatus::Disputed {
             return Err(Error::InvalidEscrowState);
