@@ -68,17 +68,18 @@ pub struct ScoreBreakdown {
 
 #[contracttype]
 pub enum DataKey {
-    Admin,              // Persistent: critical config
-    EscrowContract,     // Persistent: external dependency
-    StakingContract,    // Persistent: external dependency
-    UserScore(Address), // Persistent: long-term user data
+    Admin,                  // Persistent: critical config
+    EscrowContract,         // Persistent: external dependency
+    StakingContract,        // Persistent: external dependency
+    UserScore(Address),     // Persistent: long-term user data
     UserBreakdown(Address), // Persistent: long-term user data
-    LastUpdate(Address), // Temporary: rate limiting, auto-expires
+    LastUpdate(Address),    // Temporary: rate limiting, auto-expires
 }
 
 const MIN_SCORE: u32 = 300;
 const MAX_SCORE: u32 = 850;
 const DAY_SECONDS: u64 = 86_400;
+const DAY_SECONDS_TTL: u32 = 86_400;
 
 // ---------------------------------------------------------------------------
 // Contract
@@ -146,9 +147,9 @@ impl CreditScoreContract {
         );
         // Extend TTL for temporary storage (1 day)
         env.storage().temporary().extend_ttl(
-            &DataKey::LastUpdate(user),
-            DAY_SECONDS,
-            DAY_SECONDS,
+            &DataKey::LastUpdate(user.clone()),
+            DAY_SECONDS_TTL,
+            DAY_SECONDS_TTL,
         );
 
         env.events().publish(

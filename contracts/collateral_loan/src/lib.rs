@@ -9,12 +9,16 @@ const LIQUIDATION_THRESHOLD_BPS: i128 = 12_000; // 120%
 const LIQUIDATOR_BONUS_BPS: i128 = 500; // 5%
 const BPS_DENOMINATOR: i128 = 10_000;
 const PRICE_SCALE: i128 = 10_000;
+const DEFAULT_INTEREST_RATE_BPS: u32 = 1000; // 10% APR
+const SECONDS_PER_YEAR: i128 = 365 * 24 * 60 * 60;
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Loan {
     pub collateral_amount: i128,
     pub debt_amount: i128,
+    pub borrowed_at: u64,
+    pub interest_rate_bps: u32,
 }
 
 #[contracttype]
@@ -26,6 +30,8 @@ pub enum DataKey {
     Oracle,
     MntAsset,
     Loan(Address),
+    InterestRateBps,
+    AccruedInterestVault,
 }
 
 #[contractclient(name = "OracleClient")]
@@ -59,6 +65,12 @@ impl CollateralLoanContract {
             .set(&DataKey::UsdcToken, &usdc_token);
         env.storage().instance().set(&DataKey::Oracle, &oracle);
         env.storage().instance().set(&DataKey::MntAsset, &mnt_asset);
+        env.storage()
+            .instance()
+            .set(&DataKey::InterestRateBps, &DEFAULT_INTEREST_RATE_BPS);
+        env.storage()
+            .instance()
+            .set(&DataKey::AccruedInterestVault, &0i128);
     }
 
     pub fn open_loan(env: Env, borrower: Address, collateral_amount: i128, borrow_amount: i128) {
@@ -93,9 +105,17 @@ impl CollateralLoanContract {
         let usdc_client = token::Client::new(&env, &usdc);
         usdc_client.transfer(&env.current_contract_address(), &borrower, &borrow_amount);
 
+        let interest_rate_bps: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::InterestRateBps)
+            .unwrap_or(DEFAULT_INTEREST_RATE_BPS);
+
         let loan = Loan {
             collateral_amount,
             debt_amount: borrow_amount,
+            borrowed_at: env.ledger().timestamp(),
+            interest_rate_bps,
         };
         env.storage().persistent().set(&loan_key, &loan);
 
@@ -124,34 +144,44 @@ impl CollateralLoanContract {
             panic!("loan already repaid");
         }
 
-        let pay_amount = if amount > loan.debt_amount {
-            loan.debt_amount
-        } else {
-            amount
-        };
+        let current_debt = Self::get_current_debt(env.clone(), borrower.clone());
+        let accrued_interest = current_debt - loan.debt_amount;
+
+        if amount < current_debt {
+            panic!("insufficient repayment amount");
+        }
 
         let usdc = Self::usdc_token(&env);
         let usdc_client = token::Client::new(&env, &usdc);
-        usdc_client.transfer(&borrower, &env.current_contract_address(), &pay_amount);
+        usdc_client.transfer(&borrower, &env.current_contract_address(), &current_debt);
 
-        loan.debt_amount -= pay_amount;
-
-        if loan.debt_amount == 0 {
-            let mnt = Self::mnt_token(&env);
-            let mnt_client = token::Client::new(&env, &mnt);
-            mnt_client.transfer(
-                &env.current_contract_address(),
-                &borrower,
-                &loan.collateral_amount,
-            );
-            env.storage().persistent().remove(&loan_key);
-        } else {
-            env.storage().persistent().set(&loan_key, &loan);
+        // Track accrued interest in vault
+        if accrued_interest > 0 {
+            let mut vault: i128 = env
+                .storage()
+                .instance()
+                .get(&DataKey::AccruedInterestVault)
+                .unwrap_or(0);
+            vault = vault.checked_add(accrued_interest).expect("overflow");
+            env.storage()
+                .instance()
+                .set(&DataKey::AccruedInterestVault, &vault);
         }
+
+        loan.debt_amount = 0;
+
+        let mnt = Self::mnt_token(&env);
+        let mnt_client = token::Client::new(&env, &mnt);
+        mnt_client.transfer(
+            &env.current_contract_address(),
+            &borrower,
+            &loan.collateral_amount,
+        );
+        env.storage().persistent().remove(&loan_key);
 
         env.events().publish(
             (Symbol::new(&env, "repaid"), borrower),
-            (pay_amount, loan.debt_amount),
+            (current_debt, accrued_interest),
         );
     }
 
@@ -220,17 +250,18 @@ impl CollateralLoanContract {
     pub fn get_health_factor(env: Env, borrower: Address) -> u32 {
         Self::require_initialized(&env);
 
-        let loan: Loan = match env.storage().persistent().get(&DataKey::Loan(borrower)) {
+        let loan: Loan = match env.storage().persistent().get(&DataKey::Loan(borrower.clone())) {
             Some(l) => l,
             None => return 0,
         };
 
-        if loan.debt_amount <= 0 {
+        let current_debt = Self::get_current_debt(env.clone(), borrower);
+        if current_debt <= 0 {
             return u32::MAX;
         }
 
         let price = Self::get_mnt_price(&env);
-        let ratio = Self::compute_ratio_bps(loan.collateral_amount, loan.debt_amount, price);
+        let ratio = Self::compute_ratio_bps(loan.collateral_amount, current_debt, price);
 
         if ratio < 0 {
             0
@@ -239,6 +270,34 @@ impl CollateralLoanContract {
         } else {
             ratio as u32
         }
+    }
+
+    /// Calculate current debt including accrued interest.
+    pub fn get_current_debt(env: Env, borrower: Address) -> i128 {
+        let loan: Loan = match env.storage().persistent().get(&DataKey::Loan(borrower)) {
+            Some(l) => l,
+            None => return 0,
+        };
+
+        if loan.debt_amount <= 0 {
+            return 0;
+        }
+
+        let now = env.ledger().timestamp();
+        let elapsed_seconds = now.saturating_sub(loan.borrowed_at) as i128;
+        let elapsed_days = elapsed_seconds.checked_div(86400).unwrap_or(0);
+
+        // Simple interest: interest = debt * rate_bps * elapsed_days / (365 * 10000)
+        let interest = loan
+            .debt_amount
+            .checked_mul(loan.interest_rate_bps as i128)
+            .unwrap_or(0)
+            .checked_mul(elapsed_days)
+            .unwrap_or(0)
+            .checked_div(365 * BPS_DENOMINATOR)
+            .unwrap_or(0);
+
+        loan.debt_amount.checked_add(interest).unwrap_or(i128::MAX)
     }
 
     pub fn get_loan(env: Env, borrower: Address) -> Option<Loan> {

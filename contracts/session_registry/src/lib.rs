@@ -37,6 +37,7 @@ pub enum DataKey {
     Session(Symbol),
     MentorSessions(Address),
     LearnerSessions(Address),
+    SessionOracle,
 }
 
 // ── Errors ────────────────────────────────────────────────────────────────────
@@ -56,9 +57,7 @@ impl SessionRegistry {
             panic!("Already initialized");
         }
         env.storage().instance().set(&BACKEND, &backend);
-        env.storage()
-            .instance()
-            .extend_ttl(TTL_THRESHOLD, TTL_BUMP);
+        env.storage().instance().extend_ttl(TTL_THRESHOLD, TTL_BUMP);
     }
 
     /// Register a new session. Only callable by the platform backend.
@@ -169,6 +168,50 @@ impl SessionRegistry {
         );
     }
 
+    pub fn set_session_oracle(env: Env, oracle: Address) {
+        let backend = Self::require_backend(&env);
+        backend.require_auth();
+        env.storage()
+            .instance()
+            .set(&DataKey::SessionOracle, &oracle);
+    }
+
+    pub fn update_status_from_oracle(
+        env: Env,
+        oracle: Address,
+        session_id: Symbol,
+        status: SessionStatus,
+    ) {
+        let configured_oracle: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::SessionOracle)
+            .expect("Session oracle not configured");
+        oracle.require_auth();
+        if oracle != configured_oracle {
+            panic!("Unauthorized");
+        }
+
+        let session_key = DataKey::Session(session_id.clone());
+        let mut record: SessionRecord = env
+            .storage()
+            .persistent()
+            .get(&session_key)
+            .expect("Session not found");
+
+        let old_status = record.status.clone();
+        record.status = status.clone();
+        env.storage().persistent().set(&session_key, &record);
+        env.events().publish(
+            (
+                symbol_short!("session"),
+                Symbol::new(&env, "session_oracle_status_changed"),
+                session_id,
+            ),
+            (old_status, status),
+        );
+    }
+
     /// Get a session record by session_id.
     pub fn get_session(env: Env, session_id: Symbol) -> SessionRecord {
         env.storage()
@@ -199,13 +242,27 @@ impl SessionRegistry {
             .get(&BACKEND)
             .expect("Not initialized")
     }
+
+
+    pub fn update_session_metadata(env: Env, session_id: u64, tags: soroban_sdk::Vec<String>) {
+        let key = (symbol_short!("SessMeta"), session_id);
+        env.storage().persistent().set(&key, &tags);
+    }
+    
+    pub fn get_sessions_by_participant(env: Env, participant: Address) -> soroban_sdk::Vec<u64> {
+        soroban_sdk::Vec::new(&env)
+    }
+
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
 #[cfg(test)]
 mod tests {
     use super::*;
-    use soroban_sdk::{testutils::{Address as _, Ledger}, Env};
+    use soroban_sdk::{
+        testutils::{Address as _, Ledger},
+        Env,
+    };
 
     fn setup() -> (Env, SessionRegistryClient<'static>, Address) {
         let env = Env::default();
@@ -267,10 +324,16 @@ mod tests {
         );
 
         client.update_status(&session_id, &SessionStatus::Confirmed);
-        assert_eq!(client.get_session(&session_id).status, SessionStatus::Confirmed);
+        assert_eq!(
+            client.get_session(&session_id).status,
+            SessionStatus::Confirmed
+        );
 
         client.update_status(&session_id, &SessionStatus::Completed);
-        assert_eq!(client.get_session(&session_id).status, SessionStatus::Completed);
+        assert_eq!(
+            client.get_session(&session_id).status,
+            SessionStatus::Completed
+        );
     }
 
     #[test]
@@ -286,7 +349,15 @@ mod tests {
                 2 => Symbol::new(&env, "s2"),
                 _ => Symbol::new(&env, "s3"),
             };
-            client.register_session(&sid, &mentor, &learner, &2_000_000u64, &60u32, &100i128, &token);
+            client.register_session(
+                &sid,
+                &mentor,
+                &learner,
+                &2_000_000u64,
+                &60u32,
+                &100i128,
+                &token,
+            );
         }
 
         let mentor_sessions = client.get_sessions_by_mentor(&mentor);
@@ -314,7 +385,10 @@ mod tests {
         );
 
         client.update_status(&session_id, &SessionStatus::Cancelled);
-        assert_eq!(client.get_session(&session_id).status, SessionStatus::Cancelled);
+        assert_eq!(
+            client.get_session(&session_id).status,
+            SessionStatus::Cancelled
+        );
     }
 
     #[test]
@@ -326,7 +400,23 @@ mod tests {
         let session_id = Symbol::new(&env, "sess_dup");
         let token = dummy_token(&env);
 
-        client.register_session(&session_id, &mentor, &learner, &2_000_000u64, &60u32, &100i128, &token);
-        client.register_session(&session_id, &mentor, &learner, &2_000_000u64, &60u32, &100i128, &token);
+        client.register_session(
+            &session_id,
+            &mentor,
+            &learner,
+            &2_000_000u64,
+            &60u32,
+            &100i128,
+            &token,
+        );
+        client.register_session(
+            &session_id,
+            &mentor,
+            &learner,
+            &2_000_000u64,
+            &60u32,
+            &100i128,
+            &token,
+        );
     }
 }
