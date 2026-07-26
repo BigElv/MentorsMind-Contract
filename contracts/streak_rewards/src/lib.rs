@@ -208,7 +208,9 @@ mod test {
     pub struct MockToken;
     #[contractimpl]
     impl MockToken {
-        pub fn transfer(_e: Env, _from: Address, _to: Address, _amount: i128) {}
+        pub fn transfer(_e: Env, from: Address, _to: Address, _amount: i128) {
+            from.require_auth();
+        }
     }
 
     fn setup_test(

@@ -264,6 +264,7 @@ mod tests {
 
     use super::*;
     use soroban_sdk::testutils::Address as _;
+    use soroban_sdk::IntoVal;
 
     fn setup() -> (Env, Address, ProposalTemplatesContractClient<'static>) {
         let env = Env::default();

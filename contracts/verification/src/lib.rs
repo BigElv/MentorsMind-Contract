@@ -78,10 +78,16 @@ impl VerificationContract {
         env.storage().persistent().set(&key, &rec);
         let tkey = DataKey::Tier(mentor.clone());
         if !env.storage().persistent().has(&tkey) {
+            // New mentors start from the base tier until a separate promotion
+            // path raises their score.
             env.storage().persistent().set(&tkey, &0i32);
         }
         env.events().publish(
-            (symbol_short!("Verify"), symbol_short!("VrfyOk"), mentor.clone()),
+            (
+                symbol_short!("Verify"),
+                symbol_short!("VrfyOk"),
+                mentor.clone(),
+            ),
             MentorVerifiedEventData {
                 credential_hash: rec.credential_hash.clone(),
                 verified_at: rec.verified_at,
@@ -113,7 +119,11 @@ impl VerificationContract {
         rec.is_active = false;
         env.storage().persistent().set(&key, &rec);
         env.events().publish(
-            (symbol_short!("Verify"), symbol_short!("Revoke"), mentor.clone()),
+            (
+                symbol_short!("Verify"),
+                symbol_short!("Revoke"),
+                mentor.clone(),
+            ),
             VerificationRevokedEventData { revoked: true },
         );
     }
@@ -123,6 +133,8 @@ impl VerificationContract {
         let rec: Option<VerificationRecord> = env.storage().persistent().get(&key);
         match rec {
             None => false,
+            // Verification is only valid while the record is active and the
+            // recorded expiry has not been reached yet.
             Some(r) => r.is_active && env.ledger().timestamp() <= r.expiry,
         }
     }

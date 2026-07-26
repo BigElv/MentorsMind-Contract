@@ -46,7 +46,9 @@ const COOLDOWN_DAYS: u64 = 30;
 const COOLDOWN_SECONDS: u64 = COOLDOWN_DAYS * 86_400;
 
 // Slash amounts (with 7 decimals)
+#[allow(dead_code)]
 const SLASH_NO_SHOW: i128 = 10_000_000; // 10 MNT
+#[allow(dead_code)]
 const SLASH_DISPUTE_LOST: i128 = 50_000_000; // 50 MNT
 
 // ---------------------------------------------------------------------------
@@ -294,9 +296,7 @@ impl PerformanceBondContract {
     /// Check if a mentor is bonded (has active bond).
     /// Used by escrow to verify mentor can accept bookings.
     pub fn is_bonded(env: Env, mentor: Address) -> bool {
-        env.storage()
-            .persistent()
-            .has(&DataKey::Bond(mentor))
+        env.storage().persistent().has(&DataKey::Bond(mentor))
     }
 }
 
@@ -371,9 +371,12 @@ mod test {
             let insurance_pool = Address::generate(&env);
             let mnt_id = env.register_contract(None, MockMNT);
 
-        let bond_id = env.register_contract(None, PerformanceBondContract);
-        PerformanceBondContractClient::new(&env, &bond_id)
-            .initialize(&admin, &mnt_id, &insurance_pool);
+            let bond_id = env.register_contract(None, PerformanceBondContract);
+            PerformanceBondContractClient::new(&env, &bond_id).initialize(
+                &admin,
+                &mnt_id,
+                &insurance_pool,
+            );
 
             Fixture {
                 env,
