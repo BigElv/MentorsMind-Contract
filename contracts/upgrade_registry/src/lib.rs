@@ -124,6 +124,7 @@ const DEFAULT_UPGRADE_DELAY: u64 = 48 * 60 * 60;
 /// - execute_pending_upgrade: applying scheduled upgrades (prevents bricking)
 /// - cancel_pending_upgrade: emergency halt of upgrades
 /// - get_admin: querying admin for authorization checks
+#[allow(dead_code)]
 const REQUIRED_FUNCTIONS: &[&str] = &[
     "initialize",
     "schedule_upgrade",
