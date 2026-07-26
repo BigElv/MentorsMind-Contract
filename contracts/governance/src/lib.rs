@@ -15,9 +15,11 @@ const VOTING_PERIOD_SECS: Symbol = symbol_short!("VOT_PER");
 const QUORUM_BPS: Symbol = symbol_short!("QRM_BPS");
 const CURRENT_FEE_BPS: Symbol = symbol_short!("FEE_BPS");
 const CURRENT_AUTO_RELEASE_SECS: Symbol = symbol_short!("AUTO_REL");
+const TEMPLATES: Symbol = symbol_short!("TMPLATES");
 
 const DEFAULT_VOTING_PERIOD_SECS: u64 = 7 * 24 * 60 * 60;
 const DEFAULT_QUORUM_BPS: u32 = 1_000; // 10%
+const CUSTOM_PROPOSAL_QUORUM_BPS: u32 = 3_000; // 30%
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -78,6 +80,7 @@ pub enum DataKey {
     VoteWeight(u32, Address),
     ApprovedAsset(Address),
     Timelock,
+    CustomProposal(u32),
 }
 
 #[contract]
@@ -110,10 +113,10 @@ impl GovernanceContract {
         env.storage().persistent().set(&ADMIN, &admin);
         env.storage().persistent().set(&TOKEN, &mnt_token);
 
-        env.storage().persistent().set(&SNAPSHOT, &snapshot_contract);
         env.storage()
             .persistent()
-            .set(&VOTING_PERIOD_SECS, &period);
+            .set(&SNAPSHOT, &snapshot_contract);
+        env.storage().persistent().set(&VOTING_PERIOD_SECS, &period);
 
         env.storage().persistent().set(&VOTING_PERIOD_SECS, &period);
 
@@ -129,6 +132,14 @@ impl GovernanceContract {
             .set(&DataKey::Timelock, &timelock);
     }
 
+    pub fn set_templates_contract(env: Env, templates_contract: Address) {
+        let admin: Address = env.storage().persistent().get(&ADMIN).unwrap();
+        admin.require_auth();
+        env.storage()
+            .persistent()
+            .set(&TEMPLATES, &templates_contract);
+    }
+
     pub fn create_proposal(
         env: Env,
         proposer: Address,
@@ -142,6 +153,29 @@ impl GovernanceContract {
         let mut count: u32 = env.storage().instance().get(&PROPOSAL_COUNT).unwrap_or(0);
         count = count.checked_add(1).expect("proposal overflow");
 
+        if let ProposalAction::ExecuteCall(target, function, args) = &action {
+            if let Some(templates_contract) =
+                env.storage().persistent().get::<_, Address>(&TEMPLATES)
+            {
+                let opt_hash: Option<BytesN<32>> = env.invoke_contract(
+                    &templates_contract,
+                    &Symbol::new(&env, "get_template_hash"),
+                    (target.clone(), function.clone()).into_val(&env),
+                );
+
+                if let Some(expected_hash) = opt_hash {
+                    let args_hash = Self::compute_args_hash(&env, args);
+                    if args_hash != expected_hash {
+                        panic!("args do not match template hash");
+                    }
+                } else {
+                    env.storage()
+                        .persistent()
+                        .set(&DataKey::CustomProposal(count), &true);
+                }
+            }
+        }
+
         let now = env.ledger().timestamp();
         let voting_period_secs: u64 = env
             .storage()
@@ -149,7 +183,11 @@ impl GovernanceContract {
             .get(&VOTING_PERIOD_SECS)
             .unwrap_or(DEFAULT_VOTING_PERIOD_SECS);
 
-        let snapshot_contract: Address = env.storage().persistent().get(&SNAPSHOT).expect("snapshot not set");
+        let snapshot_contract: Address = env
+            .storage()
+            .persistent()
+            .get(&SNAPSHOT)
+            .expect("snapshot not set");
         env.invoke_contract::<()>(
             &snapshot_contract,
             &Symbol::new(&env, "record_snapshot"),
@@ -206,7 +244,11 @@ impl GovernanceContract {
             panic!("already voted");
         }
 
-        let snapshot_contract: Address = env.storage().persistent().get(&SNAPSHOT).expect("snapshot not set");
+        let snapshot_contract: Address = env
+            .storage()
+            .persistent()
+            .get(&SNAPSHOT)
+            .expect("snapshot not set");
         let weight: i128 = env.invoke_contract(
             &snapshot_contract,
             &Symbol::new(&env, "get_voting_power"),
@@ -263,11 +305,19 @@ impl GovernanceContract {
             panic!("proposal not executable");
         }
 
-        let quorum_bps: u32 = env
+        let quorum_bps: u32 = if env
             .storage()
-            .instance()
-            .get(&QUORUM_BPS)
-            .unwrap_or(DEFAULT_QUORUM_BPS);
+            .persistent()
+            .get::<_, bool>(&DataKey::CustomProposal(proposal_id))
+            .unwrap_or(false)
+        {
+            CUSTOM_PROPOSAL_QUORUM_BPS
+        } else {
+            env.storage()
+                .instance()
+                .get(&QUORUM_BPS)
+                .unwrap_or(DEFAULT_QUORUM_BPS)
+        };
         let total_votes = proposal
             .votes_for
             .checked_add(proposal.votes_against)
@@ -367,10 +417,7 @@ impl GovernanceContract {
     }
 
     fn token_address(env: &Env) -> Address {
-        env.storage()
-            .instance()
-            .get(&TOKEN)
-            .expect("token not set")
+        env.storage().instance().get(&TOKEN).expect("token not set")
     }
 
     fn get_balance(env: &Env, addr: &Address) -> i128 {
@@ -390,9 +437,7 @@ impl GovernanceContract {
     fn apply_action(env: &Env, action: &ProposalAction) {
         match action {
             ProposalAction::UpdateFee(new_fee_bps) => {
-                env.storage()
-                    .instance()
-                    .set(&CURRENT_FEE_BPS, new_fee_bps);
+                env.storage().instance().set(&CURRENT_FEE_BPS, new_fee_bps);
             }
             ProposalAction::UpdateAutoRelease(new_delay) => {
                 env.storage()
@@ -415,6 +460,17 @@ impl GovernanceContract {
                 env.invoke_contract::<soroban_sdk::Val>(target, function, val_args);
             }
         }
+    }
+
+    fn compute_args_hash(env: &Env, args: &Vec<u64>) -> BytesN<32> {
+        let mut buf = Bytes::new(env);
+        for arg in args.iter() {
+            let b = arg.to_be_bytes();
+            for byte in b.iter() {
+                buf.push_back(*byte);
+            }
+        }
+        env.crypto().sha256(&buf).into()
     }
 }
 
@@ -463,18 +519,29 @@ mod tests {
     #[contractimpl]
     impl MockSnapshot {
         pub fn record_snapshot(env: Env, _id: u32) {
-            env.storage().persistent().set(&symbol_short!("TOT_SUP"), &1000i128);
+            env.storage()
+                .persistent()
+                .set(&symbol_short!("TOT_SUP"), &1000i128);
         }
         pub fn get_total_supply_at(env: Env, _id: u32) -> i128 {
-            env.storage().persistent().get(&symbol_short!("TOT_SUP")).unwrap_or(0)
+            env.storage()
+                .persistent()
+                .get(&symbol_short!("TOT_SUP"))
+                .unwrap_or(0)
         }
         pub fn get_voting_power(env: Env, _id: u32, voter: Address) -> i128 {
-            let token: Address = env.storage().persistent().get(&symbol_short!("TOKEN")).unwrap();
+            let token: Address = env
+                .storage()
+                .persistent()
+                .get(&symbol_short!("TOKEN"))
+                .unwrap();
             let args = vec![&env, voter.into_val(&env)];
             env.invoke_contract::<i128>(&token, &Symbol::new(&env, "balance"), args)
         }
         pub fn set_token(env: Env, token: Address) {
-            env.storage().persistent().set(&symbol_short!("TOKEN"), &token);
+            env.storage()
+                .persistent()
+                .set(&symbol_short!("TOKEN"), &token);
         }
     }
 
@@ -493,7 +560,13 @@ mod tests {
 
         let admin = Address::generate(&env);
         let voter = Address::generate(&env);
-        gov.initialize(&admin, &token_id, &snapshot_id, &Some(10u64), &Some(1_000u32));
+        gov.initialize(
+            &admin,
+            &token_id,
+            &snapshot_id,
+            &Some(10u64),
+            &Some(1_000u32),
+        );
         token.set_total_supply(&1_000i128);
         token.set_balance(&voter, &200i128);
 
@@ -531,7 +604,13 @@ mod tests {
 
         let admin = Address::generate(&env);
         let voter = Address::generate(&env);
-        gov.initialize(&admin, &token_id, &snapshot_id, &Some(10u64), &Some(1_000u32));
+        gov.initialize(
+            &admin,
+            &token_id,
+            &snapshot_id,
+            &Some(10u64),
+            &Some(1_000u32),
+        );
 
         token.set_total_supply(&10_000i128);
         token.set_balance(&voter, &100i128);
@@ -569,7 +648,13 @@ mod tests {
 
         let admin = Address::generate(&env);
         let voter = Address::generate(&env);
-        gov.initialize(&admin, &token_id, &snapshot_id, &Some(10u64), &Some(1_000u32));
+        gov.initialize(
+            &admin,
+            &token_id,
+            &snapshot_id,
+            &Some(10u64),
+            &Some(1_000u32),
+        );
         token.set_total_supply(&1_000i128);
         token.set_balance(&voter, &200i128);
 
@@ -584,5 +669,258 @@ mod tests {
 
         gov.vote(&voter, &proposal_id, &true);
         gov.vote(&voter, &proposal_id, &false);
+    }
+
+    // --- Template validation tests ---
+
+    #[contract]
+    pub struct MockTemplates;
+
+    #[contractimpl]
+    impl MockTemplates {
+        pub fn add_template(
+            env: Env,
+            _admin: Address,
+            target: Address,
+            function: Symbol,
+            args_schema_hash: BytesN<32>,
+        ) {
+            env.storage().persistent().set(
+                &(symbol_short!("TMPL"), target, function),
+                &args_schema_hash,
+            );
+        }
+
+        pub fn get_template_hash(
+            env: Env,
+            target: Address,
+            function: Symbol,
+        ) -> Option<BytesN<32>> {
+            env.storage()
+                .persistent()
+                .get(&(symbol_short!("TMPL"), target, function))
+        }
+    }
+
+    fn compute_args_hash(env: &Env, args: &Vec<u64>) -> BytesN<32> {
+        let mut buf = Bytes::new(env);
+        for arg in args.iter() {
+            let b = arg.to_be_bytes();
+            for byte in b.iter() {
+                buf.push_back(*byte);
+            }
+        }
+        env.crypto().sha256(&buf).into()
+    }
+
+    #[test]
+    fn test_execute_call_with_matching_template() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let gov_id = env.register_contract(None, GovernanceContract);
+        let token_id = env.register_contract(None, MockMntToken);
+        let snapshot_id = env.register_contract(None, MockSnapshot);
+        let templates_id = env.register_contract(None, MockTemplates);
+        let gov = GovernanceContractClient::new(&env, &gov_id);
+        let token = MockMntTokenClient::new(&env, &token_id);
+        let snapshot = MockSnapshotClient::new(&env, &snapshot_id);
+        let templates = MockTemplatesClient::new(&env, &templates_id);
+        snapshot.set_token(&token_id);
+
+        let admin = Address::generate(&env);
+        let voter = Address::generate(&env);
+
+        gov.initialize(
+            &admin,
+            &token_id,
+            &snapshot_id,
+            &Some(10u64),
+            &Some(1_000u32),
+        );
+        gov.set_templates_contract(&templates_id);
+
+        token.set_total_supply(&1_000i128);
+        token.set_balance(&voter, &200i128);
+
+        let target = Address::generate(&env);
+        let function = Symbol::new(&env, "set_fee_bps");
+        let args = vec![&env, 300u64];
+        let args_hash = compute_args_hash(&env, &args);
+        templates.add_template(&admin, &target, &function, &args_hash);
+
+        let title = Bytes::from_slice(&env, b"Set fee via template");
+        let description_hash = BytesN::from_array(&env, &[4u8; 32]);
+        let proposal_id = gov.create_proposal(
+            &voter,
+            &title,
+            &description_hash,
+            &ProposalAction::ExecuteCall(target, function, args),
+        );
+
+        gov.vote(&voter, &proposal_id, &true);
+        env.ledger().set_timestamp(env.ledger().timestamp() + 11);
+        gov.execute_proposal(&proposal_id);
+
+        let proposal = gov.get_proposal(&proposal_id);
+        assert_eq!(proposal.status, ProposalStatus::Executed);
+    }
+
+    #[test]
+    #[should_panic(expected = "args do not match template hash")]
+    fn test_execute_call_with_non_matching_args() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let gov_id = env.register_contract(None, GovernanceContract);
+        let token_id = env.register_contract(None, MockMntToken);
+        let snapshot_id = env.register_contract(None, MockSnapshot);
+        let templates_id = env.register_contract(None, MockTemplates);
+        let gov = GovernanceContractClient::new(&env, &gov_id);
+        let token = MockMntTokenClient::new(&env, &token_id);
+        let snapshot = MockSnapshotClient::new(&env, &snapshot_id);
+        let templates = MockTemplatesClient::new(&env, &templates_id);
+        snapshot.set_token(&token_id);
+
+        let admin = Address::generate(&env);
+        let voter = Address::generate(&env);
+
+        gov.initialize(
+            &admin,
+            &token_id,
+            &snapshot_id,
+            &Some(10u64),
+            &Some(1_000u32),
+        );
+        gov.set_templates_contract(&templates_id);
+
+        token.set_total_supply(&1_000i128);
+        token.set_balance(&voter, &200i128);
+
+        let target = Address::generate(&env);
+        let function = Symbol::new(&env, "set_fee_bps");
+        let allowed_args = vec![&env, 300u64];
+        let allowed_hash = compute_args_hash(&env, &allowed_args);
+        templates.add_template(&admin, &target, &function, &allowed_hash);
+
+        let bad_args = vec![&env, 500u64];
+        let title = Bytes::from_slice(&env, b"Set fee to wrong value");
+        let description_hash = BytesN::from_array(&env, &[5u8; 32]);
+        gov.create_proposal(
+            &voter,
+            &title,
+            &description_hash,
+            &ProposalAction::ExecuteCall(target, function, bad_args),
+        );
+    }
+
+    #[test]
+    fn test_execute_call_custom_quorum_no_template() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let gov_id = env.register_contract(None, GovernanceContract);
+        let token_id = env.register_contract(None, MockMntToken);
+        let snapshot_id = env.register_contract(None, MockSnapshot);
+        let templates_id = env.register_contract(None, MockTemplates);
+        let gov = GovernanceContractClient::new(&env, &gov_id);
+        let token = MockMntTokenClient::new(&env, &token_id);
+        let snapshot = MockSnapshotClient::new(&env, &snapshot_id);
+        let _templates = MockTemplatesClient::new(&env, &templates_id);
+        snapshot.set_token(&token_id);
+
+        let admin = Address::generate(&env);
+        let voter = Address::generate(&env);
+
+        gov.initialize(
+            &admin,
+            &token_id,
+            &snapshot_id,
+            &Some(10u64),
+            &Some(1_000u32),
+        );
+        gov.set_templates_contract(&templates_id);
+
+        // total_supply = 1000, 30% quorum = 300 votes needed
+        // standard 10% = 100 votes needed
+        token.set_total_supply(&1_000i128);
+        token.set_balance(&voter, &200i128);
+
+        let target = Address::generate(&env);
+        let function = Symbol::new(&env, "some_call");
+        let args = vec![&env, 42u64];
+
+        let title = Bytes::from_slice(&env, b"Custom call");
+        let description_hash = BytesN::from_array(&env, &[6u8; 32]);
+        let proposal_id = gov.create_proposal(
+            &voter,
+            &title,
+            &description_hash,
+            &ProposalAction::ExecuteCall(target, function, args),
+        );
+
+        // Vote yes with 200 voting power — enough for 10% (100) but not 30% (300)
+        gov.vote(&voter, &proposal_id, &true);
+
+        env.ledger().set_timestamp(env.ledger().timestamp() + 11);
+        gov.execute_proposal(&proposal_id);
+
+        let proposal = gov.get_proposal(&proposal_id);
+        assert_eq!(proposal.status, ProposalStatus::Failed);
+    }
+
+    #[test]
+    fn test_execute_call_custom_quorum_met() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let gov_id = env.register_contract(None, GovernanceContract);
+        let token_id = env.register_contract(None, MockMntToken);
+        let snapshot_id = env.register_contract(None, MockSnapshot);
+        let templates_id = env.register_contract(None, MockTemplates);
+        let gov = GovernanceContractClient::new(&env, &gov_id);
+        let token = MockMntTokenClient::new(&env, &token_id);
+        let snapshot = MockSnapshotClient::new(&env, &snapshot_id);
+        let _templates = MockTemplatesClient::new(&env, &templates_id);
+        snapshot.set_token(&token_id);
+
+        let admin = Address::generate(&env);
+        let voter1 = Address::generate(&env);
+        let voter2 = Address::generate(&env);
+
+        gov.initialize(
+            &admin,
+            &token_id,
+            &snapshot_id,
+            &Some(10u64),
+            &Some(1_000u32),
+        );
+        gov.set_templates_contract(&templates_id);
+
+        token.set_total_supply(&1_000i128);
+        token.set_balance(&voter1, &200i128);
+        token.set_balance(&voter2, &200i128);
+
+        let target = Address::generate(&env);
+        let function = Symbol::new(&env, "some_call");
+        let args = vec![&env, 42u64];
+
+        let title = Bytes::from_slice(&env, b"Custom call meet quorum");
+        let description_hash = BytesN::from_array(&env, &[7u8; 32]);
+        let proposal_id = gov.create_proposal(
+            &voter1,
+            &title,
+            &description_hash,
+            &ProposalAction::ExecuteCall(target, function, args),
+        );
+
+        gov.vote(&voter1, &proposal_id, &true);
+        gov.vote(&voter2, &proposal_id, &true);
+
+        env.ledger().set_timestamp(env.ledger().timestamp() + 11);
+        gov.execute_proposal(&proposal_id);
+
+        let proposal = gov.get_proposal(&proposal_id);
+        assert_eq!(proposal.status, ProposalStatus::Executed);
     }
 }
