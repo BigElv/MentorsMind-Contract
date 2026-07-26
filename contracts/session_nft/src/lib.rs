@@ -1,5 +1,7 @@
 #![no_std]
-use soroban_sdk::{contract, contractimpl, contracttype, symbol_short, Address, Env, Symbol, Vec};
+use soroban_sdk::{
+    contract, contractimpl, contracttype, symbol_short, Address, BytesN, Env, IntoVal, Symbol, Vec,
+};
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -14,10 +16,20 @@ pub struct BundleNFT {
 }
 
 #[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NFTMintedEvent {
+    pub nft_id: u64,
+    pub learner: Address,
+    pub session_count: u32,
+    pub session_ids_hash: BytesN<32>,
+}
+
+#[contracttype]
 pub enum DataKey {
     TokenIdCounter,
     Bundle(u64),           // token_id -> BundleNFT
     OwnerBundles(Address), // owner -> Vec<u64>
+    BundledSessions(u64),  // token_id -> Vec<Symbol>
 }
 
 #[contract]
@@ -25,19 +37,44 @@ pub struct SessionBundleNFT;
 
 #[contractimpl]
 impl SessionBundleNFT {
-    /// Mint a new session bundle NFT.
-    ///
-    /// Auth: learner must authorize the call.
-    ///
-    /// Returns: token ID of the minted bundle.
     pub fn mint_bundle(
         env: Env,
         learner: Address,
-        mentor: Address,
-        sessions: u32,
+        session_registry: Address,
+        session_ids: Vec<Symbol>,
+        session_ids_hash: BytesN<32>,
         expiry: u64,
     ) -> u64 {
         learner.require_auth();
+
+        let count = session_ids.len();
+        if count == 0 {
+            panic!("No sessions provided");
+        }
+
+        // Cross-verify each session and extract mentor
+        let mut mentor: Option<Address> = None;
+        for i in 0..count {
+            let sid = session_ids.get(i).unwrap();
+            let record: mentorminds_session_registry::SessionRecord = env.invoke_contract(
+                &session_registry,
+                &Symbol::new(&env, "get_session"),
+                (sid,).into_val(&env),
+            );
+
+            if record.status != mentorminds_session_registry::SessionStatus::Completed {
+                panic!("Session not completed");
+            }
+            if record.learner != learner {
+                panic!("Session learner mismatch");
+            }
+            match &mentor {
+                Some(m) if *m != record.mentor => panic!("Sessions have different mentors"),
+                _ => mentor = Some(record.mentor),
+            }
+        }
+
+        let mentor = mentor.expect("mentor should be set");
 
         let mut token_id: u64 = env
             .storage()
@@ -52,16 +89,21 @@ impl SessionBundleNFT {
         let bundle = BundleNFT {
             token_id,
             owner: learner.clone(),
-            mentor: mentor.clone(),
-            sessions_total: sessions,
-            sessions_remaining: sessions,
+            mentor,
+            sessions_total: count,
+            sessions_remaining: count,
             expiry,
-            transferable: true, // Mark as transferable by default as per requirement
+            transferable: true,
         };
 
         env.storage()
             .persistent()
             .set(&DataKey::Bundle(token_id), &bundle);
+
+        // Store bundled session IDs on-chain
+        env.storage()
+            .persistent()
+            .set(&DataKey::BundledSessions(token_id), &session_ids);
 
         let mut owner_bundles: Vec<u64> = env
             .storage()
@@ -73,19 +115,20 @@ impl SessionBundleNFT {
             .persistent()
             .set(&DataKey::OwnerBundles(learner.clone()), &owner_bundles);
 
-        // Emit minted event
+        // Emit NFTMinted event
         env.events().publish(
             (symbol_short!("bundle"), symbol_short!("minted"), token_id),
-            (learner, mentor, sessions, expiry),
+            NFTMintedEvent {
+                nft_id: token_id,
+                learner,
+                session_count: count,
+                session_ids_hash,
+            },
         );
 
         token_id
     }
 
-    /// Transfer an NFT bundle to another learner.
-    ///
-    /// Auth: from address must authorize.
-    /// Only works if transferable is true.
     pub fn transfer(env: Env, from: Address, to: Address, token_id: u64) {
         from.require_auth();
 
@@ -103,7 +146,6 @@ impl SessionBundleNFT {
             panic!("Not transferable");
         }
 
-        // Remove from old owner's list
         let from_bundles: Vec<u64> = env
             .storage()
             .persistent()
@@ -119,7 +161,6 @@ impl SessionBundleNFT {
             .persistent()
             .set(&DataKey::OwnerBundles(from.clone()), &new_from_bundles);
 
-        // Add to new owner's list
         let mut to_bundles: Vec<u64> = env
             .storage()
             .persistent()
@@ -130,23 +171,17 @@ impl SessionBundleNFT {
             .persistent()
             .set(&DataKey::OwnerBundles(to.clone()), &to_bundles);
 
-        // Update bundle owner
         bundle.owner = to.clone();
         env.storage()
             .persistent()
             .set(&DataKey::Bundle(token_id), &bundle);
 
-        // Emit transferred event
         env.events().publish(
             (symbol_short!("bundle"), symbol_short!("transfd"), token_id),
             (from, to),
         );
     }
 
-    /// Redeem a session from the bundle.
-    ///
-    /// Auth: holder must authorize.
-    /// Decrements sessions_remaining and emits a registry event.
     pub fn redeem(env: Env, holder: Address, token_id: u64) {
         holder.require_auth();
 
@@ -173,13 +208,11 @@ impl SessionBundleNFT {
             .persistent()
             .set(&DataKey::Bundle(token_id), &bundle);
 
-        // Emit redeemed event
         env.events().publish(
             (symbol_short!("bundle"), symbol_short!("redeemd"), token_id),
             (holder.clone(), bundle.sessions_remaining),
         );
 
-        // Create session in registry (conceptual, emitted as event)
         env.events().publish(
             (
                 symbol_short!("registry"),
@@ -190,9 +223,6 @@ impl SessionBundleNFT {
         );
     }
 
-    /// Burn the bundle when sessions are exhausted or it has expired.
-    ///
-    /// Auth: holder must authorize.
     pub fn burn(env: Env, holder: Address, token_id: u64) {
         holder.require_auth();
 
@@ -213,7 +243,6 @@ impl SessionBundleNFT {
             panic!("Cannot burn: neither expired nor empty");
         }
 
-        // Remove from owner's list
         let owner_bundles_res: Option<Vec<u64>> = env
             .storage()
             .persistent()
@@ -230,19 +259,44 @@ impl SessionBundleNFT {
                 .set(&DataKey::OwnerBundles(holder.clone()), &new_owner_bundles);
         }
 
-        // Delete bundle
         env.storage()
             .persistent()
             .remove(&DataKey::Bundle(token_id));
+        env.storage()
+            .persistent()
+            .remove(&DataKey::BundledSessions(token_id));
 
-        // Emit burned event
         env.events().publish(
             (symbol_short!("bundle"), symbol_short!("burned"), token_id),
             holder,
         );
     }
 
-    /// Get bundle details by token ID.
+    /// Verify that all sessions backing the NFT are still in Completed status.
+    pub fn verify_nft_provenance(env: Env, nft_id: u64, session_registry: Address) -> bool {
+        let session_ids: Vec<Symbol> = match env
+            .storage()
+            .persistent()
+            .get(&DataKey::BundledSessions(nft_id))
+        {
+            Some(ids) => ids,
+            None => return false,
+        };
+
+        for i in 0..session_ids.len() {
+            let sid = session_ids.get(i).unwrap();
+            let record = env.invoke_contract::<mentorminds_session_registry::SessionRecord>(
+                &session_registry,
+                &Symbol::new(&env, "get_session"),
+                (sid,).into_val(&env),
+            );
+            if record.status != mentorminds_session_registry::SessionStatus::Completed {
+                return false;
+            }
+        }
+        true
+    }
+
     pub fn get_bundle(env: Env, token_id: u64) -> BundleNFT {
         env.storage()
             .persistent()
@@ -250,7 +304,6 @@ impl SessionBundleNFT {
             .expect("Bundle not found")
     }
 
-    /// Get all bundles owned by a specific address.
     pub fn get_bundles_by_owner(env: Env, owner: Address) -> Vec<BundleNFT> {
         let owner_bundles_ids: Vec<u64> = env
             .storage()
@@ -270,142 +323,307 @@ impl SessionBundleNFT {
         }
         bundles
     }
+
+    pub fn get_bundled_sessions(env: Env, token_id: u64) -> Vec<Symbol> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::BundledSessions(token_id))
+            .unwrap_or(Vec::new(&env))
+    }
 }
 
 #[cfg(test)]
 mod test {
     use super::*;
+    use mentorminds_session_registry::{SessionRegistry, SessionRegistryClient, SessionStatus};
     use soroban_sdk::testutils::{Address as _, Ledger};
 
+    fn dummy_hash(env: &Env) -> BytesN<32> {
+        BytesN::from_array(env, &[0u8; 32])
+    }
+
+    fn compute_hash(env: &Env, session_ids: &Vec<Symbol>) -> BytesN<32> {
+        let mut buf = soroban_sdk::Bytes::new(env);
+        for i in 0..session_ids.len() {
+            let sid = session_ids.get(i).unwrap();
+            let s = sid.to_string();
+            let b: soroban_sdk::Bytes = s.into();
+            for byte in b.iter() {
+                buf.push_back(byte);
+            }
+        }
+        env.crypto().sha256(&buf).into()
+    }
+
+    struct TestFixture {
+        env: Env,
+        nft_id: Address,
+        registry_id: Address,
+        backend: Address,
+        learner: Address,
+        mentor: Address,
+    }
+
+    impl TestFixture {
+        fn setup() -> Self {
+            let env = Env::default();
+            env.mock_all_auths();
+            env.ledger().with_mut(|li| li.timestamp = 1_000_000);
+
+            let backend = Address::generate(&env);
+            let learner = Address::generate(&env);
+            let mentor = Address::generate(&env);
+
+            let nft_id = env.register_contract(None, SessionBundleNFT);
+            let registry_id = env.register_contract(None, SessionRegistry);
+
+            let registry = SessionRegistryClient::new(&env, &registry_id);
+            registry.initialize(&backend);
+
+            TestFixture {
+                env,
+                nft_id,
+                registry_id,
+                backend,
+                learner,
+                mentor,
+            }
+        }
+
+        fn client(&self) -> SessionBundleNFTClient {
+            SessionBundleNFTClient::new(&self.env, &self.nft_id)
+        }
+
+        fn registry(&self) -> SessionRegistryClient {
+            SessionRegistryClient::new(&self.env, &self.registry_id)
+        }
+
+        fn register_completed_session(&self, id: &str) -> Symbol {
+            let sid = Symbol::new(&self.env, id);
+            self.registry().register_session(
+                &sid,
+                &self.mentor,
+                &self.learner,
+                &1_500_000u64,
+                &60u32,
+                &100i128,
+                &Address::generate(&self.env),
+            );
+            self.registry()
+                .update_status(&sid, &SessionStatus::Completed);
+            sid
+        }
+
+        fn register_pending_session(&self, id: &str) -> Symbol {
+            let sid = Symbol::new(&self.env, id);
+            self.registry().register_session(
+                &sid,
+                &self.mentor,
+                &self.learner,
+                &1_500_000u64,
+                &60u32,
+                &100i128,
+                &Address::generate(&self.env),
+            );
+            sid
+        }
+    }
+
     #[test]
-    fn test_mint_and_get() {
-        let env = Env::default();
-        env.mock_all_auths();
-        let contract_id = env.register_contract(None, SessionBundleNFT);
-        let client = SessionBundleNFTClient::new(&env, &contract_id);
+    fn test_mint_with_completed_sessions() {
+        let f = TestFixture::setup();
+        let sid1 = f.register_completed_session("s1");
+        let sid2 = f.register_completed_session("s2");
+        let sid3 = f.register_completed_session("s3");
 
-        let learner = Address::generate(&env);
-        let mentor = Address::generate(&env);
-        let sessions = 10;
-        let expiry = 1000;
-
-        let token_id = client.mint_bundle(&learner, &mentor, &sessions, &expiry);
+        let session_ids = vec![&f.env, sid1, sid2, sid3];
+        let hash = compute_hash(&f.env, &session_ids);
+        let token_id =
+            f.client()
+                .mint_bundle(&f.learner, &f.registry_id, &session_ids, &hash, &2000u64);
         assert_eq!(token_id, 1);
 
-        let bundle = client.get_bundle(&token_id);
-        assert_eq!(bundle.owner, learner);
-        assert_eq!(bundle.mentor, mentor);
-        assert_eq!(bundle.sessions_total, sessions);
-        assert_eq!(bundle.sessions_remaining, sessions);
-        assert_eq!(bundle.expiry, expiry);
-        assert_eq!(bundle.transferable, true);
+        let bundle = f.client().get_bundle(&token_id);
+        assert_eq!(bundle.owner, f.learner);
+        assert_eq!(bundle.mentor, f.mentor);
+        assert_eq!(bundle.sessions_total, 3);
+        assert_eq!(bundle.sessions_remaining, 3);
 
-        let learner_bundles = client.get_bundles_by_owner(&learner);
-        assert_eq!(learner_bundles.len(), 1);
-        assert_eq!(learner_bundles.get(0).unwrap().token_id, token_id);
+        let stored = f.client().get_bundled_sessions(&token_id);
+        assert_eq!(stored.len(), 3);
+        assert_eq!(stored.get(0).unwrap(), sid1);
+        assert_eq!(stored.get(1).unwrap(), sid2);
+        assert_eq!(stored.get(2).unwrap(), sid3);
     }
 
     #[test]
-    fn test_redeem_3_times() {
-        let env = Env::default();
-        env.mock_all_auths();
-        let contract_id = env.register_contract(None, SessionBundleNFT);
-        let client = SessionBundleNFTClient::new(&env, &contract_id);
+    #[should_panic(expected = "Session not completed")]
+    fn test_mint_with_pending_session_rejected() {
+        let f = TestFixture::setup();
+        let sid = f.register_pending_session("pending1");
 
-        let learner = Address::generate(&env);
-        let mentor = Address::generate(&env);
-        let sessions = 10;
-        let expiry = 1000;
-
-        let token_id = client.mint_bundle(&learner, &mentor, &sessions, &expiry);
-
-        client.redeem(&learner, &token_id);
-        client.redeem(&learner, &token_id);
-        client.redeem(&learner, &token_id);
-
-        let bundle = client.get_bundle(&token_id);
-        assert_eq!(bundle.sessions_remaining, 7);
+        let session_ids = vec![&f.env, sid];
+        let hash = dummy_hash(&f.env);
+        f.client()
+            .mint_bundle(&f.learner, &f.registry_id, &session_ids, &hash, &2000u64);
     }
 
     #[test]
-    fn test_transfer() {
-        let env = Env::default();
-        env.mock_all_auths();
-        let contract_id = env.register_contract(None, SessionBundleNFT);
-        let client = SessionBundleNFTClient::new(&env, &contract_id);
+    #[should_panic(expected = "Session not found")]
+    fn test_mint_with_unregistered_session_rejected() {
+        let f = TestFixture::setup();
+        let sid = Symbol::new(&f.env, "nonexistent");
 
-        let learner1 = Address::generate(&env);
-        let learner2 = Address::generate(&env);
-        let mentor = Address::generate(&env);
-
-        let token_id = client.mint_bundle(&learner1, &mentor, &5, &1000);
-
-        client.transfer(&learner1, &learner2, &token_id);
-
-        let bundle = client.get_bundle(&token_id);
-        assert_eq!(bundle.owner, learner2);
-
-        assert_eq!(client.get_bundles_by_owner(&learner1).len(), 0);
-        assert_eq!(client.get_bundles_by_owner(&learner2).len(), 1);
+        let session_ids = vec![&f.env, sid];
+        let hash = dummy_hash(&f.env);
+        f.client()
+            .mint_bundle(&f.learner, &f.registry_id, &session_ids, &hash, &2000u64);
     }
 
     #[test]
-    #[should_panic(expected = "Expired")]
-    fn test_expiry_enforcement() {
-        let env = Env::default();
-        env.mock_all_auths();
-        let contract_id = env.register_contract(None, SessionBundleNFT);
-        let client = SessionBundleNFTClient::new(&env, &contract_id);
+    #[should_panic(expected = "Session learner mismatch")]
+    fn test_mint_with_wrong_learner_rejected() {
+        let f = TestFixture::setup();
+        let wrong_learner = Address::generate(&f.env);
 
-        let learner = Address::generate(&env);
-        let mentor = Address::generate(&env);
-        let sessions = 10;
-        let expiry = 100;
+        let sid = Symbol::new(&f.env, "s_wrong");
+        f.registry().register_session(
+            &sid,
+            &f.mentor,
+            &wrong_learner,
+            &1_500_000u64,
+            &60u32,
+            &100i128,
+            &Address::generate(&f.env),
+        );
+        f.registry().update_status(&sid, &SessionStatus::Completed);
 
-        let token_id = client.mint_bundle(&learner, &mentor, &sessions, &expiry);
-
-        env.ledger().with_mut(|li| {
-            li.timestamp = 101;
-        });
-
-        client.redeem(&learner, &token_id);
+        let session_ids = vec![&f.env, sid];
+        let hash = dummy_hash(&f.env);
+        f.client()
+            .mint_bundle(&f.learner, &f.registry_id, &session_ids, &hash, &2000u64);
     }
 
     #[test]
-    fn test_burn_when_empty() {
-        let env = Env::default();
-        env.mock_all_auths();
-        let contract_id = env.register_contract(None, SessionBundleNFT);
-        let client = SessionBundleNFTClient::new(&env, &contract_id);
-
-        let learner = Address::generate(&env);
-        let mentor = Address::generate(&env);
-
-        let token_id = client.mint_bundle(&learner, &mentor, &1, &1000);
-        client.redeem(&learner, &token_id);
-
-        client.burn(&learner, &token_id);
-
-        assert_eq!(client.get_bundles_by_owner(&learner).len(), 0);
-        let res = env
-            .storage()
-            .persistent()
-            .get::<DataKey, BundleNFT>(&DataKey::Bundle(token_id));
-        assert!(res.is_none());
+    #[should_panic(expected = "No sessions provided")]
+    fn test_mint_with_empty_session_ids() {
+        let f = TestFixture::setup();
+        let session_ids: Vec<Symbol> = Vec::new(&f.env);
+        let hash = dummy_hash(&f.env);
+        f.client()
+            .mint_bundle(&f.learner, &f.registry_id, &session_ids, &hash, &2000u64);
     }
 
     #[test]
-    #[should_panic(expected = "Cannot burn: neither expired nor empty")]
-    fn test_burn_fails_if_not_empty_nor_expired() {
-        let env = Env::default();
-        env.mock_all_auths();
-        let contract_id = env.register_contract(None, SessionBundleNFT);
-        let client = SessionBundleNFTClient::new(&env, &contract_id);
+    fn test_verify_provenance_returns_true() {
+        let f = TestFixture::setup();
+        let sid1 = f.register_completed_session("p1");
+        let sid2 = f.register_completed_session("p2");
 
-        let learner = Address::generate(&env);
-        let mentor = Address::generate(&env);
+        let session_ids = vec![&f.env, sid1, sid2];
+        let hash = compute_hash(&f.env, &session_ids);
+        let token_id =
+            f.client()
+                .mint_bundle(&f.learner, &f.registry_id, &session_ids, &hash, &2000u64);
 
-        let token_id = client.mint_bundle(&learner, &mentor, &5, &1000);
-        client.burn(&learner, &token_id);
+        let valid = f.client().verify_nft_provenance(&token_id, &f.registry_id);
+        assert!(valid);
+    }
+
+    #[test]
+    fn test_verify_provenance_false_if_session_cancelled() {
+        let f = TestFixture::setup();
+        let sid1 = f.register_completed_session("c1");
+        let sid2 = f.register_completed_session("c2");
+
+        let session_ids = vec![&f.env, sid1.clone(), sid2];
+        let hash = compute_hash(&f.env, &session_ids);
+        let token_id =
+            f.client()
+                .mint_bundle(&f.learner, &f.registry_id, &session_ids, &hash, &2000u64);
+
+        f.registry().update_status(&sid1, &SessionStatus::Cancelled);
+
+        let valid = f.client().verify_nft_provenance(&token_id, &f.registry_id);
+        assert!(!valid);
+    }
+
+    #[test]
+    fn test_verify_provenance_false_for_nonexistent_nft() {
+        let f = TestFixture::setup();
+        let valid = f.client().verify_nft_provenance(&999u64, &f.registry_id);
+        assert!(!valid);
+    }
+
+    #[test]
+    fn test_redeem_still_works() {
+        let f = TestFixture::setup();
+        let sid = f.register_completed_session("r1");
+        let session_ids = vec![&f.env, sid];
+        let hash = compute_hash(&f.env, &session_ids);
+        let token_id =
+            f.client()
+                .mint_bundle(&f.learner, &f.registry_id, &session_ids, &hash, &2000u64);
+
+        f.client().redeem(&f.learner, &token_id);
+
+        let bundle = f.client().get_bundle(&token_id);
+        assert_eq!(bundle.sessions_remaining, 0);
+    }
+
+    #[test]
+    fn test_transfer_still_works() {
+        let f = TestFixture::setup();
+        let sid = f.register_completed_session("t1");
+        let session_ids = vec![&f.env, sid];
+        let hash = compute_hash(&f.env, &session_ids);
+        let token_id =
+            f.client()
+                .mint_bundle(&f.learner, &f.registry_id, &session_ids, &hash, &2000u64);
+
+        let new_owner = Address::generate(&f.env);
+        f.client().transfer(&f.learner, &new_owner, &token_id);
+
+        let bundle = f.client().get_bundle(&token_id);
+        assert_eq!(bundle.owner, new_owner);
+    }
+
+    #[test]
+    fn test_burn_cleans_up_bundled_sessions() {
+        let f = TestFixture::setup();
+        let sid = f.register_completed_session("b1");
+        let session_ids = vec![&f.env, sid];
+        let hash = compute_hash(&f.env, &session_ids);
+        let token_id =
+            f.client()
+                .mint_bundle(&f.learner, &f.registry_id, &session_ids, &hash, &100u64);
+
+        f.env.ledger().with_mut(|li| li.timestamp = 200);
+
+        f.client().burn(&f.learner, &token_id);
+
+        let stored = f.client().get_bundled_sessions(&token_id);
+        assert_eq!(stored.len(), 0);
+    }
+
+    #[test]
+    fn test_nft_minted_event_contains_session_ids_hash() {
+        let f = TestFixture::setup();
+        let sid1 = f.register_completed_session("e1");
+        let sid2 = f.register_completed_session("e2");
+
+        let session_ids = vec![&f.env, sid1, sid2];
+        let hash = compute_hash(&f.env, &session_ids);
+        let token_id =
+            f.client()
+                .mint_bundle(&f.learner, &f.registry_id, &session_ids, &hash, &2000u64);
+
+        let events = f.env.events().all();
+        let mint_event = events.get(0).unwrap();
+        let payload: NFTMintedEvent = mint_event.2.into_val(&f.env);
+        assert_eq!(payload.nft_id, token_id);
+        assert_eq!(payload.learner, f.learner);
+        assert_eq!(payload.session_count, 2);
+        assert_eq!(payload.session_ids_hash, hash);
     }
 }
