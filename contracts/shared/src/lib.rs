@@ -14,6 +14,7 @@ pub mod state_machine;
 pub mod storage;
 pub mod staking;
 pub mod ttl_utils;
+pub mod interface_id;
 
 pub use escrow::{EscrowRecord, EscrowStatus};
 pub use reentrancy_guard::ReentrancyGuard;
