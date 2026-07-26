@@ -31,6 +31,9 @@ members = [
     "contracts/snapshot",
     "contracts/prediction_market",
     "tests",
+
+    "contracts/isa",
+    "contracts/badges",
 ]
 
 [workspace.package]
