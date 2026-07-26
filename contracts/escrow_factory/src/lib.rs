@@ -29,6 +29,7 @@ const ESCROW_COUNT: Symbol = symbol_short!("ESC_CNT");
 /// deployment after a previous one expired produces a different salt (and
 /// therefore a different address) instead of colliding.
 const SESSION_NONCE: Symbol = symbol_short!("SESS_NCE");
+const INTERFACE_REGISTRY: Symbol = symbol_short!("IF_REG");
 const FACTORY_TTL_THRESHOLD: u32 = 500_000;
 const FACTORY_TTL_BUMP: u32 = 1_000_000;
 
@@ -101,6 +102,16 @@ impl EscrowFactory {
         env.storage()
             .persistent()
             .extend_ttl(&PAUSE_GUARDIAN, FACTORY_TTL_THRESHOLD, FACTORY_TTL_BUMP);
+    }
+
+    /// Set the interface registry contract address. Admin only.
+    pub fn set_interface_registry(env: Env, registry: Address) {
+        let admin = Self::admin(&env);
+        admin.require_auth();
+        env.storage().persistent().set(&INTERFACE_REGISTRY, &registry);
+        env.storage()
+            .persistent()
+            .extend_ttl(&INTERFACE_REGISTRY, FACTORY_TTL_THRESHOLD, FACTORY_TTL_BUMP);
     }
 
     /// Deploy a new escrow contract instance using minimal proxy pattern.
@@ -242,6 +253,16 @@ impl EscrowFactory {
             (symbol_short!("escrow_deployed"), session_id.clone()),
             (escrow_address.clone(), session_id),
         );
+
+        // Register interface in the interface registry (if set)
+        if let Some(registry_addr) = env.storage().persistent().get::<_, Address>(&INTERFACE_REGISTRY) {
+            let interface_id = Symbol::new(&env, "escrow_v1");
+            env.invoke_contract(
+                &registry_addr,
+                &Symbol::new(&env, "register_interface"),
+                (escrow_address.clone(), interface_id, 1u32).into_val(&env),
+            );
+        }
 
         escrow_address
     }
