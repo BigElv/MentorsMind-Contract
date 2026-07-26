@@ -28,6 +28,19 @@ pub enum DataKey {
     TotalMRR,
     ActiveSubscribers,
     Metrics(u32, u32), // (Year, Month) -> MonthlyMetrics
+    EscrowTotalVolume,
+    EscrowCount,
+    EscrowDisputeCount,
+    EscrowTotalDurationSecs,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct EscrowMetrics {
+    pub total_volume: i128,
+    pub total_count: u32,
+    pub dispute_count: u32,
+    pub avg_duration_secs: u64,
 }
 
 #[contract]
@@ -157,6 +170,30 @@ impl SubscriptionAnalytics {
             .persistent()
             .get(&DataKey::Metrics(year, month))
             .unwrap_or_default()
+    }
+
+    /// Record an escrow completion for analytics tracking (#468).
+    pub fn record_escrow(env: Env, volume: i128, duration_secs: u64, disputed: bool) {
+        let count: u32 = env.storage().persistent().get(&DataKey::EscrowCount).unwrap_or(0);
+        let total_vol: i128 = env.storage().persistent().get(&DataKey::EscrowTotalVolume).unwrap_or(0);
+        let disputes: u32 = env.storage().persistent().get(&DataKey::EscrowDisputeCount).unwrap_or(0);
+        let total_dur: u64 = env.storage().persistent().get(&DataKey::EscrowTotalDurationSecs).unwrap_or(0);
+
+        env.storage().persistent().set(&DataKey::EscrowCount, &(count + 1));
+        env.storage().persistent().set(&DataKey::EscrowTotalVolume, &(total_vol + volume));
+        env.storage().persistent().set(&DataKey::EscrowTotalDurationSecs, &(total_dur + duration_secs));
+        if disputed {
+            env.storage().persistent().set(&DataKey::EscrowDisputeCount, &(disputes + 1));
+        }
+    }
+
+    pub fn get_escrow_metrics(env: Env) -> EscrowMetrics {
+        let count: u32 = env.storage().persistent().get(&DataKey::EscrowCount).unwrap_or(0);
+        let total_vol: i128 = env.storage().persistent().get(&DataKey::EscrowTotalVolume).unwrap_or(0);
+        let disputes: u32 = env.storage().persistent().get(&DataKey::EscrowDisputeCount).unwrap_or(0);
+        let total_dur: u64 = env.storage().persistent().get(&DataKey::EscrowTotalDurationSecs).unwrap_or(0);
+        let avg_duration = if count > 0 { total_dur / count as u64 } else { 0 };
+        EscrowMetrics { total_volume: total_vol, total_count: count, dispute_count: disputes, avg_duration_secs: avg_duration }
     }
 }
 

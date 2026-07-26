@@ -1,5 +1,9 @@
 #![no_std]
 
+use shared::events::{
+    emit_bounty_event, evt_bounty_claimed, evt_bounty_disputed, evt_bounty_posted,
+    evt_bounty_refunded, evt_bounty_verified,
+};
 use soroban_sdk::{
     contract, contractimpl, contracttype, symbol_short, token, Address, BytesN, Env, IntoVal,
     Symbol, Val, Vec,
@@ -25,6 +29,7 @@ pub enum DataKey {
     BountyCount,
     Bounty(u32),
     Claim(u32, Address), // (bounty_id, learner)
+    ClaimEvidence(u32, Address), // (bounty_id, learner)
 }
 
 // ---------------------------------------------------------------------------
@@ -35,8 +40,8 @@ pub enum DataKey {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum BountyStatus {
     Open,
-    Claimed,   // at least one learner has claimed
-    Verified,  // a claim was verified and reward released
+    Claimed,  // at least one learner has claimed
+    Verified, // a claim was verified and reward released
     Disputed,
     Refunded,
 }
@@ -69,6 +74,8 @@ pub struct ClaimRecord {
     pub learner: Address,
     pub claimed_at: u64,
     pub status: ClaimStatus,
+    pub submission_hash: BytesN<32>,
+    pub submission_uri_hash: BytesN<32>,
 }
 
 // ---------------------------------------------------------------------------
@@ -118,6 +125,14 @@ pub struct BountyRefundedEvent {
     pub reward: i128,
 }
 
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EvidenceBundle {
+    pub submission_hash: BytesN<32>,
+    pub uri_hash: BytesN<32>,
+    pub submitted_at: u64,
+}
+
 // ---------------------------------------------------------------------------
 // Contract
 // ---------------------------------------------------------------------------
@@ -140,9 +155,11 @@ impl BountyContract {
         env.storage()
             .persistent()
             .extend_ttl(&DataKey::Admin, TTL_THRESHOLD, TTL_BUMP);
-        env.storage()
-            .persistent()
-            .extend_ttl(&DataKey::VerificationContract, TTL_THRESHOLD, TTL_BUMP);
+        env.storage().persistent().extend_ttl(
+            &DataKey::VerificationContract,
+            TTL_THRESHOLD,
+            TTL_BUMP,
+        );
         env.storage()
             .persistent()
             .extend_ttl(&DataKey::BountyCount, TTL_THRESHOLD, TTL_BUMP);
@@ -206,8 +223,9 @@ impl BountyContract {
             .extend_ttl(&DataKey::BountyCount, TTL_THRESHOLD, TTL_BUMP);
         env.storage().instance().extend_ttl(TTL_THRESHOLD, TTL_BUMP);
 
-        env.events().publish(
-            (symbol_short!("bounty"), symbol_short!("posted")),
+        emit_bounty_event(
+            &env,
+            evt_bounty_posted(&env),
             BountyPostedEvent {
                 id: count,
                 poster,
@@ -221,8 +239,23 @@ impl BountyContract {
     }
 
     /// Learner signals completion of the bounty challenge.
-    pub fn claim_bounty(env: Env, learner: Address, bounty_id: u32) {
+    pub fn claim_bounty(
+        env: Env,
+        learner: Address,
+        bounty_id: u32,
+        submission_hash: BytesN<32>,
+        submission_uri_hash: BytesN<32>,
+    ) {
         learner.require_auth();
+
+        // Validate evidence hashes are not zero
+        let zero_hash = BytesN::from_array(&env, &[0u8; 32]);
+        if submission_hash == zero_hash {
+            panic!("Submission hash cannot be zero");
+        }
+        if submission_uri_hash == zero_hash {
+            panic!("Submission URI hash cannot be zero");
+        }
 
         let bounty: BountyRecord = env
             .storage()
@@ -246,11 +279,25 @@ impl BountyContract {
             learner: learner.clone(),
             claimed_at: env.ledger().timestamp(),
             status: ClaimStatus::Pending,
+            submission_hash: submission_hash.clone(),
+            submission_uri_hash: submission_uri_hash.clone(),
         };
         env.storage().persistent().set(&claim_key, &claim);
         env.storage()
             .persistent()
             .extend_ttl(&claim_key, TTL_THRESHOLD, TTL_BUMP);
+
+        // Store evidence bundle
+        let evidence = EvidenceBundle {
+            submission_hash,
+            uri_hash: submission_uri_hash,
+            submitted_at: env.ledger().timestamp(),
+        };
+        let evidence_key = DataKey::ClaimEvidence(bounty_id, learner.clone());
+        env.storage().persistent().set(&evidence_key, &evidence);
+        env.storage()
+            .persistent()
+            .extend_ttl(&evidence_key, TTL_THRESHOLD, TTL_BUMP);
 
         // Transition bounty to Claimed if still Open
         if bounty.status == BountyStatus::Open {
@@ -259,15 +306,18 @@ impl BountyContract {
             env.storage()
                 .persistent()
                 .set(&DataKey::Bounty(bounty_id), &updated);
-            env.storage()
-                .persistent()
-                .extend_ttl(&DataKey::Bounty(bounty_id), TTL_THRESHOLD, TTL_BUMP);
+            env.storage().persistent().extend_ttl(
+                &DataKey::Bounty(bounty_id),
+                TTL_THRESHOLD,
+                TTL_BUMP,
+            );
         }
 
         env.storage().instance().extend_ttl(TTL_THRESHOLD, TTL_BUMP);
 
-        env.events().publish(
-            (symbol_short!("bounty"), symbol_short!("claimed")),
+        emit_bounty_event(
+            &env,
+            evt_bounty_claimed(&env),
             BountyClaimedEvent {
                 bounty_id,
                 learner,
@@ -278,8 +328,20 @@ impl BountyContract {
 
     /// Verified mentor confirms a learner completed the challenge. Releases reward to learner.
     /// First verified claim wins; subsequent calls panic.
-    pub fn verify_completion(env: Env, mentor: Address, bounty_id: u32, learner: Address) {
+    pub fn verify_completion(
+        env: Env,
+        mentor: Address,
+        bounty_id: u32,
+        learner: Address,
+        reviewer_notes_hash: BytesN<32>,
+    ) {
         mentor.require_auth();
+
+        // Validate reviewer notes hash is not zero
+        let zero_hash = BytesN::from_array(&env, &[0u8; 32]);
+        if reviewer_notes_hash == zero_hash {
+            panic!("Reviewer notes hash cannot be zero");
+        }
 
         // Check mentor is verified via the verification contract
         let ver_contract: Address = env
@@ -287,15 +349,12 @@ impl BountyContract {
             .persistent()
             .get(&DataKey::VerificationContract)
             .expect("Not initialized");
-        let is_verified: bool = env.invoke_contract(
-            &ver_contract,
-            &Symbol::new(&env, "is_verified"),
-            {
+        let is_verified: bool =
+            env.invoke_contract(&ver_contract, &Symbol::new(&env, "is_verified"), {
                 let mut args: Vec<Val> = Vec::new(&env);
                 args.push_back(mentor.clone().into_val(&env));
                 args
-            },
-        );
+            });
         if !is_verified {
             panic!("Mentor is not verified");
         }
@@ -344,8 +403,9 @@ impl BountyContract {
             .extend_ttl(&DataKey::Bounty(bounty_id), TTL_THRESHOLD, TTL_BUMP);
         env.storage().instance().extend_ttl(TTL_THRESHOLD, TTL_BUMP);
 
-        env.events().publish(
-            (symbol_short!("bounty"), symbol_short!("verified")),
+        emit_bounty_event(
+            &env,
+            evt_bounty_verified(&env),
             BountyVerifiedEvent {
                 bounty_id,
                 learner,
@@ -356,7 +416,12 @@ impl BountyContract {
     }
 
     /// Poster disputes a learner's claim within 48h of the claim.
-    pub fn dispute_completion(env: Env, bounty_id: u32, learner: Address) {
+    pub fn dispute_completion(
+        env: Env,
+        bounty_id: u32,
+        learner: Address,
+        dispute_evidence_hash: BytesN<32>,
+    ) {
         let bounty: BountyRecord = env
             .storage()
             .persistent()
@@ -364,6 +429,12 @@ impl BountyContract {
             .expect("Bounty not found");
 
         bounty.poster.require_auth();
+
+        // Validate dispute evidence hash is not zero
+        let zero_hash = BytesN::from_array(&env, &[0u8; 32]);
+        if dispute_evidence_hash == zero_hash {
+            panic!("Dispute evidence hash cannot be zero");
+        }
 
         if bounty.status == BountyStatus::Verified {
             panic!("Bounty already verified");
@@ -404,8 +475,9 @@ impl BountyContract {
             .extend_ttl(&DataKey::Bounty(bounty_id), TTL_THRESHOLD, TTL_BUMP);
         env.storage().instance().extend_ttl(TTL_THRESHOLD, TTL_BUMP);
 
-        env.events().publish(
-            (symbol_short!("bounty"), symbol_short!("disputed")),
+        emit_bounty_event(
+            &env,
+            evt_bounty_disputed(&env),
             BountyDisputedEvent {
                 bounty_id,
                 learner,
@@ -435,7 +507,11 @@ impl BountyContract {
         }
 
         let token_client = token::Client::new(&env, &bounty.token);
-        token_client.transfer(&env.current_contract_address(), &bounty.poster, &bounty.reward);
+        token_client.transfer(
+            &env.current_contract_address(),
+            &bounty.poster,
+            &bounty.reward,
+        );
 
         bounty.status = BountyStatus::Refunded;
         env.storage()
@@ -446,8 +522,9 @@ impl BountyContract {
             .extend_ttl(&DataKey::Bounty(bounty_id), TTL_THRESHOLD, TTL_BUMP);
         env.storage().instance().extend_ttl(TTL_THRESHOLD, TTL_BUMP);
 
-        env.events().publish(
-            (symbol_short!("bounty"), symbol_short!("refunded")),
+        emit_bounty_event(
+            &env,
+            evt_bounty_refunded(&env),
             BountyRefundedEvent {
                 bounty_id,
                 poster: bounty.poster.clone(),
@@ -478,6 +555,14 @@ impl BountyContract {
             .persistent()
             .get(&DataKey::BountyCount)
             .unwrap_or(0)
+    }
+
+    /// Get claim evidence for a bounty and learner.
+    pub fn get_claim_evidence(env: Env, bounty_id: u32, learner: Address) -> EvidenceBundle {
+        env.storage()
+            .persistent()
+            .get(&DataKey::ClaimEvidence(bounty_id, learner))
+            .expect("Evidence not found")
     }
 }
 
@@ -542,9 +627,11 @@ mod test {
                 env.storage()
                     .persistent()
                     .set(&TokenKey::Balance(to.clone()), &(bal + amount));
-                env.storage()
-                    .persistent()
-                    .extend_ttl(&TokenKey::Balance(to), TTL_THRESHOLD, TTL_BUMP);
+                env.storage().persistent().extend_ttl(
+                    &TokenKey::Balance(to),
+                    TTL_THRESHOLD,
+                    TTL_BUMP,
+                );
                 env.storage().instance().extend_ttl(TTL_THRESHOLD, TTL_BUMP);
             }
 
@@ -560,9 +647,11 @@ mod test {
                 env.storage()
                     .persistent()
                     .set(&TokenKey::Balance(from.clone()), &(from_bal - amount));
-                env.storage()
-                    .persistent()
-                    .extend_ttl(&TokenKey::Balance(from), TTL_THRESHOLD, TTL_BUMP);
+                env.storage().persistent().extend_ttl(
+                    &TokenKey::Balance(from),
+                    TTL_THRESHOLD,
+                    TTL_BUMP,
+                );
                 let to_bal: i128 = env
                     .storage()
                     .persistent()
@@ -571,9 +660,11 @@ mod test {
                 env.storage()
                     .persistent()
                     .set(&TokenKey::Balance(to.clone()), &(to_bal + amount));
-                env.storage()
-                    .persistent()
-                    .extend_ttl(&TokenKey::Balance(to), TTL_THRESHOLD, TTL_BUMP);
+                env.storage().persistent().extend_ttl(
+                    &TokenKey::Balance(to),
+                    TTL_THRESHOLD,
+                    TTL_BUMP,
+                );
                 env.storage().instance().extend_ttl(TTL_THRESHOLD, TTL_BUMP);
             }
         }
@@ -779,10 +870,16 @@ mod test {
 
         // Bump all contract instance TTLs before advancing time
         f.env.as_contract(&f.token_id, || {
-            f.env.storage().instance().extend_ttl(TTL_THRESHOLD, TTL_BUMP);
+            f.env
+                .storage()
+                .instance()
+                .extend_ttl(TTL_THRESHOLD, TTL_BUMP);
         });
         f.env.as_contract(&f.bounty_id, || {
-            f.env.storage().instance().extend_ttl(TTL_THRESHOLD, TTL_BUMP);
+            f.env
+                .storage()
+                .instance()
+                .extend_ttl(TTL_THRESHOLD, TTL_BUMP);
         });
 
         // Advance time past deadline; keep sequence within TTL_BUMP range
@@ -842,5 +939,54 @@ mod test {
         let id = f.post_default_bounty();
         f.client().claim_bounty(&f.learner, &id);
         f.client().claim_bounty(&f.learner, &id);
+    }
+
+    #[test]
+    fn test_ttl_renewal_preserves_claim_and_bounty_state() {
+        let f = TestFixture::setup();
+        let id = f.post_default_bounty();
+        f.client().claim_bounty(&f.learner, &id);
+
+        // Jump the ledger sequence substantially; entries should still be
+        // available because write operations bump persistent TTL.
+        f.env.ledger().set(LedgerInfo {
+            timestamp: f.env.ledger().timestamp() + 60,
+            protocol_version: 21,
+            sequence_number: 500_100,
+            network_id: Default::default(),
+            base_reserve: 10,
+            min_temp_entry_ttl: 1,
+            min_persistent_entry_ttl: 1,
+            max_entry_ttl: 10_000_000,
+        });
+
+        let bounty = f.client().get_bounty(&id);
+        assert_eq!(bounty.status, BountyStatus::Claimed);
+        let claim = f.client().get_claim(&id, &f.learner);
+        assert_eq!(claim.status, ClaimStatus::Pending);
+    }
+
+    #[test]
+    fn test_ttl_persistence_for_admin_and_count_keys() {
+        let f = TestFixture::setup();
+
+        // Move to a later sequence while staying within configured max TTL.
+        f.env.ledger().set(LedgerInfo {
+            timestamp: f.env.ledger().timestamp() + 120,
+            protocol_version: 21,
+            sequence_number: 700_200,
+            network_id: Default::default(),
+            base_reserve: 10,
+            min_temp_entry_ttl: 1,
+            min_persistent_entry_ttl: 1,
+            max_entry_ttl: 10_000_000,
+        });
+
+        // If admin and counter keys were not renewed in initialize, posting
+        // would fail due missing configuration. Successful post implies key
+        // persistence across the ledger jump.
+        let id = f.post_default_bounty();
+        assert_eq!(id, 1);
+        assert_eq!(f.client().get_bounty_count(), 1);
     }
 }
