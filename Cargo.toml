@@ -35,6 +35,7 @@ members = [
     "tests",
 
     "contracts/isa",
+    "contracts/badges",
 ]
 
 [workspace.package]
