@@ -27,6 +27,9 @@ members = [
     "tools/storage_scanner",
     "contracts/delegation",
     "contracts/escrow_factory",
+    "contracts/upgrade_registry",
+    "contracts/snapshot",
+    "contracts/prediction_market",
     "tests",
 ]
 
