@@ -36,6 +36,8 @@ pub enum DataKey {
     LiquidationAuction(Address),
     /// Cumulative unrecovered principal written off via `force_liquidate`.
     BadDebt,
+    /// Regulatory reporting contract address
+    RegulatoryReporting,
 }
 
 // ---------------------------------------------------------------------------
@@ -158,8 +160,59 @@ impl LendingPool {
         env.storage().instance().set(&DataKey::RateModelKinkBps, &DEFAULT_KINK_BPS);
         env.storage().instance().set(&DataKey::RateModelSlope1Bps, &DEFAULT_SLOPE1_BPS);
         env.storage().instance().set(&DataKey::RateModelSlope2Bps, &DEFAULT_SLOPE2_BPS);
+        
+        // Initialize regulatory reporting with placeholder
+        env.storage().instance().set(&DataKey::RegulatoryReporting, &Address::generate(&env));
 
         Ok(())
+    }
+
+    /// Set regulatory reporting contract address (admin only).
+    pub fn set_regulatory_reporting(env: Env, reporting_address: Address) -> Result<(), Error> {
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(Error::NotInitialized)?;
+        admin.require_auth();
+
+        env.storage()
+            .instance()
+            .set(&DataKey::RegulatoryReporting, &reporting_address);
+        Ok(())
+    }
+
+    fn _check_and_report_large_tx(
+        env: &Env,
+        contract: Symbol,
+        function: Symbol,
+        address: &Address,
+        amount_usd: i128,
+    ) {
+        const THRESHOLD: i128 = 10_000;
+        if amount_usd <= THRESHOLD {
+            return;
+        }
+
+        if let Some(reporting_addr) = env
+            .storage()
+            .instance()
+            .get::<DataKey, Address>(&DataKey::RegulatoryReporting)
+        {
+            use soroban_sdk::IntoVal;
+            let _ = env.try_invoke_contract::<(), _>(
+                &reporting_addr,
+                &Symbol::new(env, "record_large_tx"),
+                (
+                    contract,
+                    function,
+                    address.clone(),
+                    amount_usd,
+                    env.ledger().timestamp(),
+                )
+                    .into_val(env),
+            );
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -511,6 +564,9 @@ impl LendingPool {
         env.storage()
             .instance()
             .set(&DataKey::BlockBorrowLedger(borrower.clone()), &current_seq);
+
+        // Check for large transaction and trigger regulatory reporting
+        Self::_check_and_report_large_tx(&env, symbol_short!("lend_pool"), symbol_short!("borrow"), &borrower, amount);
 
         // Compute fee using dynamic rate model (no cache)
         let fee = Self::compute_fee(&env, amount);
