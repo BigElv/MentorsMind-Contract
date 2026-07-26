@@ -1,8 +1,8 @@
 #![no_std]
 
+use shared::EscrowRecord;
 use soroban_sdk::{
-    contract, contractimpl, contracttype, symbol_short, Address, BytesN, Env,
-    IntoVal, Symbol,
+    contract, contractimpl, contracttype, symbol_short, Address, BytesN, Env, IntoVal, Symbol,
 };
 
 // ── Storage keys ────────────────────────────────────────────────────────────
@@ -28,43 +28,13 @@ pub enum DataKey {
     Review(Symbol),
     MentorRatingSum(Address),
     MentorReviewCount(Address),
+    LoyaltyPoints(Address),
+    LoyaltyTier(Address),
 }
 
-// ── Escrow status mirror (must match escrow contract) ────────────────────────
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum EscrowStatus {
-    Active,
-    Released,
-    Disputed,
-    Refunded,
-    Resolved,
-}
-
-#[contracttype]
-#[derive(Clone, Debug)]
-pub struct EscrowInfo {
-    pub id: u64,
-    pub mentor: Address,
-    pub learner: Address,
-    pub amount: i128,
-    pub session_id: Symbol,
-    pub status: EscrowStatus,
-    pub created_at: u64,
-    pub token_address: Address,
-    pub platform_fee: i128,
-    pub net_amount: i128,
-    pub session_end_time: u64,
-    pub auto_release_delay: u64,
-    pub dispute_reason: Symbol,
-    pub resolved_at: u64,
-    pub usd_amount: i128,
-    pub quoted_token_amount: i128,
-    pub send_asset: Address,
-    pub dest_asset: Address,
-    pub total_sessions: u32,
-    pub sessions_completed: u32,
-}
+pub const TIER_SILVER: u32 = 100;
+pub const TIER_GOLD: u32 = 500;
+pub const TIER_PLATINUM: u32 = 1000;
 
 // ── Contract ─────────────────────────────────────────────────────────────────
 #[contract]
@@ -78,9 +48,7 @@ impl ReputationContract {
             panic!("Already initialized");
         }
         env.storage().instance().set(&ESCROW, &escrow_contract);
-        env.storage()
-            .instance()
-            .extend_ttl(TTL_THRESHOLD, TTL_BUMP);
+        env.storage().instance().extend_ttl(TTL_THRESHOLD, TTL_BUMP);
     }
 
     /// Submit a review for a completed session.
@@ -114,13 +82,13 @@ impl ReputationContract {
             .get(&ESCROW)
             .expect("EscrowContractNotSet");
 
-        let escrow: EscrowInfo = env.invoke_contract(
+        let escrow: EscrowRecord = env.invoke_contract(
             &escrow_addr,
             &Symbol::new(&env, "get_escrow_by_session"),
             (session_id.clone(),).into_val(&env),
         );
 
-        if escrow.status != EscrowStatus::Released {
+        if escrow.status != shared::EscrowStatus::Released {
             panic!("SessionNotReleased");
         }
 
@@ -142,18 +110,10 @@ impl ReputationContract {
         let sum_key = DataKey::MentorRatingSum(mentor.clone());
         let cnt_key = DataKey::MentorReviewCount(mentor.clone());
 
-        let current_sum: u32 = env
-            .storage()
-            .persistent()
-            .get(&sum_key)
-            .unwrap_or(0u32);
-        let current_count: u32 = env
-            .storage()
-            .persistent()
-            .get(&cnt_key)
-            .unwrap_or(0u32);
+        let current_sum: u64 = env.storage().persistent().get(&sum_key).unwrap_or(0u64);
+        let current_count: u64 = env.storage().persistent().get(&cnt_key).unwrap_or(0u64);
 
-        let new_sum = current_sum.checked_add(rating).expect("sum overflow");
+        let new_sum = current_sum.checked_add(rating as u64).expect("sum overflow");
         let new_count = current_count.checked_add(1).expect("count overflow");
 
         env.storage().persistent().set(&sum_key, &new_sum);
@@ -177,12 +137,12 @@ impl ReputationContract {
     }
 
     /// Returns (avg_rating * 100, review_count) for a mentor.
-    pub fn get_mentor_rating(env: Env, mentor: Address) -> (u32, u32) {
+    pub fn get_mentor_rating(env: Env, mentor: Address) -> (u64, u64) {
         let sum_key = DataKey::MentorRatingSum(mentor.clone());
         let cnt_key = DataKey::MentorReviewCount(mentor.clone());
 
-        let sum: u32 = env.storage().persistent().get(&sum_key).unwrap_or(0);
-        let count: u32 = env.storage().persistent().get(&cnt_key).unwrap_or(0);
+        let sum: u64 = env.storage().persistent().get(&sum_key).unwrap_or(0);
+        let count: u64 = env.storage().persistent().get(&cnt_key).unwrap_or(0);
 
         if count == 0 {
             return (0, 0);
@@ -199,13 +159,55 @@ impl ReputationContract {
             .get(&DataKey::Review(session_id))
             .expect("Review not found")
     }
+
+
+    pub fn calculate_average_rating(env: Env, user: Address) -> u32 {
+        let key = (symbol_short!("AvgRating"), user.clone());
+        env.storage().persistent().get(&key).unwrap_or(0u32)
+    }
+    
+    /// Accrue loyalty points for a user and update their tier (#463).
+    pub fn accrue_loyalty_points(env: Env, user: Address, points: u32) {
+        let current: u32 = env.storage().persistent().get(&DataKey::LoyaltyPoints(user.clone())).unwrap_or(0);
+        let total = current + points;
+        env.storage().persistent().set(&DataKey::LoyaltyPoints(user.clone()), &total);
+        let tier = if total >= TIER_PLATINUM { 3u32 } else if total >= TIER_GOLD { 2u32 } else if total >= TIER_SILVER { 1u32 } else { 0u32 };
+        env.storage().persistent().set(&DataKey::LoyaltyTier(user.clone()), &tier);
+        env.events().publish(("loyalty_points_accrued", user), (total, tier));
+    }
+
+    pub fn get_loyalty_points(env: Env, user: Address) -> u32 {
+        env.storage().persistent().get(&DataKey::LoyaltyPoints(user)).unwrap_or(0)
+    }
+
+    pub fn get_loyalty_tier(env: Env, user: Address) -> u32 {
+        env.storage().persistent().get(&DataKey::LoyaltyTier(user)).unwrap_or(0)
+    }
+
+    /// Returns discount in bps based on loyalty tier (0=0%, 1=5%, 2=10%, 3=15%).
+    pub fn get_loyalty_discount_bps(env: Env, user: Address) -> u32 {
+        let tier: u32 = env.storage().persistent().get(&DataKey::LoyaltyTier(user)).unwrap_or(0);
+        match tier { 1 => 500, 2 => 1000, 3 => 1500, _ => 0 }
+    }
+
+    pub fn update_reputation(env: Env, user: Address, new_rating: u32) {
+        let key = (symbol_short!("AvgRating"), user.clone());
+        let current: u32 = env.storage().persistent().get(&key).unwrap_or(0u32);
+        let updated = if current == 0 { new_rating } else { (current + new_rating) / 2 };
+        env.storage().persistent().set(&key, &updated);
+        env.events().publish((symbol_short!("Reput"), symbol_short!("updated")), (user, updated));
+    }
+
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
 #[cfg(test)]
 mod tests {
     use super::*;
-    use soroban_sdk::{testutils::{Address as _, Ledger}, Env};
+    use soroban_sdk::{
+        testutils::{Address as _, Ledger},
+        Env,
+    };
 
     // Mock escrow contract for testing
     #[contract]
@@ -214,28 +216,22 @@ mod tests {
     #[contractimpl]
     impl MockEscrow {
         pub fn set_status(env: Env, session_id: Symbol, released: bool) {
-            env.storage()
-                .persistent()
-                .set(&session_id, &released);
+            env.storage().persistent().set(&session_id, &released);
         }
 
-        pub fn get_escrow_by_session(env: Env, session_id: Symbol) -> EscrowInfo {
-            let released: bool = env
-                .storage()
-                .persistent()
-                .get(&session_id)
-                .unwrap_or(false);
+        pub fn get_escrow_by_session(env: Env, session_id: Symbol) -> EscrowRecord {
+            let released: bool = env.storage().persistent().get(&session_id).unwrap_or(false);
             let dummy = Address::generate(&env);
-            EscrowInfo {
+            EscrowRecord {
                 id: 1,
                 mentor: dummy.clone(),
                 learner: dummy.clone(),
                 amount: 100,
                 session_id: session_id.clone(),
                 status: if released {
-                    EscrowStatus::Released
+                    shared::EscrowStatus::Released
                 } else {
-                    EscrowStatus::Active
+                    shared::EscrowStatus::Active
                 },
                 created_at: 0,
                 token_address: dummy.clone(),
@@ -255,7 +251,13 @@ mod tests {
         }
     }
 
-    fn setup() -> (Env, ReputationContractClient<'static>, Address, Address, Address) {
+    fn setup() -> (
+        Env,
+        ReputationContractClient<'static>,
+        Address,
+        Address,
+        Address,
+    ) {
         let env = Env::default();
         env.mock_all_auths();
         env.ledger().with_mut(|li| li.timestamp = 1_000_000);
