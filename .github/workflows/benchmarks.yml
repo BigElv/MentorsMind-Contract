@@ -39,6 +39,13 @@ env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: '-D warnings'
 
+# Add permissions for GitHub token
+permissions:
+  contents: read
+  issues: write
+  pull-requests: write
+  actions: read
+
 jobs:
   benchmark:
     name: Run Benchmarks
@@ -52,7 +59,7 @@ jobs:
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: '1.85'
+          toolchain: '1.88'
           targets: wasm32-unknown-unknown
 
       # Layered caching: registry index, downloaded crates, compiled artifacts
@@ -152,75 +159,82 @@ jobs:
         if: github.event_name == 'pull_request' && always()
         uses: actions/github-script@v7
         with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
           script: |
             const fs = require('fs');
             const reportPath = 'benchmarks/results/report.json';
+            
             if (!fs.existsSync(reportPath)) {
               console.log('No report.json found — skipping comment');
               return;
             }
 
-            const results = JSON.parse(fs.readFileSync(reportPath, 'utf8'));
-            const passed = '${{ steps.bench.outcome }}' === 'success';
-            const icon = passed ? '✅' : '❌';
+            try {
+              const results = JSON.parse(fs.readFileSync(reportPath, 'utf8'));
+              const passed = '${{ steps.bench.outcome }}' === 'success';
+              const icon = passed ? '✅' : '❌';
 
-            // Build markdown table
-            let table = '| Contract | Entry Point | CPU Instructions | Memory (bytes) | Storage R/W | WASM Size |\n';
-            table    += '|----------|-------------|-----------------|---------------|-------------|----------|\n';
+              // Build markdown table
+              let table = '| Contract | Entry Point | CPU Instructions | Memory (bytes) | Storage R/W | WASM Size |\n';
+              table    += '|----------|-------------|-----------------|---------------|-------------|----------|\n';
 
-            let prevContract = '';
-            for (const r of results) {
-              const sep = r.contract !== prevContract ? `**${r.contract}**` : '';
-              prevContract = r.contract;
-              const wasm = r.wasm_bytes > 0
-                ? (r.wasm_bytes > 65536 ? `⚠️ ${Math.round(r.wasm_bytes/1024)} KB` : `${Math.round(r.wasm_bytes/1024)} KB`)
-                : 'N/A';
-              const storage = `${r.storage_reads}R/${r.storage_writes}W`;
-              table += `| ${sep} | \`${r.entry_point}\` | ${r.cpu_instructions.toLocaleString()} | ${r.mem_bytes.toLocaleString()} | ${storage} | ${wasm} |\n`;
-            }
+              let prevContract = '';
+              for (const r of results) {
+                const sep = r.contract !== prevContract ? `**${r.contract}**` : '';
+                prevContract = r.contract;
+                const wasm = r.wasm_bytes > 0
+                  ? (r.wasm_bytes > 65536 ? `⚠️ ${Math.round(r.wasm_bytes/1024)} KB` : `${Math.round(r.wasm_bytes/1024)} KB`)
+                  : 'N/A';
+                const storage = `${r.storage_reads || 0}R/${r.storage_writes || 0}W`;
+                table += `| ${sep} | \`${r.entry_point}\` | ${r.cpu_instructions.toLocaleString()} | ${r.mem_bytes.toLocaleString()} | ${storage} | ${wasm} |\n`;
+              }
 
-            // Add optimization status if validation was run
-            let optimizationStatus = '';
-            const validationCompleted = '${{ steps.validation.outputs.validation_completed }}' === 'true';
-            const validationPassed = '${{ steps.validation.outputs.validation_passed }}' === 'true';
-            
-            if (validationCompleted) {
-              const validationIcon = validationPassed ? '🚀' : '⚠️';
-              const validationText = validationPassed ? 'Optimization targets exceeded (>15%)' : 'Optimization targets not met';
-              optimizationStatus = `\n\n### ${validationIcon} Gas Optimization Status\n${validationText}`;
-            }
+              // Add optimization status if validation was run
+              let optimizationStatus = '';
+              const validationCompleted = '${{ steps.validation.outputs.validation_completed }}' === 'true';
+              const validationPassed = '${{ steps.validation.outputs.validation_passed }}' === 'true';
+              
+              if (validationCompleted) {
+                const validationIcon = validationPassed ? '🚀' : '⚠️';
+                const validationText = validationPassed ? 'Optimization targets exceeded (>15%)' : 'Optimization targets not met';
+                optimizationStatus = `\n\n### ${validationIcon} Gas Optimization Status\n${validationText}`;
+              }
 
-            const body = `## ${icon} Soroban Benchmark Results
+              const body = `## ${icon} Soroban Benchmark Results
 
-            ${table}
+              ${table}
 
-            > Baselines gated at **±10%**. WASM alert at **> 64 KB**.
-            > [Full HTML report](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})${optimizationStatus}
+              > Baselines gated at **±10%**. WASM alert at **> 64 KB**.
+              > [Full HTML report](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})${optimizationStatus}
 
-            **📊 Coverage:** ${results.length} functions across ${[...new Set(results.map(r => r.contract))].length} contracts`;
+              **📊 Coverage:** ${results.length} functions across ${[...new Set(results.map(r => r.contract))].length} contracts`;
 
-            const { data: comments } = await github.rest.issues.listComments({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              issue_number: context.issue.number,
-            });
-
-            const existing = comments.find(c =>
-              c.user.type === 'Bot' && c.body.includes('Soroban Benchmark Results')
-            );
-
-            if (existing) {
-              await github.rest.issues.updateComment({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                comment_id: existing.id,
-                body,
-              });
-            } else {
-              await github.rest.issues.createComment({
+              const { data: comments } = await github.rest.issues.listComments({
                 owner: context.repo.owner,
                 repo: context.repo.repo,
                 issue_number: context.issue.number,
-                body,
               });
+
+              const existing = comments.find(c =>
+                c.user.type === 'Bot' && c.body.includes('Soroban Benchmark Results')
+              );
+
+              if (existing) {
+                await github.rest.issues.updateComment({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  comment_id: existing.id,
+                  body,
+                });
+              } else {
+                await github.rest.issues.createComment({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: context.issue.number,
+                  body,
+                });
+              }
+            } catch (error) {
+              console.error('Failed to create PR comment:', error.message);
+              // Don't fail the workflow if comment creation fails
             }

@@ -198,14 +198,26 @@ gh workflow run benchmarks.yml -f update_baseline=true
 
 ### Common Issues
 
-#### Build Failures
+### Build Failures
 ```bash
-# Missing dependencies
-cargo build --target wasm32-unknown-unknown --release
-
-# Rust toolchain issues  
-rustup target add wasm32-unknown-unknown
+# Missing dependencies or Rust version issues
 rustup update
+rustup toolchain install 1.88
+rustup target add wasm32-unknown-unknown
+
+# Build WASM binaries
+cargo build --target wasm32-unknown-unknown --release
+```
+
+#### Rust Version Requirements
+The project requires **Rust 1.88+** due to dependency requirements:
+- `darling@0.23.0` requires rustc 1.88.0
+- `serde_with@3.21.0` requires rustc 1.88+
+
+Update your Rust toolchain if you encounter version-related errors:
+```bash
+rustup update
+rustup default 1.88
 ```
 
 #### Benchmark Timeouts
