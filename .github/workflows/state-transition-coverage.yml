@@ -40,7 +40,7 @@ jobs:
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: '1.91'
+          toolchain: '1.84'
 
       - name: Cache cargo registry
         uses: actions/cache@v4

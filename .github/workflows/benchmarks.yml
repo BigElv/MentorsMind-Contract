@@ -59,8 +59,11 @@ jobs:
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: '1.91'
+          toolchain: '1.84'
           targets: wasm32v1-none
+
+      - name: Add wasm32v1-none target
+        run: rustup target add wasm32v1-none
 
       # Layered caching: registry index, downloaded crates, compiled artifacts
       - name: Cache cargo registry
