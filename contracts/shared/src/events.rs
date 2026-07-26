@@ -332,7 +332,7 @@ pub fn evt_referral_reward(env: &Env)      -> Symbol { Symbol::new(env, "reward"
 /// Returns `true` if the topic vec has the canonical 3-element layout:
 /// `(Symbol, u32, Symbol)` with the given contract name and schema version.
 #[cfg(any(test, feature = "testutils"))]
-pub fn topic_is_valid(topics: &Vec<Val>, expected_contract: &str, env: &Env) -> bool {
+pub fn topic_is_valid(topics: &soroban_sdk::Vec<Val>, expected_contract: &str, env: &Env) -> bool {
     use soroban_sdk::TryFromVal;
 
     if topics.len() != 3 {

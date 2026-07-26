@@ -103,8 +103,8 @@ impl Fixture {
         let mentor = Address::generate(&env);
         let learner = Address::generate(&env);
         let arbitrator = Address::generate(&env);
-        let escrow_contract = env.register_contract(None, MockEscrow);
-        let contract_id = env.register_contract(None, DisputeEvidenceContract);
+        let escrow_contract = env.register(MockEscrow, ());
+        let contract_id = env.register(DisputeEvidenceContract, ());
         
         let client = DisputeEvidenceContractClient::new(&env, &contract_id);
         client.initialize(&admin, &escrow_contract);

@@ -33,7 +33,7 @@ impl Fixture {
         env.mock_all_auths();
         env.ledger().with_mut(|li| li.timestamp = 14_400);
 
-        let contract_id = env.register_contract(None, EscrowContract);
+        let contract_id = env.register(EscrowContract, ());
         let admin = Address::generate(&env);
         let mentor = Address::generate(&env);
         let learner = Address::generate(&env);
@@ -164,7 +164,7 @@ pub fn run() -> Vec<BenchResult> {
         // Advance past session end time to allow refund
         f.env.ledger().with_mut(|li| li.timestamp += 7200);
         let snap = measure(&f.env, || {
-            f.client().refund_escrow(&f.mentor, &escrow_id);
+            f.client().refund(&escrow_id);
         });
         results.push(BenchResult {
             contract: CONTRACT.into(),

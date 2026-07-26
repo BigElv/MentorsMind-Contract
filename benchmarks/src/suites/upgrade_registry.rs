@@ -35,7 +35,7 @@ impl Fixture {
         env.mock_all_auths();
         env.ledger().with_mut(|li| li.timestamp = 14_400);
 
-        let registry_id = env.register_contract(None, UpgradeRegistryContract);
+        let registry_id = env.register(UpgradeRegistryContract, ());
         let admin = Address::generate(&env);
         let signer1 = Address::generate(&env);
         let signer2 = Address::generate(&env);

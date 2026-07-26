@@ -10,7 +10,7 @@ use mentorminds_governance::{
 use soroban_sdk::{
     contract, contractimpl, contracttype,
     testutils::{Address as _, Ledger},
-    symbol_short, Address, Bytes, BytesN, Env, Symbol,
+    Address, Bytes, BytesN, Env,
 };
 
 const CONTRACT: &str = "governance";
@@ -82,8 +82,8 @@ impl Fixture {
         let proposer = Address::generate(&env);
         let voter = Address::generate(&env);
         let mnt = Address::generate(&env);
-        let snapshot = env.register_contract(None, MockSnapshot);
-        let gov = env.register_contract(None, GovernanceContract);
+        let snapshot = env.register(MockSnapshot, ());
+        let gov = env.register(GovernanceContract, ());
 
         let client = GovernanceContractClient::new(&env, &gov);
         client.initialize(
