@@ -36,6 +36,14 @@ features = ["testutils"]
 path = "../contracts/timelock"
 features = ["testutils"]
 
+[dependencies.mentorminds-upgrade-registry]
+path = "../contracts/upgrade_registry"
+features = ["testutils"]
+
+[dependencies.mentorminds-dispute-evidence]
+path = "../contracts/dispute_evidence"
+features = ["testutils"]
+
 [dependencies.shared]
 path = "../contracts/shared"
 features = ["testutils"]

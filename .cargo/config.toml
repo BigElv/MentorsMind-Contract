@@ -1,0 +1,13 @@
+# Cargo configuration for MentorMinds Contract
+# This config ensures the Rust GNU toolchain can find the MinGW-w64 linker tools
+# (gcc, dlltool, ld, ar) installed via MSYS2 at C:\msys64\mingw64
+
+[target.x86_64-pc-windows-gnu]
+linker = "C:\\msys64\\mingw64\\bin\\gcc.exe"
+ar = "C:\\msys64\\mingw64\\bin\\ar.exe"
+ranlib = "C:\\msys64\\mingw64\\bin\\ranlib.exe"
+
+[target.i686-pc-windows-gnu]
+linker = "C:\\msys64\\mingw64\\bin\\gcc.exe"
+ar = "C:\\msys64\\mingw64\\bin\\ar.exe"
+ranlib = "C:\\msys64\\mingw64\\bin\\ranlib.exe"

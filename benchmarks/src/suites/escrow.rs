@@ -157,6 +157,26 @@ pub fn run() -> Vec<BenchResult> {
         });
     }
 
+    // --- refund_escrow (refund execution) ---
+    {
+        let f = Fixture::new();
+        let escrow_id = f.create();
+        // Advance past session end time to allow refund
+        f.env.ledger().with_mut(|li| li.timestamp += 7200);
+        let snap = measure(&f.env, || {
+            f.client().refund_escrow(&f.mentor, &escrow_id);
+        });
+        results.push(BenchResult {
+            contract: CONTRACT.into(),
+            entry_point: "refund_escrow".into(),
+            cpu_instructions: snap.cpu_instructions,
+            mem_bytes: snap.mem_bytes,
+            storage_reads: 0,
+            storage_writes: 0,
+            wasm_bytes: wasm,
+        });
+    }
+
     print_suite(&results);
     results
 }
