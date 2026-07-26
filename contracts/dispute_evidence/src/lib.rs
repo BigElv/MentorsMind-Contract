@@ -18,6 +18,7 @@
 //! 4. The admin uses the on-chain resolution record to call `resolve_dispute`
 //!    on the escrow contract.
 #![no_std]
+#![allow(deprecated)] // Temporarily allow deprecated Events::publish until we migrate to #[contractevent]
 
 use soroban_sdk::{
     contract, contractclient, contracterror, contractimpl, contracttype, Address, BytesN, Env,

@@ -1,4 +1,5 @@
 #![no_std]
+#![allow(deprecated)] // Temporarily allow deprecated Events::publish until we migrate to #[contractevent]
 
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, symbol_short, Address, BytesN, Env,
@@ -712,11 +713,13 @@ fn require_upgrade_approvals_cached(env: &Env, approvers: Vec<Address>) -> Resul
     env.storage().temporary().set(&cache_time_key, &now);
     
     Ok(result)
+}
+
 /// Validate that a WASM binary exports all required functions.
 ///
 /// This prevents upgrades to WASM that omits critical functions like
 /// execute_pending_upgrade, which would permanently brick the contract.
-fn validate_wasm_exports(env: &Env, _wasm_hash: &BytesN<32>) -> Result<(), Error> {
+fn validate_wasm_exports(env: &Env, wasm_hash: &BytesN<32>) -> Result<(), Error> {
     // Note: Full WASM binary parsing in no_std is complex. This is a simplified
     // validation. In production, additional validation (e.g., via external tools
     // or during testing) should verify that the WASM indeed exports required
