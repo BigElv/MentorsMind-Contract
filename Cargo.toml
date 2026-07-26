@@ -34,6 +34,10 @@ members = [
 
     "contracts/isa",
     "contracts/badges",
+    "contracts/rbac",
+    "contracts/anomaly_detector",
+    "contracts/bounty",
+    "contracts/session_registry",
 ]
 
 [workspace.package]
