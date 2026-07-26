@@ -91,7 +91,7 @@ pub fn measure<F: FnOnce()>(env: &Env, f: F) -> CostSnapshot {
 /// Run from the workspace root so the path is correct relative to CWD.
 pub fn wasm_size(crate_name: &str) -> u64 {
     let path = format!(
-        "C:/temp/mentorsmind-target/wasm32v1-none/release/{}.wasm",
+        "target/wasm32v1-none/release/{}.wasm",
         crate_name.replace('-', "_")
     );
     fs::metadata(&path).map(|m| m.len()).unwrap_or(0)
