@@ -35,19 +35,28 @@ jobs:
 
       - name: Build all contracts (release)
         run: |
+          set -euo pipefail
           mkdir -p wasm-sizes-new
-          for contract in contracts/*/; do
-            contract_name=$(basename "$contract")
-            cd "$contract"
-            cargo build --release --target wasm32v1-none 2>&1 | tee build.log
 
-            # Copy built WASM
-            wasm_file="target/wasm32v1-none/release/${contract_name//-/_}.wasm"
+          for manifest in contracts/*/Cargo.toml; do
+            contract_dir="$(dirname "$manifest")"
+            contract_name="$(basename "$contract_dir")"
+            package_name="$(sed -n 's/^name = "\(.*\)"/\1/p' "$manifest" | head -n1)"
+            wasm_name="${package_name//-/_}.wasm"
+
+            echo "Building $package_name from $manifest"
+            cargo build --manifest-path "$manifest" --release --target wasm32v1-none 2>&1 | tee "${contract_dir}/build.log"
+
+            wasm_file="target/wasm32v1-none/release/${wasm_name}"
             if [ -f "$wasm_file" ]; then
-              cp "$wasm_file" "../../wasm-sizes-new/${contract_name}.wasm"
+              cp "$wasm_file" "wasm-sizes-new/${contract_name}.wasm"
+            else
+              echo "Expected wasm not found: $wasm_file"
             fi
-            cd ../../
           done
+
+          ls -la wasm-sizes-new
+          compgen -G "wasm-sizes-new/*.wasm" > /dev/null || { echo "No wasm files were produced"; exit 1; }
 
       - name: Optimize WASM files with wasm-opt
         run: |
@@ -84,8 +93,17 @@ jobs:
 
       - name: Generate twiggy reports
         run: |
+          set -euo pipefail
           mkdir -p twiggy-reports
-          for wasm in wasm-sizes-new/*.wasm; do
+          shopt -s nullglob
+          wasms=(wasm-sizes-new/*.wasm)
+
+          if [ ${#wasms[@]} -eq 0 ]; then
+            echo "No wasm files found for twiggy"
+            exit 1
+          fi
+
+          for wasm in "${wasms[@]}"; do
             contract=$(basename "$wasm" .wasm)
             echo "Analyzing $contract..."
             twiggy top -n 10 "$wasm" > "twiggy-reports/${contract}.txt" 2>/dev/null || echo "Twiggy analysis skipped for $contract"
