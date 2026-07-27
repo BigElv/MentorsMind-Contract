@@ -2,7 +2,7 @@
 
 use soroban_sdk::{
     contract, contractimpl, contracttype, symbol_short, token, Address, BytesN, Env, IntoVal,
-    Symbol, Vec,
+    Symbol, Val, Vec,
 };
 
 // Source chain constants
@@ -74,6 +74,10 @@ pub enum DataKey {
     Multisig,
     SupportedChains,
 }
+
+// TTL constants (in ledgers; ~5 s/ledger → 1 000 000 ≈ 57 days)
+const ROUTE_TTL_THRESHOLD: u32 = 500_000;
+const ROUTE_TTL_BUMP: u32 = 1_000_000;
 
 #[contract]
 pub struct PaymentRouter;
@@ -203,7 +207,7 @@ impl PaymentRouter {
 
         // Check for duplicate routing
         let processed_key = DataKey::ProcessedTx(source_tx_hash.clone());
-        if env.storage().instance().has(&processed_key) {
+        if env.storage().persistent().has(&processed_key) {
             panic!("Transaction already routed");
         }
 
@@ -277,8 +281,10 @@ impl PaymentRouter {
         };
 
         let route_key = DataKey::Route(source_tx_hash.clone());
-        env.storage().instance().set(&route_key, &route);
-        env.storage().instance().set(&processed_key, &true);
+        env.storage().persistent().set(&route_key, &route);
+        env.storage().persistent().extend_ttl(&route_key, ROUTE_TTL_THRESHOLD, ROUTE_TTL_BUMP);
+        env.storage().persistent().set(&processed_key, &true);
+        env.storage().persistent().extend_ttl(&processed_key, ROUTE_TTL_THRESHOLD, ROUTE_TTL_BUMP);
 
         // Update counter
         let counter: u64 = env
@@ -345,9 +351,12 @@ impl PaymentRouter {
     /// Get the escrow ID for a given source transaction hash
     pub fn get_route(env: Env, source_tx_hash: BytesN<32>) -> u64 {
         let route_key = DataKey::Route(source_tx_hash);
+        env.storage()
+            .persistent()
+            .extend_ttl(&route_key, ROUTE_TTL_THRESHOLD, ROUTE_TTL_BUMP);
         let route: PaymentRoute = env
             .storage()
-            .instance()
+            .persistent()
             .get(&route_key)
             .expect("Route not found");
         route.escrow_id
@@ -357,7 +366,10 @@ impl PaymentRouter {
     pub fn get_route_details(env: Env, source_tx_hash: BytesN<32>) -> PaymentRoute {
         let route_key = DataKey::Route(source_tx_hash);
         env.storage()
-            .instance()
+            .persistent()
+            .extend_ttl(&route_key, ROUTE_TTL_THRESHOLD, ROUTE_TTL_BUMP);
+        env.storage()
+            .persistent()
             .get(&route_key)
             .expect("Route not found")
     }
@@ -365,7 +377,11 @@ impl PaymentRouter {
     /// Check if a transaction has already been routed
     pub fn is_tx_processed(env: Env, source_tx_hash: BytesN<32>) -> bool {
         let processed_key = DataKey::ProcessedTx(source_tx_hash);
-        env.storage().instance().has(&processed_key)
+        let has = env.storage().persistent().has(&processed_key);
+        if has {
+            env.storage().persistent().extend_ttl(&processed_key, ROUTE_TTL_THRESHOLD, ROUTE_TTL_BUMP);
+        }
+        has
     }
 
     /// Get the list of supported chains
@@ -444,7 +460,7 @@ impl PaymentRouter {
 
         let timelock: Address = env.storage().instance().get(&DataKey::Timelock).expect("Timelock not set");
 
-        let mut args = Vec::new(&env);
+        let mut args: Vec<Val> = Vec::new(&env);
         args.push_back(new_escrow.into_val(&env));
 
         env.invoke_contract::<BytesN<32>>(
@@ -467,7 +483,7 @@ impl PaymentRouter {
 
         let timelock: Address = env.storage().instance().get(&DataKey::Timelock).expect("Timelock not set");
 
-        let mut args = Vec::new(&env);
+        let mut args: Vec<Val> = Vec::new(&env);
         args.push_back(new_bridge.into_val(&env));
 
         env.invoke_contract::<BytesN<32>>(
@@ -663,15 +679,13 @@ impl PaymentRouter {
     }
 
     fn generate_session_id(env: &Env, _source_tx_hash: &BytesN<32>, _source_chain: u32) -> Symbol {
-        let counter: u64 = env
+        let _counter: u64 = env
             .storage()
             .instance()
             .get(&DataKey::EscrowIdCounter)
             .unwrap_or(0);
-        
-        // Create a symbol with "RT_" prefix followed by the counter
-        let symbol_str = format!("RT_{}", counter);
-        Symbol::new(env, &symbol_str)
+
+        symbol_short!("RT_ROUT")
     }
 
     fn emit_payment_routed(env: &Env, event: PaymentRoutedEvent) {

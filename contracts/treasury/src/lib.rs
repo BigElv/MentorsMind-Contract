@@ -123,6 +123,8 @@ pub enum DataKey {
     Allocation(u32),
     /// Token whitelist: DataKey::ApprovedToken(token_address) → bool
     ApprovedToken(Address),
+    /// Regulatory reporting contract address
+    RegulatoryReporting,
 }
 
 // ---------------------------------------------------------------------------
@@ -158,19 +160,57 @@ impl TreasuryContract {
             env.storage().persistent().set(&DataKey::PauseGuardian, &guardian);
         }
         env.storage().persistent().set(&DataKey::AllocationCount, &0u32);
+        env.storage().persistent().set(&DataKey::RegulatoryReporting, &Address::generate(&env)); // placeholder
         Ok(())
     }
 
-    /// Set or update the pause guardian contract address (admin only).
-    pub fn set_pause_guardian(env: Env, guardian: Address) -> Result<(), Error> {
+    /// Set regulatory reporting contract address (admin only).
+    pub fn set_regulatory_reporting(env: Env, reporting_address: Address) -> Result<(), Error> {
         let admin = env
             .storage()
             .persistent()
             .get::<DataKey, Address>(&DataKey::Admin)
             .ok_or(Error::NotInitialized)?;
         admin.require_auth();
-        env.storage().persistent().set(&DataKey::PauseGuardian, &guardian);
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::RegulatoryReporting, &reporting_address);
         Ok(())
+    }
+
+    fn _check_and_report_large_tx(
+        env: &Env,
+        contract: Symbol,
+        function: Symbol,
+        address: &Address,
+        amount_usd: i128,
+    ) {
+        const THRESHOLD: i128 = 10_000;
+        if amount_usd <= THRESHOLD {
+            return;
+        }
+
+        if let Some(reporting_addr) = env
+            .storage()
+            .persistent()
+            .get::<DataKey, Address>(&DataKey::RegulatoryReporting)
+        {
+            // Call regulatory_reporting::record_large_tx
+            use soroban_sdk::IntoVal;
+            let _ = env.try_invoke_contract::<(), _>(
+                &reporting_addr,
+                &Symbol::new(env, "record_large_tx"),
+                (
+                    contract,
+                    function,
+                    address.clone(),
+                    amount_usd,
+                    env.ledger().timestamp(),
+                )
+                    .into_val(env),
+            );
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -277,6 +317,9 @@ impl TreasuryContract {
         if !Self::_is_token_approved(&env, &token) {
             return Err(Error::TokenNotApproved);
         }
+
+        // Check for large transaction threshold and trigger regulatory reporting
+        Self::_check_and_report_large_tx(&env, Symbol::new(&env, "treasury"), Symbol::new(&env, "allocate"), &recipient, amount);
 
         token::Client::new(&env, &token)
             .transfer(&env.current_contract_address(), &recipient, &amount);
