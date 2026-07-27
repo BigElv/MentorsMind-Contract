@@ -12,6 +12,7 @@ members = [
     "contracts/verification",
     "contracts/referral",
     "contracts/referral_leaderboard",
+    "contracts/reconciliation",
     "benchmarks",
     "contracts/treasury",
     "contracts/timelock",
@@ -20,6 +21,9 @@ members = [
     "contracts/lending_pool",
     "contracts/credit_score",
     "tests",
+
+    "contracts/isa",
+    "contracts/badges",
 ]
 
 [workspace.package]

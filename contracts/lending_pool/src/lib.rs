@@ -75,6 +75,15 @@ pub struct LenderRecord {
     pub deposited_at: u64,
 }
 
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AuctionRecord {
+    pub loan: LoanRecord,
+    pub started_at: u64,
+    pub discount_bps: i128,
+    pub liquidator: Option<Address>,
+}
+
 // ---------------------------------------------------------------------------
 // Errors
 // ---------------------------------------------------------------------------
@@ -95,6 +104,10 @@ pub enum Error {
     InvalidAmount = 10,
     SameBlockDepositWithdraw = 11,
     PerBlockBorrowLimitExceeded = 12,
+    LoanNotDue = 13,
+    AuctionNotFound = 14,
+    AuctionAlreadyActive = 15,
+    AuctionAlreadySettled = 16,
 }
 
 // ---------------------------------------------------------------------------
@@ -107,13 +120,17 @@ const DEFAULT_KINK_BPS: i128 = 8_000;           // 80% utilization kink
 const DEFAULT_SLOPE1_BPS: i128 = 400;           // 4% slope below kink
 const DEFAULT_SLOPE2_BPS: i128 = 3_000;         // 30% slope above kink
 
-const MIN_CREDIT_SCORE: u32 = 600;
 const LIQUIDATION_DAYS: u64 = 30;
 const LIQUIDATION_SECONDS: u64 = LIQUIDATION_DAYS * 86_400;
 
 /// Maximum amount a single address may borrow within one ledger sequence.
 /// Set to 10% of the pool's liquidity snapshot; enforced dynamically.
 const PER_BLOCK_BORROW_CAP_BPS: i128 = 1_000; // 10 %
+
+/// Dutch-auction liquidation window: discount grows linearly from 0% to
+/// MAX_AUCTION_DISCOUNT_BPS over AUCTION_DURATION_SECS after the auction starts.
+const AUCTION_DURATION_SECS: u64 = 24 * 60 * 60; // 24 hours
+const MAX_AUCTION_DISCOUNT_BPS: i128 = 2_000; // 20%
 
 // ---------------------------------------------------------------------------
 // Contract
@@ -154,8 +171,59 @@ impl LendingPool {
         env.storage().instance().set(&DataKey::RateModelKinkBps, &DEFAULT_KINK_BPS);
         env.storage().instance().set(&DataKey::RateModelSlope1Bps, &DEFAULT_SLOPE1_BPS);
         env.storage().instance().set(&DataKey::RateModelSlope2Bps, &DEFAULT_SLOPE2_BPS);
+        
+        // Initialize regulatory reporting with placeholder
+        env.storage().instance().set(&DataKey::RegulatoryReporting, &Address::generate(&env));
 
         Ok(())
+    }
+
+    /// Set regulatory reporting contract address (admin only).
+    pub fn set_regulatory_reporting(env: Env, reporting_address: Address) -> Result<(), Error> {
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(Error::NotInitialized)?;
+        admin.require_auth();
+
+        env.storage()
+            .instance()
+            .set(&DataKey::RegulatoryReporting, &reporting_address);
+        Ok(())
+    }
+
+    fn _check_and_report_large_tx(
+        env: &Env,
+        contract: Symbol,
+        function: Symbol,
+        address: &Address,
+        amount_usd: i128,
+    ) {
+        const THRESHOLD: i128 = 10_000;
+        if amount_usd <= THRESHOLD {
+            return;
+        }
+
+        if let Some(reporting_addr) = env
+            .storage()
+            .instance()
+            .get::<DataKey, Address>(&DataKey::RegulatoryReporting)
+        {
+            use soroban_sdk::IntoVal;
+            let _ = env.try_invoke_contract::<(), _>(
+                &reporting_addr,
+                &Symbol::new(env, "record_large_tx"),
+                (
+                    contract,
+                    function,
+                    address.clone(),
+                    amount_usd,
+                    env.ledger().timestamp(),
+                )
+                    .into_val(env),
+            );
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -558,6 +626,9 @@ impl LendingPool {
             .instance()
             .set(&DataKey::BlockBorrowLedger(borrower.clone()), &current_seq);
 
+        // Check for large transaction and trigger regulatory reporting
+        Self::_check_and_report_large_tx(&env, symbol_short!("lend_pool"), symbol_short!("borrow"), &borrower, amount);
+
         // Compute fee using dynamic rate model (no cache)
         let fee = Self::compute_fee(&env, amount);
 
@@ -738,6 +809,189 @@ impl LendingPool {
             .publish((symbol_short!("liq"),), (borrower, loan.amount));
 
         Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // Liquidation auction (#667)
+    // -----------------------------------------------------------------------
+
+    /// Starts a Dutch-auction liquidation for `borrower`'s defaulted loan.
+    /// Callable by anyone once `due_at` has passed. The discount grows
+    /// linearly from 0% to MAX_AUCTION_DISCOUNT_BPS over AUCTION_DURATION_SECS.
+    pub fn start_liquidation_auction(env: Env, borrower: Address) -> Result<(), Error> {
+        let loan: LoanRecord = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Loan(borrower.clone()))
+            .ok_or(Error::LoanNotFound)?;
+
+        if loan.repaid {
+            return Err(Error::LoanAlreadyRepaid);
+        }
+
+        let now = env.ledger().timestamp();
+        if now <= loan.due_at {
+            return Err(Error::LoanNotDue);
+        }
+
+        if env
+            .storage()
+            .persistent()
+            .has(&DataKey::LiquidationAuction(borrower.clone()))
+        {
+            return Err(Error::AuctionAlreadyActive);
+        }
+
+        let auction = AuctionRecord {
+            loan,
+            started_at: now,
+            discount_bps: 0,
+            liquidator: None,
+        };
+        env.storage()
+            .persistent()
+            .set(&DataKey::LiquidationAuction(borrower.clone()), &auction);
+
+        env.events()
+            .publish((symbol_short!("auc_start"),), (borrower, now));
+
+        Ok(())
+    }
+
+    /// Current discount (bps) for `borrower`'s active auction, based on
+    /// elapsed time since it started. Linear ramp: 0 at start, capped at
+    /// MAX_AUCTION_DISCOUNT_BPS after AUCTION_DURATION_SECS have elapsed.
+    pub fn get_auction_discount(env: Env, borrower: Address) -> Result<i128, Error> {
+        let auction: AuctionRecord = env
+            .storage()
+            .persistent()
+            .get(&DataKey::LiquidationAuction(borrower))
+            .ok_or(Error::AuctionNotFound)?;
+
+        let now = env.ledger().timestamp();
+        let elapsed = now.saturating_sub(auction.started_at);
+        if elapsed >= AUCTION_DURATION_SECS {
+            return Ok(MAX_AUCTION_DISCOUNT_BPS);
+        }
+
+        let discount = MAX_AUCTION_DISCOUNT_BPS
+            .checked_mul(elapsed as i128)
+            .expect("Overflow")
+            .checked_div(AUCTION_DURATION_SECS as i128)
+            .expect("Division error");
+        Ok(discount)
+    }
+
+    /// Executes the liquidation: `liquidator` pays `loan.amount * (1 -
+    /// discount_bps/10000)` and the pool's liquidity is restored by that
+    /// amount. The liquidator's profit is the discount versus the full
+    /// principal; no LP tokens are minted since the pool is simply repaid at
+    /// a haircut instead of the borrower repaying at par.
+    pub fn execute_liquidation(env: Env, liquidator: Address, borrower: Address) -> Result<(), Error> {
+        liquidator.require_auth();
+
+        let auction: AuctionRecord = env
+            .storage()
+            .persistent()
+            .get(&DataKey::LiquidationAuction(borrower.clone()))
+            .ok_or(Error::AuctionNotFound)?;
+
+        if auction.liquidator.is_some() {
+            return Err(Error::AuctionAlreadySettled);
+        }
+
+        let discount_bps = Self::get_auction_discount(env.clone(), borrower.clone())?;
+
+        let total_owed = auction.loan.amount + auction.loan.fee;
+        let discount_amount = total_owed
+            .checked_mul(discount_bps)
+            .expect("Overflow")
+            .checked_div(10_000)
+            .expect("Division error");
+        let payment = total_owed - discount_amount;
+
+        let usdc_token: Address = env.storage().instance().get(&DataKey::UsdcToken).unwrap();
+        let token_client = soroban_sdk::token::Client::new(&env, &usdc_token);
+        token_client.transfer(&liquidator, &env.current_contract_address(), &payment);
+
+        // Restore pool liquidity by the amount actually recovered.
+        let mut total_liquidity: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::TotalLiquidity)
+            .unwrap_or(0);
+        total_liquidity = total_liquidity.checked_add(payment).expect("Overflow");
+        env.storage()
+            .instance()
+            .set(&DataKey::TotalLiquidity, &total_liquidity);
+
+        // Mark the loan repaid and settle the auction.
+        let mut updated_loan = auction.loan.clone();
+        updated_loan.repaid = true;
+        env.storage()
+            .persistent()
+            .set(&DataKey::Loan(borrower.clone()), &updated_loan);
+        env.storage()
+            .persistent()
+            .remove(&DataKey::LiquidationAuction(borrower.clone()));
+
+        env.events().publish(
+            (symbol_short!("auc_exec"),),
+            (borrower, liquidator, payment, discount_bps),
+        );
+
+        Ok(())
+    }
+
+    /// Admin-only emergency liquidation that bypasses the Dutch auction.
+    /// No funds are recovered from the borrower; the full outstanding
+    /// principal + fee is written off to `DataKey::BadDebt` for solvency
+    /// monitoring. Pool liquidity is NOT restored.
+    pub fn force_liquidate(env: Env, admin: Address, borrower: Address) -> Result<(), Error> {
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(Error::NotInitialized)?;
+        admin.require_auth();
+        if admin != stored_admin {
+            return Err(Error::NotAdmin);
+        }
+
+        let loan: LoanRecord = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Loan(borrower.clone()))
+            .ok_or(Error::LoanNotFound)?;
+
+        if loan.repaid {
+            return Err(Error::LoanAlreadyRepaid);
+        }
+
+        let mut updated_loan = loan.clone();
+        updated_loan.repaid = true;
+        env.storage()
+            .persistent()
+            .set(&DataKey::Loan(borrower.clone()), &updated_loan);
+        env.storage()
+            .persistent()
+            .remove(&DataKey::LiquidationAuction(borrower.clone()));
+
+        let total_owed = loan.amount + loan.fee;
+        let mut bad_debt: i128 = env.storage().instance().get(&DataKey::BadDebt).unwrap_or(0);
+        bad_debt = bad_debt.checked_add(total_owed).expect("Overflow");
+        env.storage().instance().set(&DataKey::BadDebt, &bad_debt);
+
+        env.events()
+            .publish((symbol_short!("force_liq"),), (borrower, total_owed));
+
+        Ok(())
+    }
+
+    /// Total unrecovered principal + fee written off via `force_liquidate`,
+    /// for off-chain solvency monitoring.
+    pub fn get_bad_debt(env: Env) -> i128 {
+        env.storage().instance().get(&DataKey::BadDebt).unwrap_or(0)
     }
 
     pub fn accrue_yield(env: Env, admin: Address, amount: i128) -> Result<(), Error> {
