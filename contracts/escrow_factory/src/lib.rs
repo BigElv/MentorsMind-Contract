@@ -1,8 +1,9 @@
 #![no_std]
 use soroban_sdk::{
-    contract, contractimpl, contracttype, symbol_short, token, Address, BytesN, Env, IntoVal,
+    contract, contractimpl, contracttype, symbol_short, Address, Bytes, BytesN, Env, IntoVal,
     Symbol, Vec,
 };
+use soroban_sdk::xdr::ToXdr;
 
 // Pull in the shared signature-validation utilities.
 use shared::sig_validation::{current_nonce, validate_and_consume_nonce, MetaTxAction, MetaTxPayload};
@@ -31,6 +32,7 @@ const ESCROW_COUNT: Symbol = symbol_short!("ESC_CNT");
 /// deployment after a previous one expired produces a different salt (and
 /// therefore a different address) instead of colliding.
 const SESSION_NONCE: Symbol = symbol_short!("SESS_NCE");
+const INTERFACE_REGISTRY: Symbol = symbol_short!("IF_REG");
 const FACTORY_TTL_THRESHOLD: u32 = 500_000;
 const FACTORY_TTL_BUMP: u32 = 1_000_000;
 
@@ -103,6 +105,16 @@ impl EscrowFactory {
         env.storage()
             .persistent()
             .extend_ttl(&PAUSE_GUARDIAN, FACTORY_TTL_THRESHOLD, FACTORY_TTL_BUMP);
+    }
+
+    /// Set the interface registry contract address. Admin only.
+    pub fn set_interface_registry(env: Env, registry: Address) {
+        let admin = Self::admin(&env);
+        admin.require_auth();
+        env.storage().persistent().set(&INTERFACE_REGISTRY, &registry);
+        env.storage()
+            .persistent()
+            .extend_ttl(&INTERFACE_REGISTRY, FACTORY_TTL_THRESHOLD, FACTORY_TTL_BUMP);
     }
 
     pub fn set_anomaly_detector(env: Env, detector: Address) {
@@ -207,14 +219,14 @@ impl EscrowFactory {
 
         // Initialize the new escrow contract
         let initialize_sym = Symbol::new(&env, "initialize");
-        env.invoke_contract(
+        let _: () = env.invoke_contract(
             &escrow_address,
             &initialize_sym,
             (
                 env.current_contract_address(), // Set factory as admin
-                Address::generate(&env),        // Treasury (placeholder)
+                env.current_contract_address(), // Treasury (placeholder)
                 0u32,                           // Fee bps (placeholder)
-                Vec::new(&env),                 // Approved tokens (empty for now)
+                Vec::<Address>::new(&env),      // Approved tokens (empty for now)
                 72u64 * 60 * 60,                // Auto release delay (72 hours)
             )
                 .into_val(&env),
@@ -222,12 +234,12 @@ impl EscrowFactory {
 
         // Create escrow in the deployed contract
         let create_escrow_sym = Symbol::new(&env, "create_escrow");
-        env.invoke_contract(
+        let _: Address = env.invoke_contract(
             &escrow_address,
             &create_escrow_sym,
             (
-                mentor,
-                learner,
+                mentor.clone(),
+                learner.clone(),
                 amount,
                 session_id.clone(),
                 token,
@@ -271,9 +283,19 @@ impl EscrowFactory {
 
         // Emit event
         env.events().publish(
-            (symbol_short!("escrow_deployed"), session_id.clone()),
+            (Symbol::new(&env, "escrow_deployed"), session_id.clone()),
             (escrow_address.clone(), session_id),
         );
+
+        // Register interface in the interface registry (if set)
+        if let Some(registry_addr) = env.storage().persistent().get::<_, Address>(&INTERFACE_REGISTRY) {
+            let interface_id = Symbol::new(&env, "escrow_v1");
+            let _: () = env.invoke_contract(
+                &registry_addr,
+                &Symbol::new(&env, "register_interface"),
+                (escrow_address.clone(), interface_id, 1u32).into_val(&env),
+            );
+        }
 
         escrow_address
     }
@@ -370,7 +392,7 @@ impl EscrowFactory {
         );
 
         env.events().publish(
-            (symbol_short!("implementation_upgraded")),
+            (Symbol::new(&env, "impl_upgraded"),),
             (new_implementation, env.ledger().timestamp()),
         );
     }
