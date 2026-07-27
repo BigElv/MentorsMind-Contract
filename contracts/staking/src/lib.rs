@@ -51,6 +51,8 @@ pub struct UnstakedEventData {
 pub enum DataKey {
     Admin,
     MNTToken,
+    /// Optional pause guardian contract for circuit-breaker functionality.
+    PauseGuardian,
     Stake(Address),
     StakerAt(u32),
     StakerCount,
@@ -109,12 +111,32 @@ pub struct StakingContract;
 impl StakingContract {
     /// Initialize the staking contract.
     /// Must be called once before any other function.
-    pub fn initialize(env: Env, admin: Address, mnt_token: Address) -> Result<(), Error> {
+    pub fn initialize(
+        env: Env,
+        admin: Address,
+        mnt_token: Address,
+        pause_guardian: Option<Address>,
+    ) -> Result<(), Error> {
         if env.storage().instance().has(&DataKey::Admin) {
             return Err(Error::AlreadyInitialized);
         }
         env.storage().instance().set(&DataKey::Admin, &admin);
         env.storage().instance().set(&DataKey::MNTToken, &mnt_token);
+        if let Some(guardian) = pause_guardian {
+            env.storage().instance().set(&DataKey::PauseGuardian, &guardian);
+        }
+        Ok(())
+    }
+
+    /// Set or update the pause guardian contract address (admin only).
+    pub fn set_pause_guardian(env: Env, guardian: Address) -> Result<(), Error> {
+        let admin = env
+            .storage()
+            .instance()
+            .get::<DataKey, Address>(&DataKey::Admin)
+            .ok_or(Error::NotInitialized)?;
+        admin.require_auth();
+        env.storage().instance().set(&DataKey::PauseGuardian, &guardian);
         Ok(())
     }
 
@@ -143,6 +165,11 @@ impl StakingContract {
         amount: i128,
         lock_period_days: u32,
     ) -> Result<(), Error> {
+        // Check pause guardian before any state mutation
+        if let Some(guardian) = env.storage().instance().get::<DataKey, Address>(&DataKey::PauseGuardian) {
+            require_not_paused(&env, &guardian);
+        }
+
         let _guard = ReentrancyGuard::enter(&env, Symbol::new(&env, "stake"));
         if !env.storage().instance().has(&DataKey::Admin) {
             return Err(Error::NotInitialized);
@@ -496,6 +523,11 @@ impl StakingContract {
     /// (using their still-live `Stake` record, if any) into `PendingRewards`,
     /// then transfers the full pending balance to the staker.
     pub fn claim_rewards(env: Env, staker: Address, token: Address) -> Result<(), Error> {
+        // Check pause guardian before any state mutation
+        if let Some(guardian) = env.storage().instance().get::<DataKey, Address>(&DataKey::PauseGuardian) {
+            require_not_paused(&env, &guardian);
+        }
+
         let _guard = ReentrancyGuard::enter(&env, Symbol::new(&env, "claim_rewards"));
         if !env.storage().instance().has(&DataKey::Admin) {
             return Err(Error::NotInitialized);

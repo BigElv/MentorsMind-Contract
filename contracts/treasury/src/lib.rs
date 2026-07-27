@@ -1,6 +1,6 @@
 #![no_std]
 
-use shared::ReentrancyGuard;
+use shared::{ReentrancyGuard, require_not_paused};
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, symbol_short, token, Address, Env,
     IntoVal, Symbol, Vec,
@@ -116,6 +116,8 @@ pub enum DataKey {
     /// `buyback_and_burn`. Set during `initialize`.
     Timelock,
     StakingContract,
+    /// Optional pause guardian contract for circuit-breaker functionality.
+    PauseGuardian,
     AllocationCount,
     /// Individual allocation history: DataKey::Allocation(index) → AllocationHistory
     Allocation(u32),
@@ -140,11 +142,13 @@ impl TreasuryContract {
     /// * `staking_contract` — receives staker distributions.
     /// * `timelock`         — the **only** address allowed to call
     ///                        `buyback_and_burn` (enforced on every call).
+    /// * `pause_guardian`   — optional pause guardian contract for circuit-breaker.
     pub fn initialize(
         env: Env,
         admin: Address,
         staking_contract: Address,
         timelock: Address,
+        pause_guardian: Option<Address>,
     ) -> Result<(), Error> {
         if env.storage().persistent().has(&DataKey::Admin) {
             return Err(Error::AlreadyInitialized);
@@ -152,6 +156,9 @@ impl TreasuryContract {
         env.storage().persistent().set(&DataKey::Admin,           &admin);
         env.storage().persistent().set(&DataKey::StakingContract, &staking_contract);
         env.storage().persistent().set(&DataKey::Timelock,        &timelock);
+        if let Some(guardian) = pause_guardian {
+            env.storage().persistent().set(&DataKey::PauseGuardian, &guardian);
+        }
         env.storage().persistent().set(&DataKey::AllocationCount, &0u32);
         env.storage().persistent().set(&DataKey::RegulatoryReporting, &Address::generate(&env)); // placeholder
         Ok(())
@@ -256,6 +263,15 @@ impl TreasuryContract {
 
     /// Accept deposits of approved Stellar assets only.
     pub fn deposit(env: Env, from: Address, token: Address, amount: i128) -> Result<(), Error> {
+        // Check pause guardian before any state mutation
+        if let Some(guardian) = env
+            .storage()
+            .persistent()
+            .get::<DataKey, Address>(&DataKey::PauseGuardian)
+        {
+            require_not_paused(&env, &guardian);
+        }
+
         from.require_auth();
         if !Self::_is_token_approved(&env, &token) {
             panic!("Token not approved");
@@ -281,6 +297,15 @@ impl TreasuryContract {
         recipient: Address,
         amount: i128,
     ) -> Result<(), Error> {
+        // Check pause guardian before any state mutation
+        if let Some(guardian) = env
+            .storage()
+            .persistent()
+            .get::<DataKey, Address>(&DataKey::PauseGuardian)
+        {
+            require_not_paused(&env, &guardian);
+        }
+
         let _guard = ReentrancyGuard::enter(&env, Symbol::new(&env, "allocate"));
         let admin = env
             .storage()
@@ -328,6 +353,15 @@ impl TreasuryContract {
         token: Address,
         total_amount: i128,
     ) -> Result<(), Error> {
+        // Check pause guardian before any state mutation
+        if let Some(guardian) = env
+            .storage()
+            .persistent()
+            .get::<DataKey, Address>(&DataKey::PauseGuardian)
+        {
+            require_not_paused(&env, &guardian);
+        }
+
         let _guard = ReentrancyGuard::enter(&env, Symbol::new(&env, "distribute"));
         let admin = env
             .storage()
