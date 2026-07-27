@@ -1,8 +1,9 @@
 #![no_std]
 use soroban_sdk::{
-    contract, contractimpl, contracttype, symbol_short, token, Address, BytesN, Env, IntoVal,
+    contract, contractimpl, contracttype, symbol_short, Address, Bytes, BytesN, Env, IntoVal,
     Symbol, Vec,
 };
+use soroban_sdk::xdr::ToXdr;
 
 // Pull in the shared signature-validation utilities.
 use shared::sig_validation::{current_nonce, validate_and_consume_nonce, MetaTxAction, MetaTxPayload};
@@ -21,6 +22,8 @@ pub struct EscrowInfo {
 const ADMIN: Symbol = symbol_short!("ADMIN");
 const IMPLEMENTATION: Symbol = symbol_short!("IMPL");
 const PAUSE_GUARDIAN: Symbol = symbol_short!("PAUSE_GD");
+const ANOMALY_DETECTOR: Symbol = symbol_short!("ANOM_DET");
+const BYPASS_ANOMALY: Symbol = symbol_short!("BYPASS_AN");
 const ESCROW_MAPPING: Symbol = symbol_short!("ESC_MAP");
 const ESCROW_LIST: Symbol = symbol_short!("ESC_LIST");
 const ESCROW_COUNT: Symbol = symbol_short!("ESC_CNT");
@@ -114,6 +117,20 @@ impl EscrowFactory {
             .extend_ttl(&INTERFACE_REGISTRY, FACTORY_TTL_THRESHOLD, FACTORY_TTL_BUMP);
     }
 
+    pub fn set_anomaly_detector(env: Env, detector: Address) {
+        let admin = Self::admin(&env);
+        admin.require_auth();
+        env.storage().persistent().set(&ANOMALY_DETECTOR, &detector);
+        env.storage().persistent().extend_ttl(&ANOMALY_DETECTOR, FACTORY_TTL_THRESHOLD, FACTORY_TTL_BUMP);
+    }
+
+    pub fn set_bypass_anomaly_check(env: Env, bypass: bool) {
+        let admin = Self::admin(&env);
+        admin.require_auth();
+        env.storage().persistent().set(&BYPASS_ANOMALY, &bypass);
+        env.storage().persistent().extend_ttl(&BYPASS_ANOMALY, FACTORY_TTL_THRESHOLD, FACTORY_TTL_BUMP);
+    }
+
     /// Deploy a new escrow contract instance using minimal proxy pattern.
     ///
     /// # Timestamp security
@@ -139,6 +156,22 @@ impl EscrowFactory {
             );
             if is_paused {
                 panic!("Contract is paused");
+            }
+        }
+        // Anomaly detection check
+        let bypass: bool = env.storage().persistent().get(&BYPASS_ANOMALY).unwrap_or(false);
+        if !bypass {
+            if let Some(anomaly_detector) = env.storage().persistent().get::<_, Address>(&ANOMALY_DETECTOR) {
+                let res: u32 = env.invoke_contract(
+                    &anomaly_detector,
+                    &Symbol::new(&env, "check_anomaly"),
+                    (learner.clone(), 0u32, amount).into_val(&env), // 0u32 = AnomalyAction::CreateEscrow
+                );
+                if res == 2 {
+                    panic!("UserOnHold");
+                } else if res == 1 {
+                    env.events().publish((symbol_short!("anom_warn"), learner.clone()), amount);
+                }
             }
         }
         // Check if session ID already exists
@@ -186,14 +219,14 @@ impl EscrowFactory {
 
         // Initialize the new escrow contract
         let initialize_sym = Symbol::new(&env, "initialize");
-        env.invoke_contract(
+        let _: () = env.invoke_contract(
             &escrow_address,
             &initialize_sym,
             (
                 env.current_contract_address(), // Set factory as admin
-                Address::generate(&env),        // Treasury (placeholder)
+                env.current_contract_address(), // Treasury (placeholder)
                 0u32,                           // Fee bps (placeholder)
-                Vec::new(&env),                 // Approved tokens (empty for now)
+                Vec::<Address>::new(&env),      // Approved tokens (empty for now)
                 72u64 * 60 * 60,                // Auto release delay (72 hours)
             )
                 .into_val(&env),
@@ -201,12 +234,12 @@ impl EscrowFactory {
 
         // Create escrow in the deployed contract
         let create_escrow_sym = Symbol::new(&env, "create_escrow");
-        env.invoke_contract(
+        let _: Address = env.invoke_contract(
             &escrow_address,
             &create_escrow_sym,
             (
-                mentor,
-                learner,
+                mentor.clone(),
+                learner.clone(),
                 amount,
                 session_id.clone(),
                 token,
@@ -250,14 +283,14 @@ impl EscrowFactory {
 
         // Emit event
         env.events().publish(
-            (symbol_short!("escrow_deployed"), session_id.clone()),
+            (Symbol::new(&env, "escrow_deployed"), session_id.clone()),
             (escrow_address.clone(), session_id),
         );
 
         // Register interface in the interface registry (if set)
         if let Some(registry_addr) = env.storage().persistent().get::<_, Address>(&INTERFACE_REGISTRY) {
             let interface_id = Symbol::new(&env, "escrow_v1");
-            env.invoke_contract(
+            let _: () = env.invoke_contract(
                 &registry_addr,
                 &Symbol::new(&env, "register_interface"),
                 (escrow_address.clone(), interface_id, 1u32).into_val(&env),
@@ -359,7 +392,7 @@ impl EscrowFactory {
         );
 
         env.events().publish(
-            (symbol_short!("implementation_upgraded")),
+            (Symbol::new(&env, "impl_upgraded"),),
             (new_implementation, env.ledger().timestamp()),
         );
     }

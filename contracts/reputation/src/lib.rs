@@ -162,8 +162,15 @@ impl ReputationContract {
 
 
     pub fn calculate_average_rating(env: Env, user: Address) -> u32 {
-        let key = (symbol_short!("AvgRating"), user.clone());
-        env.storage().persistent().get(&key).unwrap_or(0u32)
+        let sum_key = DataKey::MentorRatingSum(user.clone());
+        let cnt_key = DataKey::MentorReviewCount(user.clone());
+        let sum: u64 = env.storage().persistent().get(&sum_key).unwrap_or(0);
+        let count: u64 = env.storage().persistent().get(&cnt_key).unwrap_or(0);
+        if count == 0 {
+            0
+        } else {
+            ((sum * 100) / count) as u32
+        }
     }
     
     /// Accrue loyalty points for a user and update their tier (#463).
@@ -191,11 +198,38 @@ impl ReputationContract {
     }
 
     pub fn update_reputation(env: Env, user: Address, new_rating: u32) {
-        let key = (symbol_short!("AvgRating"), user.clone());
-        let current: u32 = env.storage().persistent().get(&key).unwrap_or(0u32);
-        let updated = if current == 0 { new_rating } else { (current + new_rating) / 2 };
-        env.storage().persistent().set(&key, &updated);
-        env.events().publish((symbol_short!("Reput"), symbol_short!("updated")), (user, updated));
+        if new_rating < 1 || new_rating > 5 {
+            panic!("InvalidRating");
+        }
+        let sum_key = DataKey::MentorRatingSum(user.clone());
+        let cnt_key = DataKey::MentorReviewCount(user.clone());
+
+        let current_sum: u64 = env.storage().persistent().get(&sum_key).unwrap_or(0u64);
+        let current_count: u64 = env.storage().persistent().get(&cnt_key).unwrap_or(0u64);
+
+        let new_sum = current_sum.checked_add(new_rating as u64).expect("sum overflow");
+        let new_count = current_count.checked_add(1).expect("count overflow");
+
+        env.storage().persistent().set(&sum_key, &new_sum);
+        env.storage().persistent().extend_ttl(&sum_key, TTL_THRESHOLD, TTL_BUMP);
+        env.storage().persistent().set(&cnt_key, &new_count);
+        env.storage().persistent().extend_ttl(&cnt_key, TTL_THRESHOLD, TTL_BUMP);
+
+        let updated_avg = (new_sum * 100) / new_count;
+        env.events().publish((symbol_short!("Reput"), symbol_short!("updated")), (user, updated_avg));
+    }
+
+    pub fn migrate_legacy_rating(env: Env, user: Address, legacy_rating: u32, legacy_count: u32) {
+        let sum_key = DataKey::MentorRatingSum(user.clone());
+        let cnt_key = DataKey::MentorReviewCount(user.clone());
+
+        let sum = (legacy_rating as u64) * (legacy_count as u64);
+        let count = legacy_count as u64;
+
+        env.storage().persistent().set(&sum_key, &sum);
+        env.storage().persistent().extend_ttl(&sum_key, TTL_THRESHOLD, TTL_BUMP);
+        env.storage().persistent().set(&cnt_key, &count);
+        env.storage().persistent().extend_ttl(&cnt_key, TTL_THRESHOLD, TTL_BUMP);
     }
 
 }
