@@ -37,7 +37,7 @@ pub enum DataKey {
     Session(Symbol),
     MentorSessions(Address),
     LearnerSessions(Address),
-    SessionOracle,
+    SessionMetadata(Symbol),
 }
 
 // ── Errors ────────────────────────────────────────────────────────────────────
@@ -243,14 +243,38 @@ impl SessionRegistry {
             .expect("Not initialized")
     }
 
-
-    pub fn update_session_metadata(env: Env, session_id: u64, tags: soroban_sdk::Vec<String>) {
-        let key = (symbol_short!("SessMeta"), session_id);
+    pub fn update_session_metadata(env: Env, session_id: Symbol, tags: soroban_sdk::Vec<soroban_sdk::String>) {
+        let key = DataKey::SessionMetadata(session_id);
         env.storage().persistent().set(&key, &tags);
+        env.storage().persistent().extend_ttl(&key, TTL_THRESHOLD, TTL_BUMP);
+    }
+
+    pub fn get_session_metadata(env: Env, session_id: Symbol) -> soroban_sdk::Vec<soroban_sdk::String> {
+        let key = DataKey::SessionMetadata(session_id);
+        env.storage().persistent().get(&key).unwrap_or(Vec::new(&env))
     }
     
-    pub fn get_sessions_by_participant(env: Env, participant: Address) -> soroban_sdk::Vec<u64> {
-        soroban_sdk::Vec::new(&env)
+    pub fn get_sessions_by_participant(env: Env, participant: Address) -> soroban_sdk::Vec<Symbol> {
+        let mut result = Vec::new(&env);
+        let mentor_sessions: Vec<Symbol> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::MentorSessions(participant.clone()))
+            .unwrap_or(Vec::new(&env));
+        for s in mentor_sessions.iter() {
+            result.push_back(s);
+        }
+        let learner_sessions: Vec<Symbol> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::LearnerSessions(participant.clone()))
+            .unwrap_or(Vec::new(&env));
+        for s in learner_sessions.iter() {
+            if !result.contains(&s) {
+                result.push_back(s);
+            }
+        }
+        result
     }
 
 }

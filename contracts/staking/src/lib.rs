@@ -73,6 +73,8 @@ pub enum DataKey {
     /// Next un-claimed epoch id for a given staker — avoids re-scanning
     /// already-claimed epochs on every `claim_rewards` call.
     StakerNextClaimEpoch(Address),
+    AnomalyDetector,
+    BypassAnomalyCheck,
 }
 
 // ---------------------------------------------------------------------------
@@ -116,6 +118,18 @@ impl StakingContract {
         Ok(())
     }
 
+    pub fn set_anomaly_detector(env: Env, detector: Address) {
+        let admin: Address = env.storage().instance().get(&DataKey::Admin).expect("Not initialized");
+        admin.require_auth();
+        env.storage().instance().set(&DataKey::AnomalyDetector, &detector);
+    }
+
+    pub fn set_bypass_anomaly_check(env: Env, bypass: bool) {
+        let admin: Address = env.storage().instance().get(&DataKey::Admin).expect("Not initialized");
+        admin.require_auth();
+        env.storage().instance().set(&DataKey::BypassAnomalyCheck, &bypass);
+    }
+
     /// Stake MNT tokens for a given lock period.
     ///
     /// - Transfers `amount` MNT from `mentor` to this contract.
@@ -136,6 +150,22 @@ impl StakingContract {
 
         if amount <= 0 {
             return Err(Error::InvalidAmount);
+        }
+
+        let bypass: bool = env.storage().instance().get(&DataKey::BypassAnomalyCheck).unwrap_or(false);
+        if !bypass {
+            if let Some(anomaly_detector) = env.storage().instance().get::<_, Address>(&DataKey::AnomalyDetector) {
+                let res: u32 = env.invoke_contract(
+                    &anomaly_detector,
+                    &Symbol::new(&env, "check_anomaly"),
+                    (mentor.clone(), 2u32, amount).into_val(&env), // 2u32 = LargeTransfer
+                );
+                if res == 2 {
+                    panic!("UserOnHold");
+                } else if res == 1 {
+                    env.events().publish((Symbol::new(&env, "anomaly_warning"), mentor.clone()), amount);
+                }
+            }
         }
 
         if env
