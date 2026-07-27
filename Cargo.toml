@@ -19,6 +19,7 @@ members = [
     "contracts/health_dashboard",
     "contracts/insurance",
     "contracts/interface_registry",
+    "contracts/invariants",
     "contracts/isa",
     "contracts/kyc_registry",
     "contracts/lending_pool",

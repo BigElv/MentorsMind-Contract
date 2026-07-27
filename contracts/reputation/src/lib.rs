@@ -30,6 +30,8 @@ pub enum DataKey {
     MentorReviewCount(Address),
     LoyaltyPoints(Address),
     LoyaltyTier(Address),
+    SlashPenaltyBps(Address),
+    Rehabilitated(Address),
 }
 
 pub const TIER_SILVER: u32 = 100;
@@ -136,7 +138,7 @@ impl ReputationContract {
         );
     }
 
-    /// Returns (avg_rating * 100, review_count) for a mentor.
+    /// Returns (avg_rating * 100, review_count) for a mentor, incorporating slash penalties (Issue #751).
     pub fn get_mentor_rating(env: Env, mentor: Address) -> (u64, u64) {
         let sum_key = DataKey::MentorRatingSum(mentor.clone());
         let cnt_key = DataKey::MentorReviewCount(mentor.clone());
@@ -148,8 +150,61 @@ impl ReputationContract {
             return (0, 0);
         }
 
-        let avg_times_100 = (sum * 100) / count;
-        (avg_times_100, count)
+        let raw_avg = (sum * 100) / count;
+        let mut penalty_bps: u64 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::SlashPenaltyBps(mentor.clone()))
+            .unwrap_or(0);
+
+        let is_rehab: bool = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Rehabilitated(mentor.clone()))
+            .unwrap_or(false);
+
+        if is_rehab {
+            // Halve the slash penalty upon 10 perfect sessions recovery
+            penalty_bps /= 2;
+        }
+
+        if penalty_bps >= 10000 {
+            return (0, count);
+        }
+
+        let final_avg = (raw_avg * (10000 - penalty_bps)) / 10000;
+        (final_avg, count)
+    }
+
+    /// Apply compounding slash penalty BPS to a mentor's reputation score (Issue #751).
+    /// First slash reduces by 5% (500 BPS), second slash reduces by additional 10% (1500 BPS total), etc.
+    pub fn apply_slash_penalty(env: Env, mentor: Address, slash_count: u32) {
+        let bps = match slash_count {
+            0 => 0u64,
+            1 => 500u64,           // 5%
+            2 => 1500u64,          // 5% + 10% compounding
+            3 => 3000u64,          // 30%
+            _ => (slash_count as u64) * 1500u64,
+        };
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::SlashPenaltyBps(mentor.clone()), &bps);
+        env.storage()
+            .persistent()
+            .set(&DataKey::Rehabilitated(mentor.clone()), &false);
+
+        env.events()
+            .publish((symbol_short!("slash"), symbol_short!("pen")), (mentor, bps));
+    }
+
+    /// Rehabilitate a mentor who completed 10 perfect sessions after re-bonding (halves penalty).
+    pub fn rehabilitate_mentor(env: Env, mentor: Address) {
+        env.storage()
+            .persistent()
+            .set(&DataKey::Rehabilitated(mentor.clone()), &true);
+        env.events()
+            .publish((symbol_short!("slash"), symbol_short!("rehab")), mentor);
     }
 
     /// Returns the review record for a given session.
