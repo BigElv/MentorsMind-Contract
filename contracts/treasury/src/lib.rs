@@ -1,6 +1,6 @@
 #![no_std]
 
-use shared::ReentrancyGuard;
+use shared::{ReentrancyGuard, require_not_paused};
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, symbol_short, token, Address, Env,
     IntoVal, Symbol, Vec,
@@ -104,6 +104,18 @@ pub struct TreasuryTokenApprovalEvent {
     pub approved: bool,
 }
 
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PendingAllocation {
+    pub id: u32,
+    pub token: Address,
+    pub recipient: Address,
+    pub amount: i128,
+    pub approvals_count: u32,
+    pub executed: bool,
+    pub created_at: u64,
+}
+
 // ---------------------------------------------------------------------------
 // Storage keys
 // ---------------------------------------------------------------------------
@@ -112,15 +124,17 @@ pub struct TreasuryTokenApprovalEvent {
 #[derive(Clone)]
 pub enum DataKey {
     Admin,
-    /// The timelock contract whose `execute` is the only allowed caller of
-    /// `buyback_and_burn`. Set during `initialize`.
     Timelock,
     StakingContract,
+    PauseGuardian,
     AllocationCount,
-    /// Individual allocation history: DataKey::Allocation(index) → AllocationHistory
     Allocation(u32),
-    /// Token whitelist: DataKey::ApprovedToken(token_address) → bool
     ApprovedToken(Address),
+    RegulatoryReporting,
+    MultisigThreshold,
+    PendingAllocationCount,
+    PendingAllocation(u32),
+    AllocationApproval(u32, Address),
 }
 
 // ---------------------------------------------------------------------------
@@ -138,11 +152,13 @@ impl TreasuryContract {
     /// * `staking_contract` — receives staker distributions.
     /// * `timelock`         — the **only** address allowed to call
     ///                        `buyback_and_burn` (enforced on every call).
+    /// * `pause_guardian`   — optional pause guardian contract for circuit-breaker.
     pub fn initialize(
         env: Env,
         admin: Address,
         staking_contract: Address,
         timelock: Address,
+        pause_guardian: Option<Address>,
     ) -> Result<(), Error> {
         if env.storage().persistent().has(&DataKey::Admin) {
             return Err(Error::AlreadyInitialized);
@@ -150,8 +166,61 @@ impl TreasuryContract {
         env.storage().persistent().set(&DataKey::Admin,           &admin);
         env.storage().persistent().set(&DataKey::StakingContract, &staking_contract);
         env.storage().persistent().set(&DataKey::Timelock,        &timelock);
+        if let Some(guardian) = pause_guardian {
+            env.storage().persistent().set(&DataKey::PauseGuardian, &guardian);
+        }
         env.storage().persistent().set(&DataKey::AllocationCount, &0u32);
+        env.storage().persistent().set(&DataKey::RegulatoryReporting, &Address::generate(&env)); // placeholder
         Ok(())
+    }
+
+    /// Set regulatory reporting contract address (admin only).
+    pub fn set_regulatory_reporting(env: Env, reporting_address: Address) -> Result<(), Error> {
+        let admin = env
+            .storage()
+            .persistent()
+            .get::<DataKey, Address>(&DataKey::Admin)
+            .ok_or(Error::NotInitialized)?;
+        admin.require_auth();
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::RegulatoryReporting, &reporting_address);
+        Ok(())
+    }
+
+    fn _check_and_report_large_tx(
+        env: &Env,
+        contract: Symbol,
+        function: Symbol,
+        address: &Address,
+        amount_usd: i128,
+    ) {
+        const THRESHOLD: i128 = 10_000;
+        if amount_usd <= THRESHOLD {
+            return;
+        }
+
+        if let Some(reporting_addr) = env
+            .storage()
+            .persistent()
+            .get::<DataKey, Address>(&DataKey::RegulatoryReporting)
+        {
+            // Call regulatory_reporting::record_large_tx
+            use soroban_sdk::IntoVal;
+            let _ = env.try_invoke_contract::<(), _>(
+                &reporting_addr,
+                &Symbol::new(env, "record_large_tx"),
+                (
+                    contract,
+                    function,
+                    address.clone(),
+                    amount_usd,
+                    env.ledger().timestamp(),
+                )
+                    .into_val(env),
+            );
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -204,6 +273,15 @@ impl TreasuryContract {
 
     /// Accept deposits of approved Stellar assets only.
     pub fn deposit(env: Env, from: Address, token: Address, amount: i128) -> Result<(), Error> {
+        // Check pause guardian before any state mutation
+        if let Some(guardian) = env
+            .storage()
+            .persistent()
+            .get::<DataKey, Address>(&DataKey::PauseGuardian)
+        {
+            require_not_paused(&env, &guardian);
+        }
+
         from.require_auth();
         if !Self::_is_token_approved(&env, &token) {
             panic!("Token not approved");
@@ -229,6 +307,15 @@ impl TreasuryContract {
         recipient: Address,
         amount: i128,
     ) -> Result<(), Error> {
+        // Check pause guardian before any state mutation
+        if let Some(guardian) = env
+            .storage()
+            .persistent()
+            .get::<DataKey, Address>(&DataKey::PauseGuardian)
+        {
+            require_not_paused(&env, &guardian);
+        }
+
         let _guard = ReentrancyGuard::enter(&env, Symbol::new(&env, "allocate"));
         let admin = env
             .storage()
@@ -239,6 +326,50 @@ impl TreasuryContract {
 
         if !Self::_is_token_approved(&env, &token) {
             return Err(Error::TokenNotApproved);
+        }
+
+        // Check for large transaction threshold and trigger regulatory reporting
+        Self::_check_and_report_large_tx(&env, Symbol::new(&env, "treasury"), Symbol::new(&env, "allocate"), &recipient, amount);
+
+        let threshold: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::MultisigThreshold)
+            .unwrap_or(50_000);
+
+        if amount > threshold {
+            // Above threshold — requires multi-sig approval (Issue #752)
+            let pending_count: u32 = env
+                .storage()
+                .persistent()
+                .get(&DataKey::PendingAllocationCount)
+                .unwrap_or(0);
+
+            let pending = PendingAllocation {
+                id: pending_count,
+                token: token.clone(),
+                recipient: recipient.clone(),
+                amount,
+                approvals_count: 1,
+                executed: false,
+                created_at: env.ledger().timestamp(),
+            };
+
+            env.storage()
+                .persistent()
+                .set(&DataKey::PendingAllocation(pending_count), &pending);
+            env.storage()
+                .persistent()
+                .set(&DataKey::AllocationApproval(pending_count, admin.clone()), &true);
+            env.storage()
+                .persistent()
+                .set(&DataKey::PendingAllocationCount, &(pending_count + 1));
+
+            env.events().publish(
+                (symbol_short!("allocate"), symbol_short!("pending")),
+                (pending_count, recipient, amount),
+            );
+            return Ok(());
         }
 
         token::Client::new(&env, &token)
@@ -267,12 +398,110 @@ impl TreasuryContract {
         Ok(())
     }
 
+    /// Set multi-sig withdrawal threshold amount (admin only).
+    pub fn set_multisig_threshold(env: Env, threshold: i128) -> Result<(), Error> {
+        let admin = env
+            .storage()
+            .persistent()
+            .get::<DataKey, Address>(&DataKey::Admin)
+            .ok_or(Error::NotInitialized)?;
+        admin.require_auth();
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::MultisigThreshold, &threshold);
+        Ok(())
+    }
+
+    /// Multi-sig approval for pending high-value allocations (Issue #752).
+    pub fn approve_pending_allocation(
+        env: Env,
+        approver: Address,
+        pending_id: u32,
+    ) -> Result<(), Error> {
+        approver.require_auth();
+
+        let mut pending: PendingAllocation = env
+            .storage()
+            .persistent()
+            .get(&DataKey::PendingAllocation(pending_id))
+            .ok_or(Error::NotInitialized)?;
+
+        if pending.executed {
+            panic!("Pending allocation already executed");
+        }
+
+        let approval_key = DataKey::AllocationApproval(pending_id, approver.clone());
+        if env.storage().persistent().has(&approval_key) {
+            panic!("Approver already signed pending allocation");
+        }
+
+        env.storage().persistent().set(&approval_key, &true);
+        pending.approvals_count += 1;
+
+        if pending.approvals_count >= 2 {
+            // Multi-sig threshold reached — execute transfer
+            token::Client::new(&env, &pending.token).transfer(
+                &env.current_contract_address(),
+                &pending.recipient,
+                &pending.amount,
+            );
+
+            pending.executed = true;
+
+            let count: u32 = env
+                .storage()
+                .persistent()
+                .get(&DataKey::AllocationCount)
+                .unwrap_or(0u32);
+            env.storage().persistent().set(
+                &DataKey::Allocation(count),
+                &AllocationHistory {
+                    token: pending.token.clone(),
+                    recipient: pending.recipient.clone(),
+                    amount: pending.amount,
+                    timestamp: env.ledger().timestamp(),
+                },
+            );
+            env.storage()
+                .persistent()
+                .set(&DataKey::AllocationCount, &(count + 1));
+
+            env.events().publish(
+                (symbol_short!("allocate"), symbol_short!("executed")),
+                (pending_id, pending.recipient.clone(), pending.amount),
+            );
+        }
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::PendingAllocation(pending_id), &pending);
+
+        Ok(())
+    }
+
+    /// Read a pending allocation by ID.
+    pub fn get_pending_allocation(env: Env, pending_id: u32) -> Option<PendingAllocation> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::PendingAllocation(pending_id))
+    }
+
     /// Distribute tokens to stakers — pro-rata handled by staking contract.
     pub fn distribute_to_stakers(
         env: Env,
         token: Address,
         total_amount: i128,
     ) -> Result<(), Error> {
+        // Check pause guardian before any state mutation
+        if let Some(guardian) = env
+            .storage()
+            .persistent()
+            .get::<DataKey, Address>(&DataKey::PauseGuardian)
+        {
+            require_not_paused(&env, &guardian);
+        }
+
         let _guard = ReentrancyGuard::enter(&env, Symbol::new(&env, "distribute"));
         let admin = env
             .storage()

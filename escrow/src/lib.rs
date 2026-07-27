@@ -1,8 +1,6 @@
 #![no_std]
-use shared::events::{
-    emit_escrow_event, evt_escrow_created, evt_escrow_disputed, evt_escrow_refunded,
-    evt_escrow_released, evt_escrow_resolved,
-};
+#![allow(deprecated)]
+#![allow(dead_code)]
 use shared::{EscrowRecord, EscrowStatus};
 use soroban_sdk::{contract, contractimpl, contracttype, symbol_short, token, Address, Env, Symbol, Vec, IntoVal, BytesN};
 
@@ -645,6 +643,110 @@ impl EscrowContract {
         env.events().publish(
             (symbol_short!("partial"), escrow.id),
             (escrow.sessions_completed, amount_to_release),
+        );
+    }
+
+    /// Batch release for multiple sessions at once (gas optimization).
+    /// Releases proportional payment for N completed sessions atomically.
+    pub fn batch_release(env: Env, admin: Address, escrow_id: u64, sessions_to_release: u32) {
+        let key = (symbol_short!("ESCROW"), escrow_id);
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, ESCROW_TTL_THRESHOLD, ESCROW_TTL_BUMP);
+
+        let mut escrow: Escrow = env.storage().persistent().get(&key).expect("Escrow not found");
+
+        // Verify admin
+        let stored_admin: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Admin)
+            .expect("Admin not found");
+        env.storage()
+            .persistent()
+            .extend_ttl(&DataKey::Admin, ESCROW_TTL_THRESHOLD, ESCROW_TTL_BUMP);
+        admin.require_auth();
+        if admin != stored_admin {
+            panic!("Only admin can batch release");
+        }
+
+        if escrow.status != EscrowStatus::Active {
+            panic!("Escrow not active");
+        }
+
+        if sessions_to_release == 0 {
+            panic!("Must release at least one session");
+        }
+
+        let remaining_sessions = escrow.total_sessions - escrow.sessions_completed;
+        if sessions_to_release > remaining_sessions {
+            panic!("Cannot release more sessions than remaining");
+        }
+
+        // Calculate amount per session with remainder handling
+        let per_session_amount = escrow
+            .quoted_token_amount
+            .checked_div(escrow.total_sessions as i128)
+            .expect("Division error");
+
+        // For the last batch, release all remaining to handle dust
+        let amount_to_release = if escrow.sessions_completed + sessions_to_release
+            == escrow.total_sessions
+        {
+            escrow.amount
+        } else {
+            per_session_amount
+                .checked_mul(sessions_to_release as i128)
+                .expect("Overflow")
+        };
+
+        let fee_bps: u32 = env.storage().persistent().get(&DataKey::FeeBps).unwrap_or(0u32);
+        env.storage()
+            .persistent()
+            .extend_ttl(&DataKey::FeeBps, ESCROW_TTL_THRESHOLD, ESCROW_TTL_BUMP);
+
+        let platform_fee: i128 = amount_to_release
+            .checked_mul(fee_bps as i128)
+            .expect("Overflow")
+            .checked_div(10_000)
+            .expect("Division error");
+        let net_amount: i128 = amount_to_release
+            .checked_sub(platform_fee)
+            .expect("Underflow");
+
+        let treasury: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Treasury)
+            .expect("Treasury not found");
+        env.storage()
+            .persistent()
+            .extend_ttl(&DataKey::Treasury, ESCROW_TTL_THRESHOLD, ESCROW_TTL_BUMP);
+
+        let token_client = token::Client::new(&env, &escrow.token_address);
+
+        if platform_fee > 0 {
+            token_client.transfer(&env.current_contract_address(), &treasury, &platform_fee);
+        }
+
+        token_client.transfer(&env.current_contract_address(), &escrow.mentor, &net_amount);
+
+        escrow.sessions_completed += sessions_to_release;
+        escrow.amount = escrow.amount.checked_sub(amount_to_release).expect("Underflow");
+        escrow.platform_fee = escrow.platform_fee.checked_add(platform_fee).expect("Overflow");
+        escrow.net_amount = escrow.net_amount.checked_add(net_amount).expect("Overflow");
+
+        if escrow.sessions_completed == escrow.total_sessions {
+            escrow.status = EscrowStatus::Released;
+            let session_key = (SESSION_KEY, escrow.session_id.clone());
+            env.storage().persistent().remove(&session_key);
+        }
+
+        env.storage().persistent().set(&key, &escrow);
+
+        env.events().publish(
+            (symbol_short!("batch"), escrow.id),
+            (sessions_to_release, amount_to_release, remaining_sessions - sessions_to_release),
         );
     }
 
