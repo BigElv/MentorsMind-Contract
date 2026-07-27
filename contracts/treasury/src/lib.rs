@@ -104,6 +104,18 @@ pub struct TreasuryTokenApprovalEvent {
     pub approved: bool,
 }
 
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PendingAllocation {
+    pub id: u32,
+    pub token: Address,
+    pub recipient: Address,
+    pub amount: i128,
+    pub approvals_count: u32,
+    pub executed: bool,
+    pub created_at: u64,
+}
+
 // ---------------------------------------------------------------------------
 // Storage keys
 // ---------------------------------------------------------------------------
@@ -112,19 +124,17 @@ pub struct TreasuryTokenApprovalEvent {
 #[derive(Clone)]
 pub enum DataKey {
     Admin,
-    /// The timelock contract whose `execute` is the only allowed caller of
-    /// `buyback_and_burn`. Set during `initialize`.
     Timelock,
     StakingContract,
-    /// Optional pause guardian contract for circuit-breaker functionality.
     PauseGuardian,
     AllocationCount,
-    /// Individual allocation history: DataKey::Allocation(index) → AllocationHistory
     Allocation(u32),
-    /// Token whitelist: DataKey::ApprovedToken(token_address) → bool
     ApprovedToken(Address),
-    /// Regulatory reporting contract address
     RegulatoryReporting,
+    MultisigThreshold,
+    PendingAllocationCount,
+    PendingAllocation(u32),
+    AllocationApproval(u32, Address),
 }
 
 // ---------------------------------------------------------------------------
@@ -321,6 +331,47 @@ impl TreasuryContract {
         // Check for large transaction threshold and trigger regulatory reporting
         Self::_check_and_report_large_tx(&env, Symbol::new(&env, "treasury"), Symbol::new(&env, "allocate"), &recipient, amount);
 
+        let threshold: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::MultisigThreshold)
+            .unwrap_or(50_000);
+
+        if amount > threshold {
+            // Above threshold — requires multi-sig approval (Issue #752)
+            let pending_count: u32 = env
+                .storage()
+                .persistent()
+                .get(&DataKey::PendingAllocationCount)
+                .unwrap_or(0);
+
+            let pending = PendingAllocation {
+                id: pending_count,
+                token: token.clone(),
+                recipient: recipient.clone(),
+                amount,
+                approvals_count: 1,
+                executed: false,
+                created_at: env.ledger().timestamp(),
+            };
+
+            env.storage()
+                .persistent()
+                .set(&DataKey::PendingAllocation(pending_count), &pending);
+            env.storage()
+                .persistent()
+                .set(&DataKey::AllocationApproval(pending_count, admin.clone()), &true);
+            env.storage()
+                .persistent()
+                .set(&DataKey::PendingAllocationCount, &(pending_count + 1));
+
+            env.events().publish(
+                (symbol_short!("allocate"), symbol_short!("pending")),
+                (pending_count, recipient, amount),
+            );
+            return Ok(());
+        }
+
         token::Client::new(&env, &token)
             .transfer(&env.current_contract_address(), &recipient, &amount);
 
@@ -345,6 +396,95 @@ impl TreasuryContract {
             amount,
         );
         Ok(())
+    }
+
+    /// Set multi-sig withdrawal threshold amount (admin only).
+    pub fn set_multisig_threshold(env: Env, threshold: i128) -> Result<(), Error> {
+        let admin = env
+            .storage()
+            .persistent()
+            .get::<DataKey, Address>(&DataKey::Admin)
+            .ok_or(Error::NotInitialized)?;
+        admin.require_auth();
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::MultisigThreshold, &threshold);
+        Ok(())
+    }
+
+    /// Multi-sig approval for pending high-value allocations (Issue #752).
+    pub fn approve_pending_allocation(
+        env: Env,
+        approver: Address,
+        pending_id: u32,
+    ) -> Result<(), Error> {
+        approver.require_auth();
+
+        let mut pending: PendingAllocation = env
+            .storage()
+            .persistent()
+            .get(&DataKey::PendingAllocation(pending_id))
+            .ok_or(Error::NotInitialized)?;
+
+        if pending.executed {
+            panic!("Pending allocation already executed");
+        }
+
+        let approval_key = DataKey::AllocationApproval(pending_id, approver.clone());
+        if env.storage().persistent().has(&approval_key) {
+            panic!("Approver already signed pending allocation");
+        }
+
+        env.storage().persistent().set(&approval_key, &true);
+        pending.approvals_count += 1;
+
+        if pending.approvals_count >= 2 {
+            // Multi-sig threshold reached — execute transfer
+            token::Client::new(&env, &pending.token).transfer(
+                &env.current_contract_address(),
+                &pending.recipient,
+                &pending.amount,
+            );
+
+            pending.executed = true;
+
+            let count: u32 = env
+                .storage()
+                .persistent()
+                .get(&DataKey::AllocationCount)
+                .unwrap_or(0u32);
+            env.storage().persistent().set(
+                &DataKey::Allocation(count),
+                &AllocationHistory {
+                    token: pending.token.clone(),
+                    recipient: pending.recipient.clone(),
+                    amount: pending.amount,
+                    timestamp: env.ledger().timestamp(),
+                },
+            );
+            env.storage()
+                .persistent()
+                .set(&DataKey::AllocationCount, &(count + 1));
+
+            env.events().publish(
+                (symbol_short!("allocate"), symbol_short!("executed")),
+                (pending_id, pending.recipient.clone(), pending.amount),
+            );
+        }
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::PendingAllocation(pending_id), &pending);
+
+        Ok(())
+    }
+
+    /// Read a pending allocation by ID.
+    pub fn get_pending_allocation(env: Env, pending_id: u32) -> Option<PendingAllocation> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::PendingAllocation(pending_id))
     }
 
     /// Distribute tokens to stakers — pro-rata handled by staking contract.
