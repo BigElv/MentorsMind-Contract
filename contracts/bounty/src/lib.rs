@@ -29,6 +29,8 @@ pub enum DataKey {
     BountyCount,
     Bounty(u32),
     Claim(u32, Address), // (bounty_id, learner)
+    ClaimEvidence(u32, Address), // (bounty_id, learner)
+    BountyLock(u32),
 }
 
 // ---------------------------------------------------------------------------
@@ -73,6 +75,8 @@ pub struct ClaimRecord {
     pub learner: Address,
     pub claimed_at: u64,
     pub status: ClaimStatus,
+    pub submission_hash: BytesN<32>,
+    pub submission_uri_hash: BytesN<32>,
 }
 
 // ---------------------------------------------------------------------------
@@ -120,6 +124,14 @@ pub struct BountyRefundedEvent {
     pub bounty_id: u32,
     pub poster: Address,
     pub reward: i128,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EvidenceBundle {
+    pub submission_hash: BytesN<32>,
+    pub uri_hash: BytesN<32>,
+    pub submitted_at: u64,
 }
 
 // ---------------------------------------------------------------------------
@@ -228,8 +240,23 @@ impl BountyContract {
     }
 
     /// Learner signals completion of the bounty challenge.
-    pub fn claim_bounty(env: Env, learner: Address, bounty_id: u32) {
+    pub fn claim_bounty(
+        env: Env,
+        learner: Address,
+        bounty_id: u32,
+        submission_hash: BytesN<32>,
+        submission_uri_hash: BytesN<32>,
+    ) {
         learner.require_auth();
+
+        // Validate evidence hashes are not zero
+        let zero_hash = BytesN::from_array(&env, &[0u8; 32]);
+        if submission_hash == zero_hash {
+            panic!("Submission hash cannot be zero");
+        }
+        if submission_uri_hash == zero_hash {
+            panic!("Submission URI hash cannot be zero");
+        }
 
         let bounty: BountyRecord = env
             .storage()
@@ -253,11 +280,25 @@ impl BountyContract {
             learner: learner.clone(),
             claimed_at: env.ledger().timestamp(),
             status: ClaimStatus::Pending,
+            submission_hash: submission_hash.clone(),
+            submission_uri_hash: submission_uri_hash.clone(),
         };
         env.storage().persistent().set(&claim_key, &claim);
         env.storage()
             .persistent()
             .extend_ttl(&claim_key, TTL_THRESHOLD, TTL_BUMP);
+
+        // Store evidence bundle
+        let evidence = EvidenceBundle {
+            submission_hash,
+            uri_hash: submission_uri_hash,
+            submitted_at: env.ledger().timestamp(),
+        };
+        let evidence_key = DataKey::ClaimEvidence(bounty_id, learner.clone());
+        env.storage().persistent().set(&evidence_key, &evidence);
+        env.storage()
+            .persistent()
+            .extend_ttl(&evidence_key, TTL_THRESHOLD, TTL_BUMP);
 
         // Transition bounty to Claimed if still Open
         if bounty.status == BountyStatus::Open {
@@ -288,8 +329,27 @@ impl BountyContract {
 
     /// Verified mentor confirms a learner completed the challenge. Releases reward to learner.
     /// First verified claim wins; subsequent calls panic.
-    pub fn verify_completion(env: Env, mentor: Address, bounty_id: u32, learner: Address) {
+    pub fn verify_completion(
+        env: Env,
+        mentor: Address,
+        bounty_id: u32,
+        learner: Address,
+        reviewer_notes_hash: BytesN<32>,
+    ) {
+        let lock_key = DataKey::BountyLock(bounty_id);
+        if env.storage().persistent().get(&lock_key).unwrap_or(false) {
+            panic!("Bounty is locked");
+        }
+        env.storage().persistent().set(&lock_key, &true);
+
         mentor.require_auth();
+
+        // Validate reviewer notes hash is not zero
+        let zero_hash = BytesN::from_array(&env, &[0u8; 32]);
+        if reviewer_notes_hash == zero_hash {
+            env.storage().persistent().set(&lock_key, &false);
+            panic!("Reviewer notes hash cannot be zero");
+        }
 
         // Check mentor is verified via the verification contract
         let ver_contract: Address = env
@@ -304,6 +364,7 @@ impl BountyContract {
                 args
             });
         if !is_verified {
+            env.storage().persistent().set(&lock_key, &false);
             panic!("Mentor is not verified");
         }
 
@@ -314,9 +375,11 @@ impl BountyContract {
             .expect("Bounty not found");
 
         if bounty.status == BountyStatus::Verified {
+            env.storage().persistent().set(&lock_key, &false);
             panic!("Bounty already verified");
         }
         if bounty.status == BountyStatus::Refunded {
+            env.storage().persistent().set(&lock_key, &false);
             panic!("Bounty already refunded");
         }
 
@@ -328,13 +391,11 @@ impl BountyContract {
             .expect("No claim found for this learner");
 
         if claim.status == ClaimStatus::Disputed {
+            env.storage().persistent().set(&lock_key, &false);
             panic!("Claim is disputed");
         }
 
-        // Release reward to learner
-        let token_client = token::Client::new(&env, &bounty.token);
-        token_client.transfer(&env.current_contract_address(), &learner, &bounty.reward);
-
+        // Checks-Effects-Interactions: Update state to Verified BEFORE token transfer
         claim.status = ClaimStatus::Verified;
         env.storage().persistent().set(&claim_key, &claim);
         env.storage()
@@ -351,6 +412,13 @@ impl BountyContract {
             .extend_ttl(&DataKey::Bounty(bounty_id), TTL_THRESHOLD, TTL_BUMP);
         env.storage().instance().extend_ttl(TTL_THRESHOLD, TTL_BUMP);
 
+        // Release reward to learner after state update
+        let token_client = token::Client::new(&env, &bounty.token);
+        token_client.transfer(&env.current_contract_address(), &learner, &bounty.reward);
+
+        // Unlock bounty lock
+        env.storage().persistent().set(&lock_key, &false);
+
         emit_bounty_event(
             &env,
             evt_bounty_verified(&env),
@@ -364,7 +432,12 @@ impl BountyContract {
     }
 
     /// Poster disputes a learner's claim within 48h of the claim.
-    pub fn dispute_completion(env: Env, bounty_id: u32, learner: Address) {
+    pub fn dispute_completion(
+        env: Env,
+        bounty_id: u32,
+        learner: Address,
+        dispute_evidence_hash: BytesN<32>,
+    ) {
         let bounty: BountyRecord = env
             .storage()
             .persistent()
@@ -372,6 +445,12 @@ impl BountyContract {
             .expect("Bounty not found");
 
         bounty.poster.require_auth();
+
+        // Validate dispute evidence hash is not zero
+        let zero_hash = BytesN::from_array(&env, &[0u8; 32]);
+        if dispute_evidence_hash == zero_hash {
+            panic!("Dispute evidence hash cannot be zero");
+        }
 
         if bounty.status == BountyStatus::Verified {
             panic!("Bounty already verified");
@@ -492,6 +571,14 @@ impl BountyContract {
             .persistent()
             .get(&DataKey::BountyCount)
             .unwrap_or(0)
+    }
+
+    /// Get claim evidence for a bounty and learner.
+    pub fn get_claim_evidence(env: Env, bounty_id: u32, learner: Address) -> EvidenceBundle {
+        env.storage()
+            .persistent()
+            .get(&DataKey::ClaimEvidence(bounty_id, learner))
+            .expect("Evidence not found")
     }
 }
 

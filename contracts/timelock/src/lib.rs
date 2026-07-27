@@ -4,7 +4,7 @@ use shared::events::{
     evt_timelock_init, evt_timelock_sched,
 };
 use soroban_sdk::{
-    contract, contractimpl, contracterror, contracttype, symbol_short, Address, Bytes, BytesN, Env,
+    contract, contractimpl, contracterror, contracttype, Address, Bytes, BytesN, Env,
     Symbol, Val, Vec,
 };
 use soroban_sdk::xdr::ToXdr;

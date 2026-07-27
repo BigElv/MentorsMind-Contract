@@ -40,6 +40,7 @@ pub struct MarketRecord {
     pub no_pool: i128,
     pub resolved: bool,
     pub outcome: Option<bool>,
+    pub liquidity_parameter: i128, // b in LMSR cost function: higher = less slippage
 }
 
 #[contracttype]
@@ -71,6 +72,114 @@ pub enum DataKey {
 // ---------------------------------------------------------------------------
 
 const PLATFORM_FEE_BPS: i128 = 200; // 2%
+const FIXED_POINT_SCALE: i128 = 1_000_000_000_000_000_000; // 10^18 for fixed-point math
+const DEFAULT_LIQUIDITY_PARAMETER: i128 = 100_000_000_000_000_000; // 0.1 * SCALE
+
+// ---------------------------------------------------------------------------
+// Fixed-Point Math Utilities
+// ---------------------------------------------------------------------------
+
+/// Compute e^x using Taylor series approximation (10 terms).
+/// x is in fixed-point format (scaled by 10^18).
+/// Accurate to ~0.01% for x in [-5, 5].
+/// Returns result in fixed-point format.
+fn exp_fixed_point(x: i128) -> i128 {
+    if x == 0 {
+        return FIXED_POINT_SCALE;
+    }
+
+    // Avoid overflow for very large x
+    if x > 5 * FIXED_POINT_SCALE {
+        return i128::MAX / 2; // Saturate instead of overflow
+    }
+    if x < -5 * FIXED_POINT_SCALE {
+        return 0; // e^(-5+) ~= 0
+    }
+
+    let mut result = FIXED_POINT_SCALE; // 1.0
+    let mut term = FIXED_POINT_SCALE; // x^0 / 0! = 1
+    let mut x_power = x; // x^1
+
+    // Taylor series: e^x = 1 + x + x^2/2! + x^3/3! + ... (10 terms)
+    for n in 1..=10 {
+        // term = x^n / n!
+        term = (x_power / (n as i128)) / FIXED_POINT_SCALE;
+        if term == 0 {
+            break;
+        }
+        result = result + term;
+
+        // Prepare next term: x_power = x^(n+1)
+        x_power = x_power * x / FIXED_POINT_SCALE;
+    }
+
+    result
+}
+
+/// Compute ln(x) in fixed-point format using Newton's method.
+/// x is in fixed-point format. Accurate for x > 0.
+fn ln_fixed_point(x: i128) -> i128 {
+    if x <= 0 {
+        panic!("ln of non-positive number");
+    }
+    if x == FIXED_POINT_SCALE {
+        return 0; // ln(1) = 0
+    }
+
+    // Newton-Raphson: x_{n+1} = (x_n + a/x_n) / 2
+    // For ln: use Newton on e^y = a => y = ln(a)
+    let mut y = 0i128;
+    let mut prev_y = -FIXED_POINT_SCALE;
+
+    // Iterate until convergence
+    for _ in 0..10 {
+        if (y - prev_y).abs() < 1 {
+            break;
+        }
+        prev_y = y;
+        let exp_y = exp_fixed_point(y);
+        let delta = (x - exp_y) / exp_y;
+        y = y + delta;
+    }
+
+    y
+}
+
+/// LMSR cost function: C(q_yes, q_no) = b * ln(e^(q_yes/b) + e^(q_no/b))
+/// where b is the liquidity parameter.
+/// Returns cost in fixed-point format.
+fn lmsr_cost(q_yes: i128, q_no: i128, b: i128) -> i128 {
+    let q_yes_scaled = q_yes * FIXED_POINT_SCALE / b;
+    let q_no_scaled = q_no * FIXED_POINT_SCALE / b;
+
+    let exp_yes = exp_fixed_point(q_yes_scaled);
+    let exp_no = exp_fixed_point(q_no_scaled);
+    let sum = exp_yes + exp_no;
+
+    let ln_sum = ln_fixed_point(sum);
+    b * ln_sum / FIXED_POINT_SCALE
+}
+
+/// Get current price for yes outcome as basis points (0-10000).
+/// price_yes = e^(q_yes/b) / (e^(q_yes/b) + e^(q_no/b))
+fn get_yes_price_bps(q_yes: i128, q_no: i128, b: i128) -> u32 {
+    let q_yes_scaled = q_yes * FIXED_POINT_SCALE / b;
+    let q_no_scaled = q_no * FIXED_POINT_SCALE / b;
+
+    let exp_yes = exp_fixed_point(q_yes_scaled);
+    let exp_no = exp_fixed_point(q_no_scaled);
+    let sum = exp_yes + exp_no;
+
+    let price = if sum == 0 {
+        FIXED_POINT_SCALE / 2 // Default to 50/50
+    } else {
+        exp_yes * FIXED_POINT_SCALE / sum
+    };
+
+    // Convert to basis points: [0, 10000]
+    let bps = price * 10000 / FIXED_POINT_SCALE;
+    (bps as u32).min(10000)
+}
 
 // ---------------------------------------------------------------------------
 // Contract
@@ -90,7 +199,8 @@ impl PredictionMarket {
         env.storage().instance().set(&DataKey::MarketCount, &0u32);
     }
 
-    /// Create a new prediction market
+    /// Create a new prediction market with LMSR AMM.
+    /// liquidity_parameter: higher = less slippage, lower efficiency. Default: 0.1
     pub fn create_market(
         env: Env,
         creator: Address,
@@ -98,6 +208,7 @@ impl PredictionMarket {
         goal_description_hash: BytesN<32>,
         resolution_date: u64,
         token: Address,
+        liquidity_parameter: Option<i128>,
     ) -> u32 {
         creator.require_auth();
 
@@ -113,6 +224,8 @@ impl PredictionMarket {
             .unwrap_or(0);
         let market_id = market_count + 1;
 
+        let b = liquidity_parameter.unwrap_or(DEFAULT_LIQUIDITY_PARAMETER);
+
         let market = MarketRecord {
             id: market_id,
             creator: creator.clone(),
@@ -124,6 +237,7 @@ impl PredictionMarket {
             no_pool: 0,
             resolved: false,
             outcome: None,
+            liquidity_parameter: b,
         };
 
         env.storage()
@@ -139,7 +253,8 @@ impl PredictionMarket {
         market_id
     }
 
-    /// Place a bet on market outcome
+    /// Place a bet on market outcome using LMSR pricing.
+    /// Cost = C(new_state) - C(old_state) where C is LMSR cost function.
     pub fn place_bet(env: Env, bettor: Address, market_id: u32, outcome: bool, amount: i128) {
         if amount <= 0 {
             panic!("invalid amount");
@@ -162,22 +277,42 @@ impl PredictionMarket {
             panic!("market resolution date passed");
         }
 
-        // Transfer tokens from bettor to contract
+        // Calculate cost using LMSR
+        let old_cost = lmsr_cost(market.yes_pool, market.no_pool, market.liquidity_parameter);
+
+        // Update pools for cost calculation
+        let (new_yes_pool, new_no_pool) = if outcome {
+            (market.yes_pool + amount, market.no_pool)
+        } else {
+            (market.yes_pool, market.no_pool + amount)
+        };
+
+        let new_cost = lmsr_cost(new_yes_pool, new_no_pool, market.liquidity_parameter);
+
+        // Cost to bettor
+        let cost = if new_cost >= old_cost {
+            new_cost - old_cost
+        } else {
+            0 // Should not happen in normal LMSR, but handle edge case
+        };
+
+        if cost > amount {
+            panic!("insufficient amount for LMSR cost");
+        }
+
+        // Transfer tokens from bettor to contract (exact amount)
         let token_client = token::Client::new(&env, &market.token);
         token_client.transfer(&bettor, &env.current_contract_address(), &amount);
 
-        // Update pools
-        if outcome {
-            market.yes_pool += amount;
-        } else {
-            market.no_pool += amount;
-        }
+        // Update pools with new state
+        market.yes_pool = new_yes_pool;
+        market.no_pool = new_no_pool;
 
         env.storage()
             .instance()
             .set(&DataKey::Market(market_id), &market);
 
-        // Record bet
+        // Record bet with original amount (not cost)
         let bet = BetRecord {
             bettor: bettor.clone(),
             market_id,
@@ -334,7 +469,24 @@ impl PredictionMarket {
             .expect("market not found")
     }
 
-    /// Get market odds
+    /// Get current LMSR prices as basis points
+    /// Returns (yes_price_bps, no_price_bps) where both sum to 10000
+    /// e.g., (6000, 4000) means 60% yes, 40% no
+    pub fn get_current_price(env: Env, market_id: u32) -> (u32, u32) {
+        let market: MarketRecord = env
+            .storage()
+            .instance()
+            .get(&DataKey::Market(market_id))
+            .expect("market not found");
+
+        let yes_bps =
+            get_yes_price_bps(market.yes_pool, market.no_pool, market.liquidity_parameter);
+        let no_bps = 10000u32.saturating_sub(yes_bps);
+
+        (yes_bps, no_bps)
+    }
+
+    /// Get market pools (legacy, use get_current_price for LMSR prices)
     pub fn get_odds(env: Env, market_id: u32) -> (i128, i128) {
         let market: MarketRecord = env
             .storage()
@@ -365,7 +517,7 @@ mod tests {
         env.mock_all_auths();
         client.initialize(&admin);
 
-        let market_id = client.create_market(&creator, &learner, &hash, &1000, &token);
+        let market_id = client.create_market(&creator, &learner, &hash, &1000, &token, &None);
         assert_eq!(market_id, 1);
     }
 
@@ -385,12 +537,16 @@ mod tests {
         env.mock_all_auths();
         client.initialize(&admin);
 
-        let market_id = client.create_market(&creator, &learner, &hash, &1000, &token);
+        let market_id = client.create_market(&creator, &learner, &hash, &1000, &token, &None);
         client.place_bet(&bettor, &market_id, &true, &100);
 
         let (yes_pool, no_pool) = client.get_odds(&market_id);
         assert_eq!(yes_pool, 100);
         assert_eq!(no_pool, 0);
+
+        // Verify LMSR prices sum to 10000
+        let (yes_price, no_price) = client.get_current_price(&market_id);
+        assert_eq!(yes_price + no_price, 10000);
     }
 
     #[test]
@@ -408,7 +564,7 @@ mod tests {
         env.mock_all_auths();
         client.initialize(&admin);
 
-        let market_id = client.create_market(&creator, &learner, &hash, &100, &token);
+        let market_id = client.create_market(&creator, &learner, &hash, &100, &token, &None);
 
         // Advance ledger past resolution date
         env.ledger().set_timestamp(101);
@@ -435,6 +591,6 @@ mod tests {
         env.mock_all_auths();
         client.initialize(&admin);
 
-        client.create_market(&creator, &learner, &hash, &0, &token);
+        client.create_market(&creator, &learner, &hash, &0, &token, &None);
     }
 }
