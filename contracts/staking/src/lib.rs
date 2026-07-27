@@ -475,27 +475,31 @@ impl StakingContract {
         let count = Self::get_staker_count(env.clone());
         let end = (offset + limit).min(count);
 
+        // === OPTIMIZATION: Batch storage operations to reduce N+1 query problem ===
+        let mut batch_updates: soroban_sdk::Vec<(Address, i128)> = soroban_sdk::Vec::new(&env);
+        
+        // First pass: collect all staker data and calculate shares
         for i in offset..end {
             if let Some(staker) = env.storage().persistent().get::<_, Address>(&DataKey::StakerAt(i)) {
-                let record: StakeRecord = env
-                    .storage()
-                    .persistent()
-                    .get(&DataKey::Stake(staker.clone()))
-                    .unwrap();
-
-                let share = (record.amount * amount) / total_staked;
-
-                if share > 0 {
-                    let pending: i128 = env
-                        .storage()
-                        .persistent()
-                        .get(&DataKey::PendingRewards(staker.clone()))
-                        .unwrap_or(0);
-                    env.storage()
-                        .persistent()
-                        .set(&DataKey::PendingRewards(staker.clone()), &(pending + share));
+                if let Some(record) = env.storage().persistent().get::<_, StakeRecord>(&DataKey::Stake(staker.clone())) {
+                    let share = (record.amount * amount) / total_staked;
+                    if share > 0 {
+                        batch_updates.push_back((staker, share));
+                    }
                 }
             }
+        }
+        
+        // Second pass: batch update pending rewards
+        for (staker, share) in batch_updates.iter() {
+            let pending: i128 = env
+                .storage()
+                .persistent()
+                .get(&DataKey::PendingRewards(staker.clone()))
+                .unwrap_or(0);
+            env.storage()
+                .persistent()
+                .set(&DataKey::PendingRewards(staker.clone()), &(pending + share));
         }
     }
 

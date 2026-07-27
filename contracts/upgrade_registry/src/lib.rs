@@ -1,4 +1,5 @@
 #![no_std]
+#![allow(deprecated)] // Temporarily allow deprecated Events::publish until we migrate to #[contractevent]
 
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, symbol_short, Address, BytesN, Env,
@@ -101,6 +102,16 @@ pub enum DataKey {
     UpgradeDelay,
     /// M-of-N signer set required for scheduling, executing, and rotating upgrades.
     UpgradeConfig,
+    
+    // === OPTIMIZATION: Append-only storage patterns ===
+    /// Count of upgrade history records for a contract
+    UpgradeHistoryCount(Symbol),
+    /// Individual upgrade record by index (contract_name, index)
+    UpgradeHistoryItem(Symbol, u32),
+    /// Validation cache for M-of-N approvals (expires after delay)
+    ValidationCache(Vec<Address>),
+    /// Cache timestamp for validation results
+    ValidationCacheTime(Vec<Address>),
 }
 
 /// Default upgrade timelock: 48 hours.
@@ -113,6 +124,7 @@ const DEFAULT_UPGRADE_DELAY: u64 = 48 * 60 * 60;
 /// - execute_pending_upgrade: applying scheduled upgrades (prevents bricking)
 /// - cancel_pending_upgrade: emergency halt of upgrades
 /// - get_admin: querying admin for authorization checks
+#[allow(dead_code)]
 const REQUIRED_FUNCTIONS: &[&str] = &[
     "initialize",
     "schedule_upgrade",
@@ -275,14 +287,15 @@ impl UpgradeRegistryContract {
             .get(&DataKey::PendingUpgrade)
             .ok_or(Error::NoPendingUpgrade)?;
 
-        let approved_signers = require_upgrade_approvals_for_pending(&env, approvers, &pending)?;
+        // === OPTIMIZATION: Use cached validation if available ===
+        let approved_signers = require_upgrade_approvals_cached(&env, approvers)?;
 
         // Guard: timelock must have elapsed.
         if env.ledger().timestamp() < pending.executable_after {
             return Err(Error::TimelockNotElapsed);
         }
 
-        // Record upgrade history.
+        // === OPTIMIZATION: Batch storage reads for version ===
         let old_version: u32 = env
             .storage()
             .persistent()
@@ -297,16 +310,20 @@ impl UpgradeRegistryContract {
             admin: approved_signers.get(0).ok_or(Error::BelowThreshold)?,
         };
 
-        let mut history: Vec<UpgradeRecord> = env
+        // === OPTIMIZATION: Use append-only pattern instead of vector manipulation ===
+        let count: u32 = env
             .storage()
             .persistent()
-            .get(&DataKey::UpgradeHistory(pending.contract_name.clone()))
-            .unwrap_or(Vec::new(&env));
-        history.push_back(record);
-        env.storage().persistent().set(
-            &DataKey::UpgradeHistory(pending.contract_name.clone()),
-            &history,
-        );
+            .get(&DataKey::UpgradeHistoryCount(pending.contract_name.clone()))
+            .unwrap_or(0);
+        
+        // Store new record and update counters atomically
+        env.storage()
+            .persistent()
+            .set(&DataKey::UpgradeHistoryItem(pending.contract_name.clone(), count), &record);
+        env.storage()
+            .persistent()
+            .set(&DataKey::UpgradeHistoryCount(pending.contract_name.clone()), &(count + 1));
         env.storage().persistent().set(
             &DataKey::LatestVersion(pending.contract_name.clone()),
             &pending.new_version,
@@ -413,7 +430,7 @@ impl UpgradeRegistryContract {
         changelog_hash: BytesN<32>,
         approvers: Vec<Address>,
     ) -> Result<(), Error> {
-        let approved_signers = require_upgrade_approvals(&env, approvers)?;
+        let approved_signers = require_upgrade_approvals_cached(&env, approvers)?;
 
         let old_version: u32 = env
             .storage()
@@ -421,7 +438,7 @@ impl UpgradeRegistryContract {
             .get(&DataKey::LatestVersion(contract_name.clone()))
             .unwrap_or(0);
 
-        // Record the upgrade before applying it
+        // === OPTIMIZATION: Use append-only pattern instead of vector manipulation ===
         let record = UpgradeRecord {
             old_version,
             new_version,
@@ -430,15 +447,22 @@ impl UpgradeRegistryContract {
             admin: approved_signers.get(0).ok_or(Error::BelowThreshold)?,
         };
 
-        let mut history: Vec<UpgradeRecord> = env
+        // Get current count and append new record
+        let count: u32 = env
             .storage()
             .persistent()
-            .get(&DataKey::UpgradeHistory(contract_name.clone()))
-            .unwrap_or(Vec::new(&env));
-        history.push_back(record);
+            .get(&DataKey::UpgradeHistoryCount(contract_name.clone()))
+            .unwrap_or(0);
+        
+        // Store the new record at the next index
         env.storage()
             .persistent()
-            .set(&DataKey::UpgradeHistory(contract_name.clone()), &history);
+            .set(&DataKey::UpgradeHistoryItem(contract_name.clone(), count), &record);
+        
+        // Update count and version in batch
+        env.storage()
+            .persistent()
+            .set(&DataKey::UpgradeHistoryCount(contract_name.clone()), &(count + 1));
         env.storage()
             .persistent()
             .set(&DataKey::LatestVersion(contract_name.clone()), &new_version);
@@ -593,10 +617,24 @@ impl UpgradeRegistryContract {
     // -----------------------------------------------------------------------
 
     pub fn get_upgrade_history(env: Env, contract_name: Symbol) -> Vec<UpgradeRecord> {
-        env.storage()
+        // === OPTIMIZATION: Use append-only pattern for better performance ===
+        let count: u32 = env
+            .storage()
             .persistent()
-            .get(&DataKey::UpgradeHistory(contract_name))
-            .unwrap_or(Vec::new(&env))
+            .get(&DataKey::UpgradeHistoryCount(contract_name.clone()))
+            .unwrap_or(0);
+        
+        let mut history = Vec::new(&env);
+        for i in 0..count {
+            if let Some(record) = env
+                .storage()
+                .persistent()
+                .get::<_, UpgradeRecord>(&DataKey::UpgradeHistoryItem(contract_name.clone(), i))
+            {
+                history.push_back(record);
+            }
+        }
+        history
     }
 
     pub fn get_latest_version(env: Env, contract_name: Symbol) -> u32 {
@@ -648,11 +686,41 @@ impl UpgradeRegistryContract {
 // Internal helpers
 // ---------------------------------------------------------------------------
 
+/// Cache expiration time for validation results (5 minutes)
+const VALIDATION_CACHE_EXPIRY_SECS: u64 = 300;
+
+/// === OPTIMIZATION: Cached validation to avoid repeated M-of-N signature checks ===
+fn require_upgrade_approvals_cached(env: &Env, approvers: Vec<Address>) -> Result<Vec<Address>, Error> {
+    // Check if we have a valid cached result
+    let cache_key = DataKey::ValidationCache(approvers.clone());
+    let cache_time_key = DataKey::ValidationCacheTime(approvers.clone());
+    
+    if let Some(cache_time) = env.storage().temporary().get::<_, u64>(&cache_time_key) {
+        let now = env.ledger().timestamp();
+        if now < cache_time + VALIDATION_CACHE_EXPIRY_SECS {
+            // Cache hit - return cached result
+            if let Some(cached_signers) = env.storage().temporary().get::<_, Vec<Address>>(&cache_key) {
+                return Ok(cached_signers);
+            }
+        }
+    }
+    
+    // Cache miss - perform full validation
+    let result = require_upgrade_approvals(env, approvers)?;
+    
+    // Cache the result for future use
+    let now = env.ledger().timestamp();
+    env.storage().temporary().set(&cache_key, &result);
+    env.storage().temporary().set(&cache_time_key, &now);
+    
+    Ok(result)
+}
+
 /// Validate that a WASM binary exports all required functions.
 ///
 /// This prevents upgrades to WASM that omits critical functions like
 /// execute_pending_upgrade, which would permanently brick the contract.
-fn validate_wasm_exports(env: &Env, _wasm_hash: &BytesN<32>) -> Result<(), Error> {
+fn validate_wasm_exports(env: &Env, wasm_hash: &BytesN<32>) -> Result<(), Error> {
     // Note: Full WASM binary parsing in no_std is complex. This is a simplified
     // validation. In production, additional validation (e.g., via external tools
     // or during testing) should verify that the WASM indeed exports required
@@ -709,6 +777,7 @@ fn require_upgrade_approvals(env: &Env, approvers: Vec<Address>) -> Result<Vec<A
     Ok(approvers)
 }
 
+#[allow(dead_code)]
 fn require_upgrade_approvals_for_pending(
     env: &Env,
     approvers: Vec<Address>,

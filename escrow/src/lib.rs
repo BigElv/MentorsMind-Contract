@@ -1,4 +1,6 @@
 #![no_std]
+#![allow(deprecated)]
+#![allow(dead_code)]
 use shared::{EscrowRecord, EscrowStatus};
 use soroban_sdk::{contract, contractimpl, contracttype, symbol_short, token, Address, Env, Symbol, Vec, IntoVal, BytesN};
 
