@@ -123,7 +123,9 @@ impl StakingContract {
         env.storage().instance().set(&DataKey::Admin, &admin);
         env.storage().instance().set(&DataKey::MNTToken, &mnt_token);
         if let Some(guardian) = pause_guardian {
-            env.storage().instance().set(&DataKey::PauseGuardian, &guardian);
+            env.storage()
+                .instance()
+                .set(&DataKey::PauseGuardian, &guardian);
         }
         Ok(())
     }
@@ -136,20 +138,34 @@ impl StakingContract {
             .get::<DataKey, Address>(&DataKey::Admin)
             .ok_or(Error::NotInitialized)?;
         admin.require_auth();
-        env.storage().instance().set(&DataKey::PauseGuardian, &guardian);
+        env.storage()
+            .instance()
+            .set(&DataKey::PauseGuardian, &guardian);
         Ok(())
     }
 
     pub fn set_anomaly_detector(env: Env, detector: Address) {
-        let admin: Address = env.storage().instance().get(&DataKey::Admin).expect("Not initialized");
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .expect("Not initialized");
         admin.require_auth();
-        env.storage().instance().set(&DataKey::AnomalyDetector, &detector);
+        env.storage()
+            .instance()
+            .set(&DataKey::AnomalyDetector, &detector);
     }
 
     pub fn set_bypass_anomaly_check(env: Env, bypass: bool) {
-        let admin: Address = env.storage().instance().get(&DataKey::Admin).expect("Not initialized");
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .expect("Not initialized");
         admin.require_auth();
-        env.storage().instance().set(&DataKey::BypassAnomalyCheck, &bypass);
+        env.storage()
+            .instance()
+            .set(&DataKey::BypassAnomalyCheck, &bypass);
     }
 
     /// Stake MNT tokens for a given lock period.
@@ -166,7 +182,11 @@ impl StakingContract {
         lock_period_days: u32,
     ) -> Result<(), Error> {
         // Check pause guardian before any state mutation
-        if let Some(guardian) = env.storage().instance().get::<DataKey, Address>(&DataKey::PauseGuardian) {
+        if let Some(guardian) = env
+            .storage()
+            .instance()
+            .get::<DataKey, Address>(&DataKey::PauseGuardian)
+        {
             require_not_paused(&env, &guardian);
         }
 
@@ -179,9 +199,17 @@ impl StakingContract {
             return Err(Error::InvalidAmount);
         }
 
-        let bypass: bool = env.storage().instance().get(&DataKey::BypassAnomalyCheck).unwrap_or(false);
+        let bypass: bool = env
+            .storage()
+            .instance()
+            .get(&DataKey::BypassAnomalyCheck)
+            .unwrap_or(false);
         if !bypass {
-            if let Some(anomaly_detector) = env.storage().instance().get::<_, Address>(&DataKey::AnomalyDetector) {
+            if let Some(anomaly_detector) = env
+                .storage()
+                .instance()
+                .get::<_, Address>(&DataKey::AnomalyDetector)
+            {
                 let res: u32 = env.invoke_contract(
                     &anomaly_detector,
                     &Symbol::new(&env, "check_anomaly"),
@@ -190,7 +218,10 @@ impl StakingContract {
                 if res == 2 {
                     panic!("UserOnHold");
                 } else if res == 1 {
-                    env.events().publish((Symbol::new(&env, "anomaly_warning"), mentor.clone()), amount);
+                    env.events().publish(
+                        (Symbol::new(&env, "anomaly_warning"), mentor.clone()),
+                        amount,
+                    );
                 }
             }
         }
@@ -216,7 +247,9 @@ impl StakingContract {
         token_client.transfer(&mentor, &env.current_contract_address(), &amount);
 
         let now = env.ledger().timestamp();
-        let lock_seconds = (lock_period_days as u64).checked_mul(86_400u64).expect("Overflow");
+        let lock_seconds = (lock_period_days as u64)
+            .checked_mul(86_400u64)
+            .expect("Overflow");
         let unlock_at = now.checked_add(lock_seconds).expect("Timestamp overflow");
         let tier = compute_tier(amount);
 
@@ -236,10 +269,18 @@ impl StakingContract {
         // Update stakers list and total staked
         let key = DataKey::StakerIndex(mentor.clone());
         if !env.storage().persistent().has(&key) {
-            let count: u32 = env.storage().persistent().get(&DataKey::StakerCount).unwrap_or(0);
-            env.storage().persistent().set(&DataKey::StakerAt(count), &mentor);
+            let count: u32 = env
+                .storage()
+                .persistent()
+                .get(&DataKey::StakerCount)
+                .unwrap_or(0);
+            env.storage()
+                .persistent()
+                .set(&DataKey::StakerAt(count), &mentor);
             env.storage().persistent().set(&key, &count);
-            env.storage().persistent().set(&DataKey::StakerCount, &(count + 1));
+            env.storage()
+                .persistent()
+                .set(&DataKey::StakerCount, &(count + 1));
         }
 
         let total_staked: i128 = env
@@ -247,16 +288,21 @@ impl StakingContract {
             .persistent()
             .get(&DataKey::TotalStaked)
             .unwrap_or(0);
-        env.storage()
-            .persistent()
-            .set(&DataKey::TotalStaked, &(total_staked.checked_add(amount).expect("Overflow")));
+        env.storage().persistent().set(
+            &DataKey::TotalStaked,
+            &(total_staked.checked_add(amount).expect("Overflow")),
+        );
 
         // Record the epoch this staker joined in. Rewards for the epoch that
         // is currently accruing (i.e. not yet snapshotted by
         // `distribute_revenue`) are NOT credited to this staker, since their
         // deposit would otherwise dilute rewards earned by stakers who were
         // present for the whole epoch. Eligibility starts at `current_epoch + 1`.
-        let current_epoch: u64 = env.storage().persistent().get(&DataKey::EpochId).unwrap_or(0);
+        let current_epoch: u64 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::EpochId)
+            .unwrap_or(0);
         let entry_epoch = current_epoch.checked_add(1).expect("Overflow");
         env.storage()
             .persistent()
@@ -333,18 +379,34 @@ impl StakingContract {
         // Update stakers list and total staked
         let key = DataKey::StakerIndex(mentor.clone());
         if let Some(index) = env.storage().persistent().get::<_, u32>(&key) {
-            let count: u32 = env.storage().persistent().get(&DataKey::StakerCount).unwrap_or(0);
+            let count: u32 = env
+                .storage()
+                .persistent()
+                .get(&DataKey::StakerCount)
+                .unwrap_or(0);
             let last_index = count - 1;
-            
+
             if index != last_index {
-                let last_mentor: Address = env.storage().persistent().get(&DataKey::StakerAt(last_index)).unwrap();
-                env.storage().persistent().set(&DataKey::StakerAt(index), &last_mentor);
-                env.storage().persistent().set(&DataKey::StakerIndex(last_mentor), &index);
+                let last_mentor: Address = env
+                    .storage()
+                    .persistent()
+                    .get(&DataKey::StakerAt(last_index))
+                    .unwrap();
+                env.storage()
+                    .persistent()
+                    .set(&DataKey::StakerAt(index), &last_mentor);
+                env.storage()
+                    .persistent()
+                    .set(&DataKey::StakerIndex(last_mentor), &index);
             }
-            
-            env.storage().persistent().remove(&DataKey::StakerAt(last_index));
+
+            env.storage()
+                .persistent()
+                .remove(&DataKey::StakerAt(last_index));
             env.storage().persistent().remove(&key);
-            env.storage().persistent().set(&DataKey::StakerCount, &last_index);
+            env.storage()
+                .persistent()
+                .set(&DataKey::StakerCount, &last_index);
         }
 
         let total_staked: i128 = env
@@ -352,9 +414,10 @@ impl StakingContract {
             .persistent()
             .get(&DataKey::TotalStaked)
             .unwrap_or(0);
-        env.storage()
-            .persistent()
-            .set(&DataKey::TotalStaked, &(total_staked.checked_sub(record.amount).expect("Underflow")));
+        env.storage().persistent().set(
+            &DataKey::TotalStaked,
+            &(total_staked.checked_sub(record.amount).expect("Underflow")),
+        );
 
         emit_staking_event(
             &env,
@@ -387,7 +450,15 @@ impl StakingContract {
     }
 
     pub fn get_staker_count(env: Env) -> u32 {
-        env.storage().persistent().get(&DataKey::StakerCount).unwrap_or(0)
+        env.storage()
+            .persistent()
+            .get(&DataKey::StakerCount)
+            .unwrap_or(0)
+    }
+
+    /// Get a staker address by index (for paginated iteration).
+    pub fn get_staker_at(env: Env, index: u32) -> Option<Address> {
+        env.storage().persistent().get(&DataKey::StakerAt(index))
     }
 
     /// Return all current stakers (Paginated).
@@ -395,7 +466,11 @@ impl StakingContract {
         let count = Self::get_staker_count(env.clone());
         let mut out = soroban_sdk::Vec::new(&env);
         for i in 0..count {
-            if let Some(addr) = env.storage().persistent().get::<_, Address>(&DataKey::StakerAt(i)) {
+            if let Some(addr) = env
+                .storage()
+                .persistent()
+                .get::<_, Address>(&DataKey::StakerAt(i))
+            {
                 out.push_back(addr);
             }
         }
@@ -433,7 +508,11 @@ impl StakingContract {
             .get(&DataKey::TotalStaked)
             .unwrap_or(0);
 
-        let current_epoch: u64 = env.storage().persistent().get(&DataKey::EpochId).unwrap_or(0);
+        let current_epoch: u64 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::EpochId)
+            .unwrap_or(0);
 
         env.storage()
             .persistent()
@@ -443,7 +522,9 @@ impl StakingContract {
             .set(&DataKey::EpochReward(current_epoch), &amount);
 
         let next_epoch = current_epoch.checked_add(1).expect("Overflow");
-        env.storage().persistent().set(&DataKey::EpochId, &next_epoch);
+        env.storage()
+            .persistent()
+            .set(&DataKey::EpochId, &next_epoch);
 
         emit_staking_event(
             &env,
@@ -460,7 +541,13 @@ impl StakingContract {
     /// stakes occur between successive calls covering different windows —
     /// callers requiring dilution resistance should use
     /// [`distribute_revenue`] instead.
-    pub fn distribute_revenue_batch(env: Env, token: Address, amount: i128, offset: u32, limit: u32) {
+    pub fn distribute_revenue_batch(
+        env: Env,
+        token: Address,
+        amount: i128,
+        offset: u32,
+        limit: u32,
+    ) {
         let _ = token;
         let total_staked: i128 = env
             .storage()
@@ -477,11 +564,19 @@ impl StakingContract {
 
         // === OPTIMIZATION: Batch storage operations to reduce N+1 query problem ===
         let mut batch_updates: soroban_sdk::Vec<(Address, i128)> = soroban_sdk::Vec::new(&env);
-        
+
         // First pass: collect all staker data and calculate shares
         for i in offset..end {
-            if let Some(staker) = env.storage().persistent().get::<_, Address>(&DataKey::StakerAt(i)) {
-                if let Some(record) = env.storage().persistent().get::<_, StakeRecord>(&DataKey::Stake(staker.clone())) {
+            if let Some(staker) = env
+                .storage()
+                .persistent()
+                .get::<_, Address>(&DataKey::StakerAt(i))
+            {
+                if let Some(record) = env
+                    .storage()
+                    .persistent()
+                    .get::<_, StakeRecord>(&DataKey::Stake(staker.clone()))
+                {
                     let share = (record.amount * amount) / total_staked;
                     if share > 0 {
                         batch_updates.push_back((staker, share));
@@ -489,7 +584,7 @@ impl StakingContract {
                 }
             }
         }
-        
+
         // Second pass: batch update pending rewards
         for (staker, share) in batch_updates.iter() {
             let pending: i128 = env
@@ -507,16 +602,34 @@ impl StakingContract {
         if !env.storage().instance().has(&DataKey::Admin) {
             panic!("Not initialized");
         }
-        if let Some(list) = env.storage().persistent().get::<_, soroban_sdk::Vec<Address>>(&DataKey::Stakers) {
-            let mut count: u32 = env.storage().persistent().get(&DataKey::StakerCount).unwrap_or(0);
+        if let Some(list) = env
+            .storage()
+            .persistent()
+            .get::<_, soroban_sdk::Vec<Address>>(&DataKey::Stakers)
+        {
+            let mut count: u32 = env
+                .storage()
+                .persistent()
+                .get(&DataKey::StakerCount)
+                .unwrap_or(0);
             for staker in list.iter() {
-                if !env.storage().persistent().has(&DataKey::StakerIndex(staker.clone())) {
-                    env.storage().persistent().set(&DataKey::StakerAt(count), &staker);
-                    env.storage().persistent().set(&DataKey::StakerIndex(staker.clone()), &count);
+                if !env
+                    .storage()
+                    .persistent()
+                    .has(&DataKey::StakerIndex(staker.clone()))
+                {
+                    env.storage()
+                        .persistent()
+                        .set(&DataKey::StakerAt(count), &staker);
+                    env.storage()
+                        .persistent()
+                        .set(&DataKey::StakerIndex(staker.clone()), &count);
                     count += 1;
                 }
             }
-            env.storage().persistent().set(&DataKey::StakerCount, &count);
+            env.storage()
+                .persistent()
+                .set(&DataKey::StakerCount, &count);
             env.storage().persistent().remove(&DataKey::Stakers);
         }
     }
@@ -528,7 +641,11 @@ impl StakingContract {
     /// then transfers the full pending balance to the staker.
     pub fn claim_rewards(env: Env, staker: Address, token: Address) -> Result<(), Error> {
         // Check pause guardian before any state mutation
-        if let Some(guardian) = env.storage().instance().get::<DataKey, Address>(&DataKey::PauseGuardian) {
+        if let Some(guardian) = env
+            .storage()
+            .instance()
+            .get::<DataKey, Address>(&DataKey::PauseGuardian)
+        {
             require_not_paused(&env, &guardian);
         }
 
@@ -579,13 +696,18 @@ impl StakingContract {
 
     /// Current epoch id (the epoch presently accruing, not yet snapshotted).
     pub fn get_current_epoch(env: Env) -> u64 {
-        env.storage().persistent().get(&DataKey::EpochId).unwrap_or(0)
+        env.storage()
+            .persistent()
+            .get(&DataKey::EpochId)
+            .unwrap_or(0)
     }
 
     /// `TotalStaked` snapshot recorded when epoch `epoch` was closed by
     /// `distribute_revenue`, or `None` if that epoch has not been closed yet.
     pub fn get_epoch_total_staked(env: Env, epoch: u64) -> Option<i128> {
-        env.storage().persistent().get(&DataKey::EpochTotalStaked(epoch))
+        env.storage()
+            .persistent()
+            .get(&DataKey::EpochTotalStaked(epoch))
     }
 
     /// Reward amount recorded for epoch `epoch`, or `None` if not yet closed.
@@ -595,7 +717,9 @@ impl StakingContract {
 
     /// The epoch id from which `staker` becomes eligible for rewards.
     pub fn get_staker_epoch_entry(env: Env, staker: Address) -> Option<u64> {
-        env.storage().persistent().get(&DataKey::StakerEpochEntry(staker))
+        env.storage()
+            .persistent()
+            .get(&DataKey::StakerEpochEntry(staker))
     }
 
     /// Settle every closed epoch in `[StakerNextClaimEpoch(staker), current_epoch)`
@@ -606,7 +730,11 @@ impl StakingContract {
     fn settle_epoch_rewards(env: &Env, staker: &Address, stake_amount: i128) {
         const MAX_EPOCHS_PER_SETTLE: u64 = 50;
 
-        let current_epoch: u64 = env.storage().persistent().get(&DataKey::EpochId).unwrap_or(0);
+        let current_epoch: u64 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::EpochId)
+            .unwrap_or(0);
         let entry_epoch: u64 = env
             .storage()
             .persistent()
@@ -632,8 +760,8 @@ impl StakingContract {
                     .get::<_, i128>(&DataKey::EpochReward(next_claim)),
             ) {
                 if epoch_total > 0 {
-                    let share = (stake_amount.checked_mul(epoch_reward).expect("Overflow"))
-                        / epoch_total;
+                    let share =
+                        (stake_amount.checked_mul(epoch_reward).expect("Overflow")) / epoch_total;
                     accrued = accrued.checked_add(share).expect("Overflow");
                 }
             }
@@ -940,7 +1068,8 @@ mod test {
         }
 
         f.env.budget().reset_unlimited();
-        f.client().distribute_revenue_batch(&f.mnt_id, &10000, &0, &10);
+        f.client()
+            .distribute_revenue_batch(&f.mnt_id, &10000, &0, &10);
         f.env.budget().print();
     }
 

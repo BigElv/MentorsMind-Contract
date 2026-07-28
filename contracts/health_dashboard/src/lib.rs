@@ -83,6 +83,41 @@ pub struct Config {
     pub mnt_token: Address,
     pub reputation: Address,
     pub interface_registry: Address,
+    pub treasury: Address,
+    pub insurance: Address,
+    pub lending_pool: Address,
+    pub usdc_token: Address,
+}
+
+// ---------------------------------------------------------------------------
+// Solvency types (Issue #771)
+// ---------------------------------------------------------------------------
+
+/// Mirrored from treasury::PendingAllocation for cross-contract decoding.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PendingAllocationView {
+    pub id: u32,
+    pub token: Address,
+    pub recipient: Address,
+    pub amount: i128,
+    pub approvals_count: u32,
+    pub executed: bool,
+    pub created_at: u64,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SolvencyReport {
+    pub treasury_balance: i128,
+    pub pending_allocations: i128,
+    pub insurance_pool_balance: i128,
+    pub outstanding_claims: i128,
+    pub staking_total: i128,
+    pub pending_rewards: i128,
+    pub lending_total_liquidity: i128,
+    pub outstanding_loans: i128,
+    pub is_solvent: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -104,6 +139,10 @@ impl HealthDashboardContract {
         mnt_token: Address,
         reputation: Address,
         interface_registry: Address,
+        treasury: Address,
+        insurance: Address,
+        lending_pool: Address,
+        usdc_token: Address,
     ) {
         if env.storage().persistent().has(&DataKey::Config) {
             panic!("Already initialized");
@@ -118,6 +157,10 @@ impl HealthDashboardContract {
                 mnt_token,
                 reputation,
                 interface_registry,
+                treasury,
+                insurance,
+                lending_pool,
+                usdc_token,
             },
         );
     }
@@ -161,6 +204,163 @@ impl HealthDashboardContract {
             &Symbol::new(&env, "get_version"),
             (contract_name,).into_val(&env),
         )
+    }
+
+    // ─── Protocol solvency (Issue #771) ─────────────────────────────────
+
+    /// Aggregate solvency view across treasury, insurance, staking, and
+    /// lending pool. Emits a `SolvencyAlert` event if the protocol is
+    /// detected as insolvent (is_solvent == false).
+    pub fn get_protocol_solvency(env: Env) -> SolvencyReport {
+        let cfg: Config = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Config)
+            .expect("Not initialized");
+
+        // ── Treasury ─────────────────────────────────────────────────────
+        // Query USDC balance held by the treasury contract.
+        let treasury_balance: i128 = env.invoke_contract(
+            &cfg.treasury,
+            &Symbol::new(&env, "get_balance"),
+            (cfg.usdc_token.clone(),).into_val(&env),
+        );
+
+        // Sum pending allocations as obligations.
+        let mut pending_allocations: i128 = 0;
+        let pending_count: u32 = env
+            .try_invoke_contract::<u32, soroban_sdk::Error>(
+                &cfg.treasury,
+                &Symbol::new(&env, "pending_allocation_count"),
+                ().into_val(&env),
+            )
+            .unwrap_or(Ok(0))
+            .unwrap_or(0);
+        for i in 0..pending_count {
+            if let Ok(Ok(Some(pending))) = env
+                .try_invoke_contract::<Option<PendingAllocationView>, soroban_sdk::Error>(
+                    &cfg.treasury,
+                    &Symbol::new(&env, "get_pending_allocation"),
+                    (i,).into_val(&env),
+                )
+            {
+                if !pending.executed {
+                    pending_allocations = pending_allocations.saturating_add(pending.amount);
+                }
+            }
+        }
+
+        // ── Insurance pool ───────────────────────────────────────────────
+        let insurance_pool_balance: i128 = env.invoke_contract(
+            &cfg.insurance,
+            &Symbol::new(&env, "get_pool_balance"),
+            ().into_val(&env),
+        );
+
+        let total_claims_paid: i128 = env
+            .try_invoke_contract::<i128, soroban_sdk::Error>(
+                &cfg.insurance,
+                &Symbol::new(&env, "get_total_claims_paid"),
+                ().into_val(&env),
+            )
+            .unwrap_or(Ok(0))
+            .unwrap_or(0);
+
+        let outstanding_claims: i128 = total_claims_paid;
+
+        // ── Staking ──────────────────────────────────────────────────────
+        let staking_total: i128 = env.invoke_contract(
+            &cfg.staking,
+            &Symbol::new(&env, "get_total_staked"),
+            ().into_val(&env),
+        );
+
+        // Best-effort pending rewards sum (capped at 50 stakers per call).
+        let staker_count: u32 = env
+            .try_invoke_contract::<u32, soroban_sdk::Error>(
+                &cfg.staking,
+                &Symbol::new(&env, "get_staker_count"),
+                ().into_val(&env),
+            )
+            .unwrap_or(Ok(0))
+            .unwrap_or(0);
+        let mut pending_rewards: i128 = 0;
+        let max_check = if staker_count > 50 { 50 } else { staker_count };
+        for i in 0..max_check {
+            if let Ok(Ok(Some(staker))) = env
+                .try_invoke_contract::<Option<Address>, soroban_sdk::Error>(
+                    &cfg.staking,
+                    &Symbol::new(&env, "get_staker_at"),
+                    (i,).into_val(&env),
+                )
+            {
+                let reward: i128 = env
+                    .try_invoke_contract::<i128, soroban_sdk::Error>(
+                        &cfg.staking,
+                        &Symbol::new(&env, "get_pending_rewards"),
+                        (staker,).into_val(&env),
+                    )
+                    .unwrap_or(Ok(0))
+                    .unwrap_or(0);
+                pending_rewards = pending_rewards.saturating_add(reward);
+            }
+        }
+
+        // ── Lending pool ─────────────────────────────────────────────────
+        let lending_total_liquidity: i128 = env.invoke_contract(
+            &cfg.lending_pool,
+            &Symbol::new(&env, "total_liquidity"),
+            ().into_val(&env),
+        );
+
+        let bad_debt: i128 = env
+            .try_invoke_contract::<i128, soroban_sdk::Error>(
+                &cfg.lending_pool,
+                &Symbol::new(&env, "get_bad_debt"),
+                ().into_val(&env),
+            )
+            .unwrap_or(Ok(0))
+            .unwrap_or(0);
+
+        // Outstanding loans = bad_debt + (initial liquidity - current liquidity)
+        let initial_liquidity_proxy: i128 = treasury_balance.saturating_add(insurance_pool_balance);
+        let outstanding_loans: i128 = bad_debt
+            .saturating_add(initial_liquidity_proxy.saturating_sub(lending_total_liquidity));
+
+        // ── Solvency check ───────────────────────────────────────────────
+        // treasury must cover pending allocations
+        // insurance pool must be non-negative
+        // lending pool must have non-negative liquidity
+        let is_solvent = treasury_balance >= pending_allocations
+            && insurance_pool_balance >= 0
+            && lending_total_liquidity >= 0;
+
+        let report = SolvencyReport {
+            treasury_balance,
+            pending_allocations,
+            insurance_pool_balance,
+            outstanding_claims,
+            staking_total,
+            pending_rewards,
+            lending_total_liquidity,
+            outstanding_loans,
+            is_solvent,
+        };
+
+        if !is_solvent {
+            env.events().publish(
+                (Symbol::new(&env, "SolvencyAlert"),),
+                (
+                    treasury_balance,
+                    pending_allocations,
+                    insurance_pool_balance,
+                    staking_total,
+                    lending_total_liquidity,
+                ),
+            );
+        }
+
+        report
     }
 }
 
@@ -421,6 +621,77 @@ mod test {
         }
     }
 
+    // ─── Solvency mock contracts (Issue #771) ──────────────────────────
+
+    #[contract]
+    pub struct MockTreasury;
+
+    #[contractimpl]
+    impl MockTreasury {
+        pub fn get_balance(_env: Env, _token: Address) -> i128 {
+            100_000 // treasury holds 100k USDC
+        }
+        pub fn pending_allocation_count(_env: Env) -> u32 {
+            1
+        }
+        pub fn get_pending_allocation(env: Env, _id: u32) -> Option<PendingAllocationView> {
+            Some(PendingAllocationView {
+                id: 0,
+                token: Address::generate(&env),
+                recipient: Address::generate(&env),
+                amount: 10_000, // 10k pending
+                approvals_count: 1,
+                executed: false,
+                created_at: 0,
+            })
+        }
+    }
+
+    #[contract]
+    pub struct MockInsurance;
+
+    #[contractimpl]
+    impl MockInsurance {
+        pub fn get_pool_balance(_env: Env) -> i128 {
+            50_000 // insurance pool holds 50k
+        }
+        pub fn get_total_claims_paid(_env: Env) -> i128 {
+            5_000 // 5k claims paid so far
+        }
+    }
+
+    #[contract]
+    pub struct MockLendingPool;
+
+    #[contractimpl]
+    impl MockLendingPool {
+        pub fn total_liquidity(_env: Env) -> i128 {
+            200_000 // 200k in pool
+        }
+        pub fn get_bad_debt(_env: Env) -> i128 {
+            1_000 // 1k bad debt
+        }
+    }
+
+    #[contract]
+    pub struct MockStakingForSolvency;
+
+    #[contractimpl]
+    impl MockStakingForSolvency {
+        pub fn get_total_staked(_env: Env) -> i128 {
+            500_000 // 500k staked
+        }
+        pub fn get_staker_count(_env: Env) -> u32 {
+            1
+        }
+        pub fn get_staker_at(_env: Env, _index: u32) -> Option<Address> {
+            Some(Address::generate(&_env))
+        }
+        pub fn get_pending_rewards(_env: Env, _staker: Address) -> i128 {
+            1_000 // 1k pending rewards
+        }
+    }
+
     fn setup() -> (Env, Address, Address) {
         let env = Env::default();
         env.mock_all_auths();
@@ -434,6 +705,10 @@ mod test {
 
         let reputation = env.register_contract(None, MockReputation);
         let iface = env.register_contract(None, MockInterfaceRegistry);
+        let treasury = env.register_contract(None, MockTreasury);
+        let insurance = env.register_contract(None, MockInsurance);
+        let lending_pool = env.register_contract(None, MockLendingPool);
+        let usdc = env.register_contract(None, MockMntToken);
         let dashboard = env.register_contract(None, HealthDashboardContract);
 
         HealthDashboardContractClient::new(&env, &dashboard).initialize(
@@ -444,6 +719,10 @@ mod test {
             &mnt,
             &reputation,
             &iface,
+            &treasury,
+            &insurance,
+            &lending_pool,
+            &usdc,
         );
 
         (env, dashboard, mnt)
@@ -494,5 +773,206 @@ mod test {
         });
 
         let _ = client.get_platform_stats();
+    }
+
+    // ═════════════════════════════════════════════════════════════════════
+    // Solvency tests (Issue #771)
+    // ═════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_get_protocol_solvency_returns_all_fields() {
+        let (env, dashboard, _) = setup();
+        let client = HealthDashboardContractClient::new(&env, &dashboard);
+        let report = client.get_protocol_solvency();
+
+        // All fields must be non-negative (overflow-protected)
+        assert!(report.treasury_balance >= 0);
+        assert!(report.pending_allocations >= 0);
+        assert!(report.insurance_pool_balance >= 0);
+        assert!(report.outstanding_claims >= 0);
+        assert!(report.staking_total >= 0);
+        assert!(report.pending_rewards >= 0);
+        assert!(report.lending_total_liquidity >= 0);
+        assert!(report.outstanding_loans >= 0);
+
+        // With mock defaults: treasury=100k ≥ pending=10k → solvent
+        // insurance=50k ≥ 0 → solvent
+        // lending=200k ≥ 0 → solvent
+        assert!(report.is_solvent);
+    }
+
+    #[test]
+    fn test_solvency_treasury_insufficient_returns_insolvent() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+
+        let escrow_id = env.register_contract(None, MockEscrow);
+        let session_reg = env.register_contract(None, MockSessionRegistry);
+        let staking = Address::generate(&env);
+        let mnt = env.register_contract(None, MockMntToken);
+        MockMntTokenClient::new(&env, &mnt).mint(&staking, &5000i128);
+
+        let reputation = env.register_contract(None, MockReputation);
+        let iface = env.register_contract(None, MockInterfaceRegistry);
+
+        // Treasury with low balance relative to pending
+        #[contract]
+        pub struct MockTreasuryLow;
+
+        #[contractimpl]
+        impl MockTreasuryLow {
+            pub fn get_balance(_env: Env, _token: Address) -> i128 {
+                500
+            }
+            pub fn pending_allocation_count(_env: Env) -> u32 {
+                1
+            }
+            pub fn get_pending_allocation(env: Env, _id: u32) -> Option<PendingAllocationView> {
+                Some(PendingAllocationView {
+                    id: 0,
+                    token: Address::generate(&env),
+                    recipient: Address::generate(&env),
+                    amount: 10_000, // pending > balance
+                    approvals_count: 1,
+                    executed: false,
+                    created_at: 0,
+                })
+            }
+        }
+
+        let treasury = env.register_contract(None, MockTreasuryLow);
+        let insurance = env.register_contract(None, MockInsurance);
+        let lending_pool = env.register_contract(None, MockLendingPool);
+        let usdc = env.register_contract(None, MockMntToken);
+        let dashboard = env.register_contract(None, HealthDashboardContract);
+
+        HealthDashboardContractClient::new(&env, &dashboard).initialize(
+            &admin,
+            &escrow_id,
+            &session_reg,
+            &staking,
+            &mnt,
+            &reputation,
+            &iface,
+            &treasury,
+            &insurance,
+            &lending_pool,
+            &usdc,
+        );
+
+        let client = HealthDashboardContractClient::new(&env, &dashboard);
+        let report = client.get_protocol_solvency();
+
+        assert!(!report.is_solvent, "insolvent when treasury < pending");
+        assert_eq!(report.treasury_balance, 500);
+        assert_eq!(report.pending_allocations, 10_000);
+    }
+
+    #[test]
+    fn test_solvency_emits_alert_event_when_insolvent() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+
+        let escrow_id = env.register_contract(None, MockEscrow);
+        let session_reg = env.register_contract(None, MockSessionRegistry);
+        let staking = Address::generate(&env);
+        let mnt = env.register_contract(None, MockMntToken);
+        MockMntTokenClient::new(&env, &mnt).mint(&staking, &5000i128);
+
+        let reputation = env.register_contract(None, MockReputation);
+        let iface = env.register_contract(None, MockInterfaceRegistry);
+
+        // Treasury with balance=0 and pending > 0 → insolvent
+        #[contract]
+        pub struct MockTreasuryZero;
+
+        #[contractimpl]
+        impl MockTreasuryZero {
+            pub fn get_balance(_env: Env, _token: Address) -> i128 {
+                0
+            }
+            pub fn pending_allocation_count(_env: Env) -> u32 {
+                1
+            }
+            pub fn get_pending_allocation(env: Env, _id: u32) -> Option<PendingAllocationView> {
+                Some(PendingAllocationView {
+                    id: 0,
+                    token: Address::generate(&env),
+                    recipient: Address::generate(&env),
+                    amount: 100,
+                    approvals_count: 0,
+                    executed: false,
+                    created_at: 0,
+                })
+            }
+        }
+
+        let treasury = env.register_contract(None, MockTreasuryZero);
+        let insurance = env.register_contract(None, MockInsurance);
+        let lending_pool = env.register_contract(None, MockLendingPool);
+        let usdc = env.register_contract(None, MockMntToken);
+        let dashboard = env.register_contract(None, HealthDashboardContract);
+
+        HealthDashboardContractClient::new(&env, &dashboard).initialize(
+            &admin,
+            &escrow_id,
+            &session_reg,
+            &staking,
+            &mnt,
+            &reputation,
+            &iface,
+            &treasury,
+            &insurance,
+            &lending_pool,
+            &usdc,
+        );
+
+        let client = HealthDashboardContractClient::new(&env, &dashboard);
+        let report = client.get_protocol_solvency();
+        assert!(!report.is_solvent);
+
+        // Check that SolvencyAlert event was emitted
+        let events = env.events().all();
+        let has_alert = events
+            .iter()
+            .any(|e| e.1 == (Symbol::new(&env, "SolvencyAlert"),).into_val(&env));
+        assert!(
+            has_alert,
+            "SolvencyAlert event must be emitted when insolvent"
+        );
+    }
+
+    #[test]
+    fn test_solvency_all_fields_non_negative_during_normal_ops() {
+        let (env, dashboard, _) = setup();
+        let client = HealthDashboardContractClient::new(&env, &dashboard);
+        let report = client.get_protocol_solvency();
+
+        // Verify all numeric fields are >= 0 (overflow protection)
+        assert!(report.treasury_balance >= 0);
+        assert!(report.pending_allocations >= 0);
+        assert!(report.insurance_pool_balance >= 0);
+        assert!(report.outstanding_claims >= 0);
+        assert!(report.staking_total >= 0);
+        assert!(report.pending_rewards >= 0);
+        assert!(report.lending_total_liquidity >= 0);
+        assert!(report.outstanding_loans >= 0);
+    }
+
+    #[test]
+    fn test_solvency_exact_values_match_mocks() {
+        let (env, dashboard, _) = setup();
+        let client = HealthDashboardContractClient::new(&env, &dashboard);
+        let report = client.get_protocol_solvency();
+
+        assert_eq!(report.treasury_balance, 100_000);
+        assert_eq!(report.pending_allocations, 10_000);
+        assert_eq!(report.insurance_pool_balance, 50_000);
+        assert_eq!(report.outstanding_claims, 5_000);
+        assert!(report.staking_total >= 0);
+        assert!(report.pending_rewards >= 0);
+        assert_eq!(report.lending_total_liquidity, 200_000);
     }
 }
