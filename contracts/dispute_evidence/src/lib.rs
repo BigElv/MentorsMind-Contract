@@ -106,6 +106,9 @@ pub struct DisputeResolution {
     pub release_to_mentor: bool,
     pub note: Symbol,
     pub resolved_at: u64,
+    /// Merkle root of the evidence set at the time of ruling, binding the
+    /// resolution to a specific evidence set for tamper-evident audit.
+    pub evidence_root: BytesN<32>,
 }
 
 #[contracttype]
@@ -125,6 +128,9 @@ pub enum DataKey {
     CooldownEnabled,
     AnomalyDetector,
     BypassAnomalyCheck,
+    /// Merkle root of the evidence set for a given escrow. Updated on every
+    /// evidence submission for tamper-evident integrity.
+    EvidenceRoot(u64),
 }
 
 #[contractclient(name = "EscrowContractClient")]
@@ -353,8 +359,23 @@ impl DisputeEvidenceContract {
         };
         evidence.push_back(item.clone());
         env.storage().persistent().set(&key, &evidence);
+
+        // Compute and store Merkle root over the entire evidence set.
+        let root = Self::compute_evidence_root(&env, &evidence);
+        env.storage()
+            .persistent()
+            .set(&DataKey::EvidenceRoot(escrow_id), &root);
+
         env.events()
             .publish((Symbol::new(&env, "evidence_submitted"), escrow_id), item);
+        env.events().publish(
+            (
+                Symbol::new(&env, "evidence_root_updated"),
+                escrow_id,
+                evidence.len(),
+            ),
+            root.clone(),
+        );
         Ok(())
     }
 
@@ -440,11 +461,14 @@ impl DisputeEvidenceContract {
             }
         }
 
+        let evidence_root = Self::get_evidence_root(env.clone(), escrow_id);
+
         let resolution = DisputeResolution {
             arbitrator: arbitrator.clone(),
             release_to_mentor,
             note: note.clone(),
             resolved_at: env.ledger().timestamp(),
+            evidence_root,
         };
         env.storage().persistent().set(&key, &resolution);
         env.events().publish(
@@ -459,6 +483,54 @@ impl DisputeEvidenceContract {
             .persistent()
             .get(&DataKey::Resolution(escrow_id))
             .expect("resolution not found")
+    }
+
+    /// Compute a sequential Merkle root over the evidence set:
+    /// `sha256(sha256(item_1) || sha256(item_2) || ... || sha256(item_n))`
+    fn compute_evidence_root(env: &Env, evidence: &Vec<EvidenceItem>) -> BytesN<32> {
+        use soroban_sdk::crypto::sha256;
+
+        // Hash each evidence item individually, then concatenate and hash the
+        // result to produce a single root commitment.
+        let mut combined = soroban_sdk::Bytes::new(env);
+        for item in evidence.iter() {
+            let mut item_bytes = soroban_sdk::Bytes::new(env);
+            // Include content_hash + evidence_uri_hash + submitted_at in the
+            // item leaf so any field modification invalidates the root.
+            item_bytes.extend_from_slice(&item.content_hash.to_bytes());
+            item_bytes.extend_from_slice(&item.evidence_uri_hash.to_bytes());
+            item_bytes.extend_from_array(&item.submitted_at.to_be_bytes());
+            let leaf = sha256(&item_bytes);
+            combined.extend_from_slice(&leaf.to_bytes());
+        }
+
+        if combined.len() == 0 {
+            // Empty set → zero root.
+            return BytesN::from_array(env, &[0u8; 32]);
+        }
+
+        sha256(&combined)
+    }
+
+    /// Return the stored Merkle root for `escrow_id`, or zero if no evidence
+    /// has been submitted.
+    pub fn get_evidence_root(env: Env, escrow_id: u64) -> BytesN<32> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::EvidenceRoot(escrow_id))
+            .unwrap_or_else(|| BytesN::from_array(&env, &[0u8; 32]))
+    }
+
+    /// Recompute the Merkle root from the provided items and compare to the
+    /// stored root. Returns `true` if they match, `false` otherwise.
+    pub fn verify_evidence_set(
+        env: Env,
+        escrow_id: u64,
+        items: Vec<EvidenceItem>,
+    ) -> bool {
+        let stored_root = Self::get_evidence_root(env.clone(), escrow_id);
+        let computed_root = Self::compute_evidence_root(&env, &items);
+        stored_root == computed_root
     }
 
     fn require_admin(env: &Env, admin: &Address) -> Result<(), Error> {
@@ -916,5 +988,113 @@ mod tests {
             last.1,
             (Symbol::new(&env, "dispute_resolved"), 1u64).into_val(&env)
         );
+    }
+
+    // ─── #781: Merkle evidence root ───────────────────────────────────────
+
+    #[test]
+    fn evidence_root_is_zero_before_any_submission() {
+        let (_env, _admin, _mentor, _learner, client) = setup_disputed();
+        let root = client.get_evidence_root(&1);
+        assert_eq!(root, BytesN::from_array(&_env, &[0u8; 32]));
+    }
+
+    #[test]
+    fn evidence_root_changes_after_each_submission() {
+        let (env, admin, mentor, _learner, client) = setup_disputed();
+        client.set_cooldown_enabled(&admin, &false).unwrap();
+
+        let root0 = client.get_evidence_root(&1);
+
+        client
+            .submit_evidence(&1, &mentor, &hash32(&env, 1), &hash32(&env, 2), &None)
+            .unwrap();
+        let root1 = client.get_evidence_root(&1);
+        assert_ne!(root0, root1, "root must change after first submission");
+
+        client
+            .submit_evidence(&1, &mentor, &hash32(&env, 3), &hash32(&env, 4), &None)
+            .unwrap();
+        let root2 = client.get_evidence_root(&1);
+        assert_ne!(root1, root2, "root must change after second submission");
+    }
+
+    #[test]
+    fn verify_evidence_set_returns_true_for_exact_set() {
+        let (env, admin, mentor, learner, client) = setup_disputed();
+        client.set_cooldown_enabled(&admin, &false).unwrap();
+
+        client
+            .submit_evidence(&1, &mentor, &hash32(&env, 1), &hash32(&env, 2), &None)
+            .unwrap();
+        client
+            .submit_evidence(&1, &learner, &hash32(&env, 3), &hash32(&env, 4), &None)
+            .unwrap();
+
+        let items = client.get_evidence(&1);
+        assert!(client.verify_evidence_set(&1, &items));
+    }
+
+    #[test]
+    fn verify_evidence_set_returns_false_for_tampered_item() {
+        let (env, admin, mentor, learner, client) = setup_disputed();
+        client.set_cooldown_enabled(&admin, &false).unwrap();
+
+        client
+            .submit_evidence(&1, &mentor, &hash32(&env, 1), &hash32(&env, 2), &None)
+            .unwrap();
+        client
+            .submit_evidence(&1, &learner, &hash32(&env, 3), &hash32(&env, 4), &None)
+            .unwrap();
+
+        let mut items = client.get_evidence(&1);
+        // Tamper with the first item's content_hash.
+        let mut tampered = items.get(0).unwrap();
+        tampered.content_hash = hash32(&env, 99);
+        items.set(0, tampered);
+
+        assert!(
+            !client.verify_evidence_set(&1, &items),
+            "tampered evidence must fail verification"
+        );
+    }
+
+    #[test]
+    fn resolution_records_evidence_root_at_time_of_ruling() {
+        let (env, admin, mentor, _learner, client) = setup_disputed();
+        client.set_cooldown_enabled(&admin, &false).unwrap();
+
+        client
+            .submit_evidence(&1, &mentor, &hash32(&env, 1), &hash32(&env, 2), &None)
+            .unwrap();
+        let root_at_ruling = client.get_evidence_root(&1);
+
+        let arb = Address::generate(&env);
+        client.record_dispute_opened(&1).unwrap();
+        advance_time(&env, MIN_RESOLUTION_DELAY_SECS + 1);
+        client
+            .submit_resolution(&1, &arb, &true, &Symbol::new(&env, "ok"))
+            .unwrap();
+
+        let resolution = client.get_resolution(&1);
+        assert_eq!(
+            resolution.evidence_root, root_at_ruling,
+            "resolution must capture the evidence root at time of ruling"
+        );
+    }
+
+    #[test]
+    fn evidence_root_updated_event_emitted() {
+        let (env, _admin, mentor, _learner, client) = setup_disputed();
+        client
+            .submit_evidence(&1, &mentor, &hash32(&env, 1), &hash32(&env, 2), &None)
+            .unwrap();
+        let events = env.events().all();
+        // Look for the evidence_root_updated event (second event emitted)
+        let found = events.iter().any(|e| {
+            // Topics are (event_name, escrow_id, item_count)
+            e.1 == (Symbol::new(&env, "evidence_root_updated"), 1u64, 1u32).into_val(&env)
+        });
+        assert!(found, "evidence_root_updated event must be emitted");
     }
 }
