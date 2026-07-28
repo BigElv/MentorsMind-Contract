@@ -17,6 +17,7 @@ pub mod storage;
 pub mod staking;
 pub mod ttl_utils;
 pub mod interface_id;
+pub mod validation;
 
 pub use escrow::{EscrowRecord, EscrowStatus};
 pub use pause_guard::{ContractPaused, is_paused, require_not_paused};
@@ -29,6 +30,7 @@ pub use state_machine::StateMachine;
 pub use staking::{StakeRecord, StakedEventData};
 pub use storage::{EternalStorage, StorageType, InstanceKey, PersistentKey, TempKey};
 pub use ttl_utils::{next_bump_interval, should_bump_ttl};
+pub use validation::{Validator, ValidationError, require_auth_and_validate};
 
 /// Common error codes shared across all MentorsMind contracts.
 ///
@@ -58,4 +60,6 @@ pub enum SharedError {
     Overflow = 9,
     /// An arithmetic operation would underflow below zero.
     Underflow = 10,
+    /// Input validation failed (see `ValidationError` for field details).
+    ValidationError = 11,
 }
