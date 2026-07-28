@@ -1,4 +1,6 @@
 #![no_std]
+#![allow(deprecated)]
+#![allow(dead_code)]
 use shared::{EscrowRecord, EscrowStatus};
 use soroban_sdk::{contract, contractimpl, contracttype, symbol_short, token, Address, Env, Symbol, Vec, IntoVal, BytesN};
 
@@ -142,6 +144,44 @@ pub struct TokenApprovalEventData {
 }
 
 // ---------------------------------------------------------------------------
+// Graduated fee schedule (Issue #676)
+// ---------------------------------------------------------------------------
+
+/// Graduated platform-fee schedule.
+///
+/// The applicable base rate is selected by the mentor's staking tier
+/// (0 = none, 1 = Bronze, 2 = Silver, 3 = Gold). A session whose value exceeds
+/// `volume_discount_threshold` receives an additional `volume_discount_bps`
+/// reduction on the selected rate.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FeeSchedule {
+    pub tier0_bps: u32,
+    pub tier1_bps: u32,
+    pub tier2_bps: u32,
+    pub tier3_bps: u32,
+    pub volume_discount_threshold: i128,
+    pub volume_discount_bps: u32,
+}
+
+/// Event data emitted whenever a graduated platform fee is applied on release.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FeeAppliedEventData {
+    pub mentor: Address,
+    pub tier: u32,
+    pub base_bps: u32,
+    pub effective_bps: u32,
+    pub fee_amount: i128,
+}
+
+/// Cross-contract view of the staking contract used to read a mentor's tier.
+#[soroban_sdk::contractclient(name = "StakingClient")]
+pub trait StakingTierTrait {
+    fn get_tier(env: Env, mentor: Address) -> u32;
+}
+
+// ---------------------------------------------------------------------------
 // DataKey enum — typed storage key for all persistent state
 // ---------------------------------------------------------------------------
 
@@ -155,6 +195,10 @@ pub enum DataKey {
     AutoRelDelay,
     Escrow(u64),
     ApprovedToken(Address),
+    /// Graduated fee schedule (Issue #676). When set, overrides the flat FeeBps.
+    FeeSchedule,
+    /// Address of the staking contract used to read mentor tiers.
+    StakingContract,
 }
 
 // ---------------------------------------------------------------------------
@@ -466,6 +510,145 @@ impl EscrowContract {
                     approved: false,
                 },
             );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Graduated fee schedule (Issue #676)
+    // -----------------------------------------------------------------------
+
+    /// Set the graduated fee schedule (admin only). Once set, releases use the
+    /// tier-based rates instead of the flat `FeeBps`.
+    pub fn set_fee_schedule(env: Env, admin: Address, schedule: FeeSchedule) {
+        let stored_admin: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Admin)
+            .expect("Not initialized");
+        env.storage()
+            .persistent()
+            .extend_ttl(&DataKey::Admin, ESCROW_TTL_THRESHOLD, ESCROW_TTL_BUMP);
+        admin.require_auth();
+        if admin != stored_admin {
+            panic!("Caller not authorized");
+        }
+
+        // Each tier rate is capped at the same maximum as the flat fee.
+        if schedule.tier0_bps > MAX_FEE_BPS
+            || schedule.tier1_bps > MAX_FEE_BPS
+            || schedule.tier2_bps > MAX_FEE_BPS
+            || schedule.tier3_bps > MAX_FEE_BPS
+        {
+            panic!("Fee exceeds maximum (1000 bps)");
+        }
+
+        env.storage().persistent().set(&DataKey::FeeSchedule, &schedule);
+        env.storage()
+            .persistent()
+            .extend_ttl(&DataKey::FeeSchedule, ESCROW_TTL_THRESHOLD, ESCROW_TTL_BUMP);
+    }
+
+    /// Get the current fee schedule, if one has been set.
+    pub fn get_fee_schedule(env: Env) -> Option<FeeSchedule> {
+        env.storage().persistent().get(&DataKey::FeeSchedule)
+    }
+
+    /// Set the staking contract address used to read mentor tiers (admin only).
+    pub fn set_staking_contract(env: Env, admin: Address, staking: Address) {
+        let stored_admin: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Admin)
+            .expect("Not initialized");
+        env.storage()
+            .persistent()
+            .extend_ttl(&DataKey::Admin, ESCROW_TTL_THRESHOLD, ESCROW_TTL_BUMP);
+        admin.require_auth();
+        if admin != stored_admin {
+            panic!("Caller not authorized");
+        }
+
+        env.storage().persistent().set(&DataKey::StakingContract, &staking);
+        env.storage()
+            .persistent()
+            .extend_ttl(&DataKey::StakingContract, ESCROW_TTL_THRESHOLD, ESCROW_TTL_BUMP);
+    }
+
+    /// Read the mentor's staking tier via a cross-contract call. Returns 0 when
+    /// no staking contract is configured.
+    fn _mentor_tier(env: &Env, mentor: &Address) -> u32 {
+        match env
+            .storage()
+            .persistent()
+            .get::<_, Address>(&DataKey::StakingContract)
+        {
+            Some(staking) => StakingClient::new(env, &staking).get_tier(mentor),
+            None => 0,
+        }
+    }
+
+    /// Select the base bps for a tier from the schedule.
+    fn _tier_bps(schedule: &FeeSchedule, tier: u32) -> u32 {
+        match tier {
+            1 => schedule.tier1_bps,
+            2 => schedule.tier2_bps,
+            3 => schedule.tier3_bps,
+            _ => schedule.tier0_bps,
+        }
+    }
+
+    /// Compute the graduated platform fee for `mentor` on a session worth
+    /// `amount`, returning `(fee, tier, base_bps, effective_bps)`.
+    ///
+    /// The mentor's tier selects the base rate; a session whose value exceeds
+    /// the schedule's `volume_discount_threshold` receives an additional
+    /// `volume_discount_bps` reduction (never below zero).
+    fn _compute_fee_with_meta(
+        env: &Env,
+        schedule: &FeeSchedule,
+        mentor: &Address,
+        amount: i128,
+    ) -> (i128, u32, u32, u32) {
+        let tier = Self::_mentor_tier(env, mentor);
+        let base_bps = Self::_tier_bps(schedule, tier);
+        let effective_bps = if amount > schedule.volume_discount_threshold {
+            base_bps.saturating_sub(schedule.volume_discount_bps)
+        } else {
+            base_bps
+        };
+        let fee = amount
+            .checked_mul(effective_bps as i128)
+            .expect("Overflow")
+            .checked_div(10_000)
+            .expect("Division error");
+        (fee, tier, base_bps, effective_bps)
+    }
+
+    /// Public view: compute the graduated platform fee for a mentor/amount.
+    ///
+    /// Falls back to the flat `FeeBps` rate when no fee schedule is configured.
+    pub fn compute_platform_fee(env: Env, mentor: Address, amount: i128) -> i128 {
+        match env
+            .storage()
+            .persistent()
+            .get::<_, FeeSchedule>(&DataKey::FeeSchedule)
+        {
+            Some(schedule) => {
+                let (fee, _, _, _) = Self::_compute_fee_with_meta(&env, &schedule, &mentor, amount);
+                fee
+            }
+            None => {
+                let fee_bps: u32 = env
+                    .storage()
+                    .persistent()
+                    .get(&DataKey::FeeBps)
+                    .unwrap_or(DEFAULT_FEE_BPS);
+                amount
+                    .checked_mul(fee_bps as i128)
+                    .expect("Overflow")
+                    .checked_div(10_000)
+                    .expect("Division error")
+            }
         }
     }
 
@@ -837,6 +1020,18 @@ impl EscrowContract {
         escrow.dispute_reason = reason.clone();
         env.storage().persistent().set(&key, &escrow);
 
+        // Standardized observability event (Issue #597).
+        emit_escrow_event(
+            &env,
+            evt_escrow_disputed(&env),
+            DisputeOpenedEventData {
+                escrow_id,
+                caller: caller.clone(),
+                reason: reason.clone(),
+                token_address: escrow.token_address.clone(),
+            },
+        );
+        // Legacy ad-hoc event retained for backward compatibility.
         env.events().publish(
             (Symbol::new(&env, "Escrow"), Symbol::new(&env, "DisputeOpened"), escrow_id),
             DisputeOpenedEventData {
@@ -901,7 +1096,20 @@ impl EscrowContract {
         escrow.resolved_at = now;
         env.storage().persistent().set(&key, &escrow);
 
-        // Emit event
+        // Standardized observability event (Issue #597).
+        emit_escrow_event(
+            &env,
+            evt_escrow_resolved(&env),
+            DisputeResolvedEventData {
+                escrow_id,
+                mentor_pct,
+                mentor_amount,
+                learner_amount,
+                token_address: escrow.token_address.clone(),
+                time: now,
+            },
+        );
+        // Legacy ad-hoc event retained for backward compatibility.
         env.events().publish(
             (Symbol::new(&env, "Escrow"), Symbol::new(&env, "DisputeResolved"), escrow_id),
             DisputeResolvedEventData {
@@ -959,6 +1167,18 @@ impl EscrowContract {
         escrow.status = EscrowStatus::Refunded;
         env.storage().persistent().set(&key, &escrow);
 
+        // Standardized observability event (Issue #597).
+        emit_escrow_event(
+            &env,
+            evt_escrow_refunded(&env),
+            EscrowRefundedEventData {
+                escrow_id,
+                learner: escrow.learner.clone(),
+                amount: escrow.amount,
+                token_address: escrow.token_address.clone(),
+            },
+        );
+        // Legacy ad-hoc event retained for backward compatibility.
         env.events().publish(
             (Symbol::new(&env, "Escrow"), Symbol::new(&env, "Refunded"), escrow_id),
             EscrowRefundedEventData {
@@ -1469,20 +1689,39 @@ impl EscrowContract {
     /// Shared release logic used by both `release_funds` and `try_auto_release`.
     fn _do_release(env: &Env, escrow: &mut Escrow, key: &(Symbol, u64)) {
         let release_amount = escrow.amount;
-        let fee_bps: u32 = env
+
+        // Prefer the graduated fee schedule (Issue #676) when configured;
+        // otherwise fall back to the flat FeeBps rate for backward compat.
+        let platform_fee: i128;
+        let mut fee_meta: Option<(u32, u32, u32)> = None; // (tier, base_bps, effective_bps)
+        if let Some(schedule) = env
             .storage()
             .persistent()
-            .get(&DataKey::FeeBps)
-            .unwrap_or(DEFAULT_FEE_BPS);
-        env.storage()
-            .persistent()
-            .extend_ttl(&DataKey::FeeBps, ESCROW_TTL_THRESHOLD, ESCROW_TTL_BUMP);
+            .get::<_, FeeSchedule>(&DataKey::FeeSchedule)
+        {
+            env.storage()
+                .persistent()
+                .extend_ttl(&DataKey::FeeSchedule, ESCROW_TTL_THRESHOLD, ESCROW_TTL_BUMP);
+            let (fee, tier, base_bps, effective_bps) =
+                Self::_compute_fee_with_meta(env, &schedule, &escrow.mentor, release_amount);
+            platform_fee = fee;
+            fee_meta = Some((tier, base_bps, effective_bps));
+        } else {
+            let fee_bps: u32 = env
+                .storage()
+                .persistent()
+                .get(&DataKey::FeeBps)
+                .unwrap_or(DEFAULT_FEE_BPS);
+            env.storage()
+                .persistent()
+                .extend_ttl(&DataKey::FeeBps, ESCROW_TTL_THRESHOLD, ESCROW_TTL_BUMP);
+            platform_fee = release_amount
+                .checked_mul(fee_bps as i128)
+                .expect("Overflow")
+                .checked_div(10_000)
+                .expect("Division error");
+        }
 
-        let platform_fee: i128 = release_amount
-            .checked_mul(fee_bps as i128)
-            .expect("Overflow")
-            .checked_div(10_000)
-            .expect("Division error");
         let net_amount: i128 = release_amount
             .checked_sub(platform_fee)
             .expect("Underflow");
@@ -1510,6 +1749,20 @@ impl EscrowContract {
         escrow.amount = 0; // all remaining amount is released
         env.storage().persistent().set(key, escrow);
 
+        // Standardized observability event (Issue #597).
+        emit_escrow_event(
+            env,
+            evt_escrow_released(env),
+            EscrowReleasedEventData {
+                escrow_id: escrow.id,
+                mentor: escrow.mentor.clone(),
+                amount: release_amount,
+                net_amount,
+                platform_fee,
+                token_address: escrow.token_address.clone(),
+            },
+        );
+        // Legacy ad-hoc event retained for backward compatibility.
         env.events().publish(
             (Symbol::new(env, "Escrow"), Symbol::new(env, "Released"), escrow.id),
             EscrowReleasedEventData {
@@ -1532,6 +1785,21 @@ impl EscrowContract {
                 token_address: escrow.token_address.clone(),
             },
         );
+
+        // Graduated-fee observability: emit FeeApplied whenever the schedule
+        // was used to price this release (Issue #676).
+        if let Some((tier, base_bps, effective_bps)) = fee_meta {
+            env.events().publish(
+                (Symbol::new(env, "Escrow"), Symbol::new(env, "FeeApplied"), escrow.id),
+                FeeAppliedEventData {
+                    mentor: escrow.mentor.clone(),
+                    tier,
+                    base_bps,
+                    effective_bps,
+                    fee_amount: platform_fee,
+                },
+            );
+        }
     }
 
     /// Internal token whitelist setter. Stores approval state in persistent storage.
@@ -1693,7 +1961,23 @@ impl EscrowContract {
             .persistent()
             .extend_ttl(&learner_key, ESCROW_TTL_THRESHOLD, ESCROW_TTL_BUMP);
 
-        // --- Emit event ---
+        // --- Emit events ---
+        // Standardized observability event (Issue #597): canonical
+        // (contract, version, event_type) topic layout for off-chain indexers.
+        emit_escrow_event(
+            &env,
+            evt_escrow_created(&env),
+            EscrowCreatedEventData {
+                escrow_id: count,
+                mentor: mentor.clone(),
+                learner: learner.clone(),
+                amount,
+                session_id: session_id.clone(),
+                token_address: token_address.clone(),
+                session_end_time,
+            },
+        );
+        // Legacy ad-hoc event retained for backward compatibility.
         env.events().publish(
             (Symbol::new(&env, "Escrow"), Symbol::new(&env, "Created"), count),
             EscrowCreatedEventData {
@@ -1754,7 +2038,7 @@ mod test {
     use soroban_sdk::{
         testutils::{Address as _, Ledger, Events},
         token::{Client as TokenClient, StellarAssetClient},
-        Address, Env, Vec, IntoVal, Symbol,
+        Address, Env, Vec, IntoVal, Symbol, TryFromVal,
     };
 
     // -----------------------------------------------------------------------
@@ -2672,5 +2956,68 @@ mod test {
         assert_eq!(token.balance(&f.mentor), mentor_start + 750);
         assert_eq!(token.balance(&f.learner), learner_start - 1_000 + 250);
         assert_eq!(token.balance(&f.contract_id), 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // Observability / standardized events (Issue #597)
+    // -----------------------------------------------------------------------
+
+    /// Count events whose topic uses the canonical
+    /// `(contract="escrow", version=1, event_type)` layout for `event_type`.
+    fn count_standard_escrow_events(f: &TestFixture, event_type: &str) -> u32 {
+        let contract_sym = Symbol::new(&f.env, "escrow");
+        let evt_sym = Symbol::new(&f.env, event_type);
+        let mut n = 0u32;
+        for (_addr, topics, _data) in f.env.events().all().iter() {
+            if topics.len() != 3 {
+                continue;
+            }
+            let c = Symbol::try_from_val(&f.env, &topics.get(0).unwrap());
+            let v = u32::try_from_val(&f.env, &topics.get(1).unwrap());
+            let e = Symbol::try_from_val(&f.env, &topics.get(2).unwrap());
+            if let (Ok(c), Ok(v), Ok(e)) = (c, v, e) {
+                if c == contract_sym && v == 1u32 && e == evt_sym {
+                    n += 1;
+                }
+            }
+        }
+        n
+    }
+
+    #[test]
+    fn test_standard_created_and_released_events_emitted() {
+        let f = TestFixture::setup_with_fee(500);
+        let id = f.create_escrow_at(1_000, 0);
+        assert_eq!(
+            count_standard_escrow_events(&f, "created"),
+            1,
+            "one standardized 'created' event expected"
+        );
+
+        f.client().release_funds(&f.learner, &id);
+        assert_eq!(
+            count_standard_escrow_events(&f, "released"),
+            1,
+            "one standardized 'released' event expected"
+        );
+    }
+
+    #[test]
+    fn test_standard_dispute_and_resolve_events_emitted() {
+        let f = TestFixture::setup_with_fee(0);
+        let id = f.create_escrow_at(1_000, 0);
+        f.open_dispute(id);
+        assert_eq!(count_standard_escrow_events(&f, "disputed"), 1);
+
+        f.client().resolve_dispute(&id, &50u32);
+        assert_eq!(count_standard_escrow_events(&f, "resolved"), 1);
+    }
+
+    #[test]
+    fn test_standard_refunded_event_emitted() {
+        let f = TestFixture::setup_with_fee(0);
+        let id = f.create_escrow_at(1_000, 0);
+        f.client().refund(&id);
+        assert_eq!(count_standard_escrow_events(&f, "refunded"), 1);
     }
 }

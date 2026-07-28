@@ -43,6 +43,7 @@ pub enum DataKey {
     Bounty(u32),
     Claim(u32, Address), // (bounty_id, learner)
     ClaimEvidence(u32, Address), // (bounty_id, learner)
+    BountyLock(u32),
 }
 
 // ---------------------------------------------------------------------------
@@ -374,10 +375,17 @@ impl BountyContract {
         learner: Address,
         reviewer_notes_hash: BytesN<32>,
     ) {
+        let lock_key = DataKey::BountyLock(bounty_id);
+        if env.storage().persistent().get(&lock_key).unwrap_or(false) {
+            panic!("Bounty is locked");
+        }
+        env.storage().persistent().set(&lock_key, &true);
+
         mentor.require_auth();
 
         let zero_hash = BytesN::from_array(&env, &[0u8; 32]);
         if reviewer_notes_hash == zero_hash {
+            env.storage().persistent().set(&lock_key, &false);
             panic!("Reviewer notes hash cannot be zero");
         }
 
@@ -394,6 +402,7 @@ impl BountyContract {
                 args
             });
         if !is_verified {
+            env.storage().persistent().set(&lock_key, &false);
             panic!("Mentor is not verified");
         }
 
@@ -404,9 +413,11 @@ impl BountyContract {
             .expect("Bounty not found");
 
         if bounty.status == BountyStatus::Verified {
+            env.storage().persistent().set(&lock_key, &false);
             panic!("Bounty already verified");
         }
         if bounty.status == BountyStatus::Refunded {
+            env.storage().persistent().set(&lock_key, &false);
             panic!("Bounty already refunded");
         }
 
@@ -418,6 +429,7 @@ impl BountyContract {
             .expect("No claim found for this learner");
 
         if claim.status == ClaimStatus::Disputed {
+            env.storage().persistent().set(&lock_key, &false);
             panic!("Claim is disputed");
         }
 
@@ -437,13 +449,11 @@ impl BountyContract {
         }
 
         if total_remaining == 0 {
+            env.storage().persistent().set(&lock_key, &false);
             panic!("All milestones already completed");
         }
 
-        // Release remaining reward to learner
-        let token_client = token::Client::new(&env, &bounty.token);
-        token_client.transfer(&env.current_contract_address(), &learner, &total_remaining);
-
+        // Checks-Effects-Interactions: Update state BEFORE token transfer
         claim.status = ClaimStatus::Verified;
         env.storage().persistent().set(&claim_key, &claim);
         env.storage()
@@ -460,6 +470,13 @@ impl BountyContract {
             .persistent()
             .extend_ttl(&DataKey::Bounty(bounty_id), TTL_THRESHOLD, TTL_BUMP);
         env.storage().instance().extend_ttl(TTL_THRESHOLD, TTL_BUMP);
+
+        // Release remaining reward to learner after state update
+        let token_client = token::Client::new(&env, &bounty.token);
+        token_client.transfer(&env.current_contract_address(), &learner, &total_remaining);
+
+        // Unlock bounty lock
+        env.storage().persistent().set(&lock_key, &false);
 
         emit_bounty_event(
             &env,
@@ -483,10 +500,17 @@ impl BountyContract {
         milestone_index: u32,
         reviewer_notes_hash: BytesN<32>,
     ) {
+        let lock_key = DataKey::BountyLock(bounty_id);
+        if env.storage().persistent().get(&lock_key).unwrap_or(false) {
+            panic!("Bounty is locked");
+        }
+        env.storage().persistent().set(&lock_key, &true);
+
         mentor.require_auth();
 
         let zero_hash = BytesN::from_array(&env, &[0u8; 32]);
         if reviewer_notes_hash == zero_hash {
+            env.storage().persistent().set(&lock_key, &false);
             panic!("Reviewer notes hash cannot be zero");
         }
 
@@ -503,6 +527,7 @@ impl BountyContract {
                 args
             });
         if !is_verified {
+            env.storage().persistent().set(&lock_key, &false);
             panic!("Mentor is not verified");
         }
 
@@ -513,19 +538,23 @@ impl BountyContract {
             .expect("Bounty not found");
 
         if bounty.status == BountyStatus::Verified {
+            env.storage().persistent().set(&lock_key, &false);
             panic!("Bounty already fully verified");
         }
         if bounty.status == BountyStatus::Refunded {
+            env.storage().persistent().set(&lock_key, &false);
             panic!("Bounty already refunded");
         }
 
         // Validate milestone index
         if milestone_index as u32 >= bounty.milestones.len() {
+            env.storage().persistent().set(&lock_key, &false);
             panic!("Milestone index out of bounds");
         }
 
         let milestone_ref = &bounty.milestones.get(milestone_index).unwrap();
         if milestone_ref.completed {
+            env.storage().persistent().set(&lock_key, &false);
             panic!("Milestone already completed");
         }
 
@@ -538,24 +567,20 @@ impl BountyContract {
             .expect("No claim found for this learner");
 
         if claim.status == ClaimStatus::Disputed {
+            env.storage().persistent().set(&lock_key, &false);
             panic!("Claim is disputed");
         }
 
         // Calculate milestone reward
         let milestone_reward = bounty.reward * (milestone_ref.reward_bps as i128) / 10000;
 
-        // Transfer milestone reward to learner
-        let token_client = token::Client::new(&env, &bounty.token);
-        token_client.transfer(&env.current_contract_address(), &learner, &milestone_reward);
-
-        // Mark milestone as completed
+        // Checks-Effects-Interactions: Update state BEFORE token transfer
         let mut milestones = bounty.milestones.clone();
         let mut updated_milestone = milestone_ref.clone();
         updated_milestone.completed = true;
         updated_milestone.completed_by = Some(learner.clone());
         milestones.set(milestone_index, updated_milestone);
 
-        // Check if all milestones are now completed
         let all_completed = milestones.iter().all(|m| m.completed);
 
         if all_completed {
@@ -581,6 +606,13 @@ impl BountyContract {
             .persistent()
             .extend_ttl(&DataKey::Bounty(bounty_id), TTL_THRESHOLD, TTL_BUMP);
         env.storage().instance().extend_ttl(TTL_THRESHOLD, TTL_BUMP);
+
+        // Transfer milestone reward to learner after state update
+        let token_client = token::Client::new(&env, &bounty.token);
+        token_client.transfer(&env.current_contract_address(), &learner, &milestone_reward);
+
+        // Unlock bounty lock
+        env.storage().persistent().set(&lock_key, &false);
 
         emit_bounty_event(
             &env,

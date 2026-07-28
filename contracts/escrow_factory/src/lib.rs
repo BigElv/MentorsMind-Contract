@@ -1,8 +1,9 @@
 #![no_std]
 use soroban_sdk::{
-    contract, contractimpl, contracttype, symbol_short, token, Address, BytesN, Env, IntoVal,
+    contract, contractimpl, contracttype, symbol_short, Address, Bytes, BytesN, Env, IntoVal,
     Symbol, Vec,
 };
+use soroban_sdk::xdr::ToXdr;
 
 // Pull in the shared signature-validation utilities.
 use shared::sig_validation::{current_nonce, validate_and_consume_nonce, MetaTxAction, MetaTxPayload};
@@ -21,6 +22,8 @@ pub struct EscrowInfo {
 const ADMIN: Symbol = symbol_short!("ADMIN");
 const IMPLEMENTATION: Symbol = symbol_short!("IMPL");
 const PAUSE_GUARDIAN: Symbol = symbol_short!("PAUSE_GD");
+const ANOMALY_DETECTOR: Symbol = symbol_short!("ANOM_DET");
+const BYPASS_ANOMALY: Symbol = symbol_short!("BYPASS_AN");
 const ESCROW_MAPPING: Symbol = symbol_short!("ESC_MAP");
 const ESCROW_LIST: Symbol = symbol_short!("ESC_LIST");
 const ESCROW_COUNT: Symbol = symbol_short!("ESC_CNT");
@@ -29,6 +32,7 @@ const ESCROW_COUNT: Symbol = symbol_short!("ESC_CNT");
 /// deployment after a previous one expired produces a different salt (and
 /// therefore a different address) instead of colliding.
 const SESSION_NONCE: Symbol = symbol_short!("SESS_NCE");
+const INTERFACE_REGISTRY: Symbol = symbol_short!("IF_REG");
 const FACTORY_TTL_THRESHOLD: u32 = 500_000;
 const FACTORY_TTL_BUMP: u32 = 1_000_000;
 
@@ -59,6 +63,25 @@ pub const TIMESTAMP_TOLERANCE_SECS: u64 = 60; // 1 minute
 /// A supplied start that is more than this many seconds in the past is
 /// rejected to prevent replaying stale session parameters.
 const MAX_PAST_START_SECS: u64 = 5 * 60; // 5 minutes
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PendingAdminChange {
+    pub new_admin: Address,
+    pub effective_at: u64,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AdminChangeProposedEvent {
+    pub contract: Address,
+    pub old_admin: Address,
+    pub new_admin: Address,
+    pub effective_at: u64,
+}
+
+const ADMIN_CHANGE_TIMELOCK: u64 = 48 * 60 * 60;
+const PENDING_ADMIN: Symbol = symbol_short!("PEND_ADM");
 
 #[contract]
 pub struct EscrowFactory;
@@ -93,6 +116,69 @@ impl EscrowFactory {
         );
     }
 
+    pub fn propose_admin_change(
+        env: Env,
+        current_admin: Address,
+        new_admin: Address,
+    ) {
+        Self::require_admin(&env, &current_admin);
+        let old_admin = Self::admin(&env);
+        let effective_at = env
+            .ledger()
+            .timestamp()
+            .checked_add(ADMIN_CHANGE_TIMELOCK)
+            .expect("timestamp overflow");
+        env.storage().persistent().set(
+            &PENDING_ADMIN,
+            &PendingAdminChange {
+                new_admin: new_admin.clone(),
+                effective_at,
+            },
+        );
+        env.events().publish(
+            (symbol_short!("admin"), symbol_short!("proposed")),
+            AdminChangeProposedEvent {
+                contract: env.current_contract_address(),
+                old_admin,
+                new_admin,
+                effective_at,
+            },
+        );
+    }
+
+    pub fn accept_admin_change(env: Env, new_admin: Address) {
+        new_admin.require_auth();
+        let pending: PendingAdminChange = env
+            .storage()
+            .persistent()
+            .get(&PENDING_ADMIN)
+            .expect("no pending admin change");
+        if pending.new_admin != new_admin {
+            panic!("unauthorized");
+        }
+        if env.ledger().timestamp() < pending.effective_at {
+            panic!("admin change not yet effective");
+        }
+        env.storage().persistent().set(&ADMIN, &new_admin);
+        env.storage().persistent().remove(&PENDING_ADMIN);
+    }
+
+    pub fn cancel_admin_change(env: Env, multisig: Address) {
+        multisig.require_auth();
+        if !env.storage().persistent().has(&PENDING_ADMIN) {
+            panic!("no pending admin change");
+        }
+        env.storage().persistent().remove(&PENDING_ADMIN);
+    }
+
+    pub fn get_pending_admin_change(env: Env) -> Option<PendingAdminChange> {
+        env.storage().persistent().get(&PENDING_ADMIN)
+    }
+
+    pub fn get_admin(env: Env) -> Address {
+        Self::admin(&env)
+    }
+
     /// Set the pause guardian contract address. Admin only.
     pub fn set_pause_guardian(env: Env, guardian: Address) {
         let admin = Self::admin(&env);
@@ -101,6 +187,30 @@ impl EscrowFactory {
         env.storage()
             .persistent()
             .extend_ttl(&PAUSE_GUARDIAN, FACTORY_TTL_THRESHOLD, FACTORY_TTL_BUMP);
+    }
+
+    /// Set the interface registry contract address. Admin only.
+    pub fn set_interface_registry(env: Env, registry: Address) {
+        let admin = Self::admin(&env);
+        admin.require_auth();
+        env.storage().persistent().set(&INTERFACE_REGISTRY, &registry);
+        env.storage()
+            .persistent()
+            .extend_ttl(&INTERFACE_REGISTRY, FACTORY_TTL_THRESHOLD, FACTORY_TTL_BUMP);
+    }
+
+    pub fn set_anomaly_detector(env: Env, detector: Address) {
+        let admin = Self::admin(&env);
+        admin.require_auth();
+        env.storage().persistent().set(&ANOMALY_DETECTOR, &detector);
+        env.storage().persistent().extend_ttl(&ANOMALY_DETECTOR, FACTORY_TTL_THRESHOLD, FACTORY_TTL_BUMP);
+    }
+
+    pub fn set_bypass_anomaly_check(env: Env, bypass: bool) {
+        let admin = Self::admin(&env);
+        admin.require_auth();
+        env.storage().persistent().set(&BYPASS_ANOMALY, &bypass);
+        env.storage().persistent().extend_ttl(&BYPASS_ANOMALY, FACTORY_TTL_THRESHOLD, FACTORY_TTL_BUMP);
     }
 
     /// Deploy a new escrow contract instance using minimal proxy pattern.
@@ -128,6 +238,22 @@ impl EscrowFactory {
             );
             if is_paused {
                 panic!("Contract is paused");
+            }
+        }
+        // Anomaly detection check
+        let bypass: bool = env.storage().persistent().get(&BYPASS_ANOMALY).unwrap_or(false);
+        if !bypass {
+            if let Some(anomaly_detector) = env.storage().persistent().get::<_, Address>(&ANOMALY_DETECTOR) {
+                let res: u32 = env.invoke_contract(
+                    &anomaly_detector,
+                    &Symbol::new(&env, "check_anomaly"),
+                    (learner.clone(), 0u32, amount).into_val(&env), // 0u32 = AnomalyAction::CreateEscrow
+                );
+                if res == 2 {
+                    panic!("UserOnHold");
+                } else if res == 1 {
+                    env.events().publish((symbol_short!("anom_warn"), learner.clone()), amount);
+                }
             }
         }
         // Check if session ID already exists
@@ -175,14 +301,14 @@ impl EscrowFactory {
 
         // Initialize the new escrow contract
         let initialize_sym = Symbol::new(&env, "initialize");
-        env.invoke_contract(
+        let _: () = env.invoke_contract(
             &escrow_address,
             &initialize_sym,
             (
                 env.current_contract_address(), // Set factory as admin
-                Address::generate(&env),        // Treasury (placeholder)
+                env.current_contract_address(), // Treasury (placeholder)
                 0u32,                           // Fee bps (placeholder)
-                Vec::new(&env),                 // Approved tokens (empty for now)
+                Vec::<Address>::new(&env),      // Approved tokens (empty for now)
                 72u64 * 60 * 60,                // Auto release delay (72 hours)
             )
                 .into_val(&env),
@@ -190,12 +316,12 @@ impl EscrowFactory {
 
         // Create escrow in the deployed contract
         let create_escrow_sym = Symbol::new(&env, "create_escrow");
-        env.invoke_contract(
+        let _: Address = env.invoke_contract(
             &escrow_address,
             &create_escrow_sym,
             (
-                mentor,
-                learner,
+                mentor.clone(),
+                learner.clone(),
                 amount,
                 session_id.clone(),
                 token,
@@ -239,9 +365,19 @@ impl EscrowFactory {
 
         // Emit event
         env.events().publish(
-            (symbol_short!("escrow_deployed"), session_id.clone()),
+            (Symbol::new(&env, "escrow_deployed"), session_id.clone()),
             (escrow_address.clone(), session_id),
         );
+
+        // Register interface in the interface registry (if set)
+        if let Some(registry_addr) = env.storage().persistent().get::<_, Address>(&INTERFACE_REGISTRY) {
+            let interface_id = Symbol::new(&env, "escrow_v1");
+            let _: () = env.invoke_contract(
+                &registry_addr,
+                &Symbol::new(&env, "register_interface"),
+                (escrow_address.clone(), interface_id, 1u32).into_val(&env),
+            );
+        }
 
         escrow_address
     }
@@ -338,7 +474,7 @@ impl EscrowFactory {
         );
 
         env.events().publish(
-            (symbol_short!("implementation_upgraded")),
+            (Symbol::new(&env, "impl_upgraded"),),
             (new_implementation, env.ledger().timestamp()),
         );
     }
