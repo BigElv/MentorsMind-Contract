@@ -58,9 +58,9 @@ members = [
     "escrow",
     "multisig",
     "tools",
+    "tools/storage_scanner",
     "benchmarks",
     "tests",
-    "tools/storage_scanner",
 ]
 
 [workspace.package]

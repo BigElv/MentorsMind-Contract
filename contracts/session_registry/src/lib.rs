@@ -1,6 +1,6 @@
 #![no_std]
 
-use soroban_sdk::{contract, contractimpl, contracttype, symbol_short, Address, Env, Symbol, Vec};
+use soroban_sdk::{contract, contractimpl, contracttype, symbol_short, Address, Env, String, Symbol, Vec};
 
 // ── Storage keys ─────────────────────────────────────────────────────────────
 const BACKEND: Symbol = symbol_short!("BACKEND");
@@ -35,8 +35,15 @@ pub struct SessionRecord {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum DataKey {
     Session(Symbol),
+    /// Deprecated: kept for backward compat, no longer written to
     MentorSessions(Address),
+    /// Deprecated: kept for backward compat, no longer written to
     LearnerSessions(Address),
+    MentorSessionCount(Address),
+    MentorSessionAt(Address, u32),
+    LearnerSessionCount(Address),
+    LearnerSessionAt(Address, u32),
+    SessionOracle,
     SessionMetadata(Symbol),
 }
 
@@ -96,35 +103,33 @@ impl SessionRegistry {
             .persistent()
             .extend_ttl(&session_key, TTL_THRESHOLD, TTL_BUMP);
 
-        // Index by mentor
-        let mentor_key = DataKey::MentorSessions(mentor.clone());
-        let mut mentor_sessions: Vec<Symbol> = env
+        // Index by mentor (indexed storage)
+        let mentor_count_key = DataKey::MentorSessionCount(mentor.clone());
+        let mentor_idx: u32 = env
             .storage()
             .persistent()
-            .get(&mentor_key)
-            .unwrap_or(Vec::new(&env));
-        mentor_sessions.push_back(session_id.clone());
+            .get(&mentor_count_key)
+            .unwrap_or(0);
         env.storage()
             .persistent()
-            .set(&mentor_key, &mentor_sessions);
+            .set(&DataKey::MentorSessionAt(mentor.clone(), mentor_idx), &session_id.clone());
         env.storage()
             .persistent()
-            .extend_ttl(&mentor_key, TTL_THRESHOLD, TTL_BUMP);
+            .set(&mentor_count_key, &(mentor_idx + 1));
 
-        // Index by learner
-        let learner_key = DataKey::LearnerSessions(learner.clone());
-        let mut learner_sessions: Vec<Symbol> = env
+        // Index by learner (indexed storage)
+        let learner_count_key = DataKey::LearnerSessionCount(learner.clone());
+        let learner_idx: u32 = env
             .storage()
             .persistent()
-            .get(&learner_key)
-            .unwrap_or(Vec::new(&env));
-        learner_sessions.push_back(session_id.clone());
+            .get(&learner_count_key)
+            .unwrap_or(0);
         env.storage()
             .persistent()
-            .set(&learner_key, &learner_sessions);
+            .set(&DataKey::LearnerSessionAt(learner.clone(), learner_idx), &session_id.clone());
         env.storage()
             .persistent()
-            .extend_ttl(&learner_key, TTL_THRESHOLD, TTL_BUMP);
+            .set(&learner_count_key, &(learner_idx + 1));
 
         // Emit event
         env.events().publish(
@@ -220,20 +225,81 @@ impl SessionRegistry {
             .expect("Session not found")
     }
 
-    /// Get all session IDs for a mentor.
-    pub fn get_sessions_by_mentor(env: Env, mentor: Address) -> Vec<Symbol> {
-        env.storage()
+    /// Get paginated session IDs for a mentor.
+    /// `offset` is the starting index, `limit` is the max items to return.
+    pub fn get_sessions_by_mentor_page(
+        env: Env,
+        mentor: Address,
+        offset: u32,
+        limit: u32,
+    ) -> Vec<Symbol> {
+        let count: u32 = env
+            .storage()
             .persistent()
-            .get(&DataKey::MentorSessions(mentor))
-            .unwrap_or(Vec::new(&env))
+            .get(&DataKey::MentorSessionCount(mentor.clone()))
+            .unwrap_or(0);
+        let mut result = Vec::new(&env);
+        let start = offset.min(count);
+        let end = (offset + limit).min(count);
+        for i in start..end {
+            let key = DataKey::MentorSessionAt(mentor.clone(), i);
+            if let Some(sid) = env.storage().persistent().get::<_, Symbol>(&key) {
+                result.push_back(sid);
+            }
+        }
+        result
     }
 
-    /// Get all session IDs for a learner.
+    /// Get paginated session IDs for a learner.
+    pub fn get_sessions_by_learner_page(
+        env: Env,
+        learner: Address,
+        offset: u32,
+        limit: u32,
+    ) -> Vec<Symbol> {
+        let count: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::LearnerSessionCount(learner.clone()))
+            .unwrap_or(0);
+        let mut result = Vec::new(&env);
+        let start = offset.min(count);
+        let end = (offset + limit).min(count);
+        for i in start..end {
+            let key = DataKey::LearnerSessionAt(learner.clone(), i);
+            if let Some(sid) = env.storage().persistent().get::<_, Symbol>(&key) {
+                result.push_back(sid);
+            }
+        }
+        result
+    }
+
+    /// Deprecated: returns first 50 sessions for a mentor.
+    /// Use `get_sessions_by_mentor_page` for full paginated access.
+    pub fn get_sessions_by_mentor(env: Env, mentor: Address) -> Vec<Symbol> {
+        Self::get_sessions_by_mentor_page(env, mentor, 0, 50)
+    }
+
+    /// Deprecated: returns first 50 sessions for a learner.
+    /// Use `get_sessions_by_learner_page` for full paginated access.
     pub fn get_sessions_by_learner(env: Env, learner: Address) -> Vec<Symbol> {
+        Self::get_sessions_by_learner_page(env, learner, 0, 50)
+    }
+
+    /// Get total session count for a mentor.
+    pub fn get_mentor_session_count(env: Env, mentor: Address) -> u32 {
         env.storage()
             .persistent()
-            .get(&DataKey::LearnerSessions(learner))
-            .unwrap_or(Vec::new(&env))
+            .get(&DataKey::MentorSessionCount(mentor))
+            .unwrap_or(0)
+    }
+
+    /// Get total session count for a learner.
+    pub fn get_learner_session_count(env: Env, learner: Address) -> u32 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::LearnerSessionCount(learner))
+            .unwrap_or(0)
     }
 
     fn require_backend(env: &Env) -> Address {
@@ -389,6 +455,17 @@ mod tests {
 
         let learner_sessions = client.get_sessions_by_learner(&learner);
         assert_eq!(learner_sessions.len(), 3);
+
+        // Test paginated queries
+        let page1 = client.get_sessions_by_mentor_page(&mentor, &0u32, &2u32);
+        assert_eq!(page1.len(), 2);
+
+        let page2 = client.get_sessions_by_mentor_page(&mentor, &2u32, &2u32);
+        assert_eq!(page2.len(), 1);
+
+        // Test count functions
+        assert_eq!(client.get_mentor_session_count(&mentor), 3);
+        assert_eq!(client.get_learner_session_count(&learner), 3);
     }
 
     #[test]
