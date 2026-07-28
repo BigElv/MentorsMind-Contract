@@ -20,6 +20,9 @@ pub enum Error {
     AlreadyStaked = 4,
     NoStakeFound = 5,
     StillLocked = 6,
+    NoPendingAdminChange = 7,
+    AdminChangeNotYetEffective = 8,
+    InvalidAdminChange = 9,
 }
 
 // ---------------------------------------------------------------------------
@@ -41,6 +44,24 @@ pub struct UnstakedEventData {
     pub mentor: Address,
     pub amount: i128,
 }
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PendingAdminChange {
+    pub new_admin: Address,
+    pub effective_at: u64,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AdminChangeProposedEvent {
+    pub contract: Address,
+    pub old_admin: Address,
+    pub new_admin: Address,
+    pub effective_at: u64,
+}
+
+const ADMIN_CHANGE_TIMELOCK: u64 = 48 * 60 * 60;
 
 // ---------------------------------------------------------------------------
 // Storage keys
@@ -77,6 +98,7 @@ pub enum DataKey {
     StakerNextClaimEpoch(Address),
     AnomalyDetector,
     BypassAnomalyCheck,
+    PendingAdmin,
 }
 
 // ---------------------------------------------------------------------------
@@ -130,13 +152,75 @@ impl StakingContract {
         Ok(())
     }
 
-    /// Set or update the pause guardian contract address (admin only).
-    pub fn set_pause_guardian(env: Env, guardian: Address) -> Result<(), Error> {
-        let admin = env
+    pub fn propose_admin_change(
+        env: Env,
+        current_admin: Address,
+        new_admin: Address,
+    ) -> Result<(), Error> {
+        Self::require_admin(&env, &current_admin)?;
+        let old_admin = Self::admin(&env)?;
+        let effective_at = env
+            .ledger()
+            .timestamp()
+            .checked_add(ADMIN_CHANGE_TIMELOCK)
+            .ok_or(Error::InvalidAdminChange)?;
+        env.storage().instance().set(
+            &DataKey::PendingAdmin,
+            &PendingAdminChange {
+                new_admin: new_admin.clone(),
+                effective_at,
+            },
+        );
+        env.events().publish(
+            (Symbol::new(&env, "admin"), Symbol::new(&env, "proposed")),
+            AdminChangeProposedEvent {
+                contract: env.current_contract_address(),
+                old_admin,
+                new_admin,
+                effective_at,
+            },
+        );
+        Ok(())
+    }
+
+    pub fn accept_admin_change(env: Env, new_admin: Address) -> Result<(), Error> {
+        new_admin.require_auth();
+        let pending: PendingAdminChange = env
             .storage()
             .instance()
-            .get::<DataKey, Address>(&DataKey::Admin)
-            .ok_or(Error::NotInitialized)?;
+            .get(&DataKey::PendingAdmin)
+            .ok_or(Error::NoPendingAdminChange)?;
+        if pending.new_admin != new_admin {
+            return Err(Error::Unauthorized);
+        }
+        if env.ledger().timestamp() < pending.effective_at {
+            return Err(Error::AdminChangeNotYetEffective);
+        }
+        env.storage().instance().set(&DataKey::Admin, &new_admin);
+        env.storage().instance().remove(&DataKey::PendingAdmin);
+        Ok(())
+    }
+
+    pub fn cancel_admin_change(env: Env, multisig: Address) -> Result<(), Error> {
+        multisig.require_auth();
+        if !env.storage().instance().has(&DataKey::PendingAdmin) {
+            return Err(Error::NoPendingAdminChange);
+        }
+        env.storage().instance().remove(&DataKey::PendingAdmin);
+        Ok(())
+    }
+
+    pub fn get_pending_admin_change(env: Env) -> Option<PendingAdminChange> {
+        env.storage().instance().get(&DataKey::PendingAdmin)
+    }
+
+    pub fn get_admin(env: Env) -> Result<Address, Error> {
+        Self::admin(&env)
+    }
+
+    /// Set or update the pause guardian contract address (admin only).
+    pub fn set_pause_guardian(env: Env, guardian: Address) -> Result<(), Error> {
+        let admin = Self::admin(&env)?;
         admin.require_auth();
         env.storage()
             .instance()
@@ -154,6 +238,22 @@ impl StakingContract {
         env.storage()
             .instance()
             .set(&DataKey::AnomalyDetector, &detector);
+    }
+
+    fn admin(env: &Env) -> Result<Address, Error> {
+        env.storage()
+            .instance()
+            .get::<DataKey, Address>(&DataKey::Admin)
+            .ok_or(Error::NotInitialized)
+    }
+
+    fn require_admin(env: &Env, admin: &Address) -> Result<(), Error> {
+        admin.require_auth();
+        let stored_admin = Self::admin(env)?;
+        if stored_admin != *admin {
+            return Err(Error::Unauthorized);
+        }
+        Ok(())
     }
 
     pub fn set_bypass_anomaly_check(env: Env, bypass: bool) {

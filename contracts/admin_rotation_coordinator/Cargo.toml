@@ -1,20 +1,17 @@
 [package]
-name = "mentorminds-referral"
+name = "admin-rotation-coordinator"
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.70"
 
 [lib]
-crate-type = ["cdylib"]
+crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 soroban-sdk = { workspace = true }
-shared = { path = "../shared" }
-mentorminds-mnt-token = { path = "../mnt-token" }
 
 [dev-dependencies]
 soroban-sdk = { workspace = true, features = ["testutils"] }
-mentorminds-referral-leaderboard = { path = "../referral_leaderboard" }
 
 [features]
 testutils = ["soroban-sdk/testutils"]

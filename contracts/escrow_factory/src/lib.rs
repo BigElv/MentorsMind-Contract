@@ -64,6 +64,25 @@ pub const TIMESTAMP_TOLERANCE_SECS: u64 = 60; // 1 minute
 /// rejected to prevent replaying stale session parameters.
 const MAX_PAST_START_SECS: u64 = 5 * 60; // 5 minutes
 
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PendingAdminChange {
+    pub new_admin: Address,
+    pub effective_at: u64,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AdminChangeProposedEvent {
+    pub contract: Address,
+    pub old_admin: Address,
+    pub new_admin: Address,
+    pub effective_at: u64,
+}
+
+const ADMIN_CHANGE_TIMELOCK: u64 = 48 * 60 * 60;
+const PENDING_ADMIN: Symbol = symbol_short!("PEND_ADM");
+
 #[contract]
 pub struct EscrowFactory;
 
@@ -95,6 +114,69 @@ impl EscrowFactory {
             FACTORY_TTL_THRESHOLD,
             FACTORY_TTL_BUMP,
         );
+    }
+
+    pub fn propose_admin_change(
+        env: Env,
+        current_admin: Address,
+        new_admin: Address,
+    ) {
+        Self::require_admin(&env, &current_admin);
+        let old_admin = Self::admin(&env);
+        let effective_at = env
+            .ledger()
+            .timestamp()
+            .checked_add(ADMIN_CHANGE_TIMELOCK)
+            .expect("timestamp overflow");
+        env.storage().persistent().set(
+            &PENDING_ADMIN,
+            &PendingAdminChange {
+                new_admin: new_admin.clone(),
+                effective_at,
+            },
+        );
+        env.events().publish(
+            (symbol_short!("admin"), symbol_short!("proposed")),
+            AdminChangeProposedEvent {
+                contract: env.current_contract_address(),
+                old_admin,
+                new_admin,
+                effective_at,
+            },
+        );
+    }
+
+    pub fn accept_admin_change(env: Env, new_admin: Address) {
+        new_admin.require_auth();
+        let pending: PendingAdminChange = env
+            .storage()
+            .persistent()
+            .get(&PENDING_ADMIN)
+            .expect("no pending admin change");
+        if pending.new_admin != new_admin {
+            panic!("unauthorized");
+        }
+        if env.ledger().timestamp() < pending.effective_at {
+            panic!("admin change not yet effective");
+        }
+        env.storage().persistent().set(&ADMIN, &new_admin);
+        env.storage().persistent().remove(&PENDING_ADMIN);
+    }
+
+    pub fn cancel_admin_change(env: Env, multisig: Address) {
+        multisig.require_auth();
+        if !env.storage().persistent().has(&PENDING_ADMIN) {
+            panic!("no pending admin change");
+        }
+        env.storage().persistent().remove(&PENDING_ADMIN);
+    }
+
+    pub fn get_pending_admin_change(env: Env) -> Option<PendingAdminChange> {
+        env.storage().persistent().get(&PENDING_ADMIN)
+    }
+
+    pub fn get_admin(env: Env) -> Address {
+        Self::admin(&env)
     }
 
     /// Set the pause guardian contract address. Admin only.
