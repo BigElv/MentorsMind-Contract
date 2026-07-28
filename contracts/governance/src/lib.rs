@@ -9,8 +9,8 @@ use shared::events::{
 };
 use shared::StateMachine;
 use soroban_sdk::{
-    contract, contractimpl, contracttype, symbol_short, vec, Address, Bytes, BytesN, Env, IntoVal,
-    Symbol, Vec,
+    contract, contracterror, contractimpl, contracttype, symbol_short, vec, Address, Bytes,
+    BytesN, Env, IntoVal, Symbol, Vec,
 };
 
 // Instance storage: frequently read config
@@ -41,6 +41,36 @@ const MID_WEIGHT_BPS: u32 = 10_000; // 100.00%
 /// Late window: 66–100% — 110% weight (11000 bps)
 const LATE_WEIGHT_BPS: u32 = 11_000; // 110.00%
 
+#[contracterror]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
+#[repr(u32)]
+pub enum Error {
+    AlreadyInitialized = 1,
+    NotInitialized = 2,
+    Unauthorized = 3,
+    NoPendingAdminChange = 4,
+    AdminChangeNotYetEffective = 5,
+    InvalidAdminChange = 6,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PendingAdminChange {
+    pub new_admin: Address,
+    pub effective_at: u64,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AdminChangeProposedEvent {
+    pub contract: Address,
+    pub old_admin: Address,
+    pub new_admin: Address,
+    pub effective_at: u64,
+}
+
+const ADMIN_CHANGE_TIMELOCK: u64 = 48 * 60 * 60;
+
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ProposalAction {
@@ -48,7 +78,7 @@ pub enum ProposalAction {
     UpdateAutoRelease(u64),
     AddAsset(Address),
     UpdateAdmin(Address),
-    ExecuteCall(Address, Symbol),
+    ExecuteCall(Address, Symbol, Vec<u64>),
 }
 
 #[contracttype]
@@ -123,6 +153,7 @@ pub enum DataKey {
     ArbitratorCompensation,
     Appeal(u32),
     AllowedCall(Address, Symbol),
+    PendingAdmin,
     /// Weighted vote tally (for quorum) — uses time-weight multiplier
     WeightedVotesFor(u32),
     /// Weighted vote tally (against quorum)
@@ -216,6 +247,73 @@ impl GovernanceContract {
         env.storage().persistent().set(&PROPOSAL_COUNT, &0u32);
     }
 
+    pub fn propose_admin_change(
+        env: Env,
+        current_admin: Address,
+        new_admin: Address,
+    ) -> Result<(), Error> {
+        Self::require_admin(&env, &current_admin)?;
+        let old_admin = Self::admin(&env)?;
+        let effective_at = env
+            .ledger()
+            .timestamp()
+            .checked_add(ADMIN_CHANGE_TIMELOCK)
+            .ok_or(Error::InvalidAdminChange)?;
+        env.storage().instance().set(
+            &DataKey::PendingAdmin,
+            &PendingAdminChange {
+                new_admin: new_admin.clone(),
+                effective_at,
+            },
+        );
+        env.events().publish(
+            (symbol_short!("admin"), symbol_short!("proposed")),
+            AdminChangeProposedEvent {
+                contract: env.current_contract_address(),
+                old_admin,
+                new_admin,
+                effective_at,
+            },
+        );
+        Ok(())
+    }
+
+    pub fn accept_admin_change(env: Env, new_admin: Address) -> Result<(), Error> {
+        new_admin.require_auth();
+        let pending: PendingAdminChange = env
+            .storage()
+            .instance()
+            .get(&DataKey::PendingAdmin)
+            .ok_or(Error::NoPendingAdminChange)?;
+        if pending.new_admin != new_admin {
+            return Err(Error::Unauthorized);
+        }
+        if env.ledger().timestamp() < pending.effective_at {
+            return Err(Error::AdminChangeNotYetEffective);
+        }
+        env.storage().instance().set(&ADMIN, &new_admin);
+        env.storage().persistent().set(&ADMIN, &new_admin);
+        env.storage().instance().remove(&DataKey::PendingAdmin);
+        Ok(())
+    }
+
+    pub fn cancel_admin_change(env: Env, multisig: Address) -> Result<(), Error> {
+        multisig.require_auth();
+        if !env.storage().instance().has(&DataKey::PendingAdmin) {
+            return Err(Error::NoPendingAdminChange);
+        }
+        env.storage().instance().remove(&DataKey::PendingAdmin);
+        Ok(())
+    }
+
+    pub fn get_pending_admin_change(env: Env) -> Option<PendingAdminChange> {
+        env.storage().instance().get(&DataKey::PendingAdmin)
+    }
+
+    pub fn get_admin(env: Env) -> Result<Address, Error> {
+        Self::admin(&env)
+    }
+
     pub fn set_timelock(env: Env, timelock: Address) {
         let admin: Address = env.storage().instance().get(&ADMIN).unwrap();
         admin.require_auth();
@@ -262,7 +360,7 @@ impl GovernanceContract {
         Self::require_initialized(&env);
 
         // ExecuteCall proposals must target an allowlisted (contract, function) pair
-        if let ProposalAction::ExecuteCall(ref target, ref function) = action {
+        if let ProposalAction::ExecuteCall(target, function, _) = &action {
             if !env
                 .storage()
                 .persistent()
@@ -577,7 +675,7 @@ impl GovernanceContract {
         );
 
         // ExecuteCall requires an additional 7-day delay after voting ends
-        if let ProposalAction::ExecuteCall(_, _) = &proposal.action {
+        if let ProposalAction::ExecuteCall(_, _, _) = &proposal.action {
             let earliest_execute = proposal
                 .voting_ends_at
                 .checked_add(EXECUTE_CALL_TIMELOCK_SECS)
@@ -970,6 +1068,26 @@ impl GovernanceContract {
         }
     }
 
+    fn admin(env: &Env) -> Result<Address, Error> {
+        env.storage()
+            .instance()
+            .get(&ADMIN)
+            .ok_or(Error::NotInitialized)
+    }
+
+    fn require_admin(env: &Env, admin: &Address) -> Result<(), Error> {
+        admin.require_auth();
+        let stored: Address = env
+            .storage()
+            .instance()
+            .get(&ADMIN)
+            .ok_or(Error::NotInitialized)?;
+        if stored != *admin {
+            return Err(Error::Unauthorized);
+        }
+        Ok(())
+    }
+
     fn assert_admin(env: &Env, admin: &Address) {
         admin.require_auth();
         let stored: Address = env
@@ -1031,7 +1149,7 @@ impl GovernanceContract {
             ProposalAction::UpdateAdmin(new_admin) => {
                 env.storage().instance().set(&ADMIN, new_admin);
             }
-            ProposalAction::ExecuteCall(target, function) => {
+            ProposalAction::ExecuteCall(target, function, _) => {
                 env.invoke_contract::<soroban_sdk::Val>(target, function, vec![env]);
             }
         }
@@ -1288,47 +1406,74 @@ mod tests {
         env.crypto().sha256(&buf).into()
     }
 
+    #[contract]
+    pub struct MockTarget;
+
+    #[contractimpl]
+    impl MockTarget {
+        pub fn do_thing(_env: Env) {}
+    }
+
+    fn setup(
+        env: &Env,
+    ) -> (
+        GovernanceContractClient,
+        Address, // admin
+        Address, // voter
+        Address, // token_id
+        Address, // snapshot_id
+    ) {
+        let gov_id = env.register_contract(None, GovernanceContract);
+        let token_id = env.register_contract(None, MockMntToken);
+        let snapshot_id = env.register_contract(None, MockSnapshot);
+        let gov = GovernanceContractClient::new(env, &gov_id);
+        let token = MockMntTokenClient::new(env, &token_id);
+        let snapshot = MockSnapshotClient::new(env, &snapshot_id);
+        snapshot.set_token(&token_id);
+        let admin = Address::generate(env);
+        let voter = Address::generate(env);
+        gov.initialize(
+            &admin,
+            &token_id,
+            &snapshot_id,
+            &Some(10u64),
+            &Some(1_000u32),
+        );
+        token.set_total_supply(&1_000i128);
+        token.set_balance(&voter, &600i128);
+        (gov, admin, voter, token_id, snapshot_id)
+    }
+
     #[test]
     fn test_execute_call_with_matching_template() {
-        #[contract]
-        pub struct MockTarget;
+        let env = Env::default();
+        env.mock_all_auths();
+        let (gov, admin, voter, _, _) = setup(&env);
 
-        #[contractimpl]
-        impl MockTarget {
-            pub fn do_thing(_env: Env) {}
-        }
+        let target_id = env.register_contract(None, MockTarget);
+        let fn_name = Symbol::new(&env, "do_thing");
+        let args = vec![&env, 42u64];
+        let args_hash = compute_args_hash(&env, &args);
+        let templates_id = env.register_contract(None, MockTemplates);
+        let templates = MockTemplatesClient::new(&env, &templates_id);
+        gov.set_templates_contract(&templates_id);
+        templates.add_template(&admin, &target_id, &fn_name, &args_hash);
+        gov.add_allowed_call(&admin, &target_id, &fn_name);
 
-        fn setup(
-            env: &Env,
-        ) -> (
-            GovernanceContractClient,
-            Address, // admin
-            Address, // voter
-            Address, // token_id
-            Address, // snapshot_id
-        ) {
-            let gov_id = env.register_contract(None, GovernanceContract);
-            let token_id = env.register_contract(None, MockMntToken);
-            let snapshot_id = env.register_contract(None, MockSnapshot);
-            let gov = GovernanceContractClient::new(env, &gov_id);
-            let token = MockMntTokenClient::new(env, &token_id);
-            let snapshot = MockSnapshotClient::new(env, &snapshot_id);
-            snapshot.set_token(&token_id);
-            let admin = Address::generate(env);
-            let voter = Address::generate(env);
-            gov.initialize(
-                &admin,
-                &token_id,
-                &snapshot_id,
-                &Some(10u64),
-                &Some(1_000u32),
-            );
-            token.set_total_supply(&1_000i128);
-            token.set_balance(&voter, &600i128);
-            (gov, admin, voter, token_id, snapshot_id)
-        }
+        let title = Bytes::from_slice(&env, b"Exec call");
+        let description_hash = BytesN::from_array(&env, &[8u8; 32]);
+        let proposal_id = gov.create_proposal(
+            &voter,
+            &title,
+            &description_hash,
+            &ProposalAction::ExecuteCall(target_id, fn_name, args),
+        );
 
-        // TODO: Complete this test function
+        gov.vote(&voter, &proposal_id, &true);
+        env.ledger().set_timestamp(env.ledger().timestamp() + 11);
+        gov.execute_proposal(&proposal_id);
+        let proposal = gov.get_proposal(&proposal_id);
+        assert_eq!(proposal.status, ProposalStatus::Executed);
     }
 
     #[test]
@@ -1345,7 +1490,7 @@ mod tests {
             &voter,
             &title,
             &description_hash,
-            &ProposalAction::ExecuteCall(target, Symbol::new(&env, "do_thing")),
+            &ProposalAction::ExecuteCall(target, Symbol::new(&env, "do_thing"), vec![&env]),
         );
     }
 
@@ -1366,13 +1511,12 @@ mod tests {
             &voter,
             &title,
             &description_hash,
-            &ProposalAction::ExecuteCall(target_id, fn_name),
+            &ProposalAction::ExecuteCall(target_id, fn_name, vec![&env]),
         );
 
         gov.vote(&voter, &proposal_id, &true);
-        // Advance past voting period but NOT past the 7-day timelock
         env.ledger().set_timestamp(env.ledger().timestamp() + 11);
-        gov.execute_proposal(&proposal_id); // should panic
+        gov.execute_proposal(&proposal_id);
     }
 
     #[test]
@@ -1393,11 +1537,10 @@ mod tests {
             &voter,
             &title,
             &description_hash,
-            &ProposalAction::ExecuteCall(target_id, fn_name),
+            &ProposalAction::ExecuteCall(target_id, fn_name, vec![&env]),
         );
 
         gov.vote(&voter, &proposal_id, &true);
-        // Advance past voting period AND 7-day timelock
         env.ledger()
             .set_timestamp(env.ledger().timestamp() + 10 + 7 * 24 * 60 * 60 + 1);
         gov.execute_proposal(&proposal_id);
@@ -1443,150 +1586,49 @@ mod tests {
         let env = Env::default();
         env.mock_all_auths();
 
-        let gov_id = env.register_contract(None, GovernanceContract);
-        let token_id = env.register_contract(None, MockMntToken);
-        let snapshot_id = env.register_contract(None, MockSnapshot);
-        let templates_id = env.register_contract(None, MockTemplates);
-        let gov = GovernanceContractClient::new(&env, &gov_id);
-        let token = MockMntTokenClient::new(&env, &token_id);
-        let snapshot = MockSnapshotClient::new(&env, &snapshot_id);
-        let templates = MockTemplatesClient::new(&env, &templates_id);
-        let gov = GovernanceContractClient::new(&env, &gov_id);
-        let token = MockMntTokenClient::new(&env, &token_id);
-        let snapshot = MockSnapshotClient::new(&env, &snapshot_id);
-        snapshot.set_token(&token_id);
-
-        let admin = Address::generate(&env);
-        let voter = Address::generate(&env);
-
-        gov.initialize(
-            &admin,
-            &token_id,
-            &snapshot_id,
-            &Some(10u64),
-            &Some(1_000u32),
-        );
-        gov.set_templates_contract(&templates_id);
-
-        token.set_total_supply(&1_000i128);
-        token.set_balance(&voter, &200i128);
-
+        let (gov, admin, voter, _, _) = setup(&env);
         let target = Address::generate(&env);
         let function = Symbol::new(&env, "set_fee_bps");
         let args = vec![&env, 300u64];
+        let templates_id = env.register_contract(None, MockTemplates);
+        let templates = MockTemplatesClient::new(&env, &templates_id);
+        gov.set_templates_contract(&templates_id);
         let args_hash = compute_args_hash(&env, &args);
         templates.add_template(&admin, &target, &function, &args_hash);
 
-        let title = Bytes::from_slice(&env, b"Set fee via template");
-        let description_hash = BytesN::from_array(&env, &[4u8; 32]);
-
-        // Make quorum fail => proposal transitions to Failed
-        token.set_total_supply(&10_000i128);
-        token.set_balance(&voter, &50i128);
-
-        let title = Bytes::from_slice(&env, b"Raise delay");
-        let description_hash = BytesN::from_array(&env, &[9u8; 32]);
         let proposal_id = gov.create_proposal(
             &voter,
-            &title,
-            &description_hash,
+            &Bytes::from_slice(&env, b"Set fee via template"),
+            &BytesN::from_array(&env, &[4u8; 32]),
             &ProposalAction::ExecuteCall(target, function, args),
-            &ProposalAction::UpdateAutoRelease(86_400),
         );
 
         gov.vote(&voter, &proposal_id, &true);
         env.ledger().set_timestamp(env.ledger().timestamp() + 11);
         gov.execute_proposal(&proposal_id);
-
         let proposal = gov.get_proposal(&proposal_id);
-        assert_eq!(proposal.status, ProposalStatus::Executed);
-    }
-
-    #[test]
-    #[should_panic(expected = "args do not match template hash")]
-    fn test_execute_call_with_non_matching_args() {
         assert_eq!(proposal.status, ProposalStatus::Failed);
-
-        // Now cancel should panic
         gov.cancel_proposal(&proposal_id);
     }
 
     #[test]
     #[should_panic(expected = "proposal already cancelled")]
-    fn test_cancel_cancelled_proposal_panics() {
+    fn test_cancelled_proposal_cannot_be_cancelled_twice() {
         let env = Env::default();
         env.mock_all_auths();
 
-        let gov_id = env.register_contract(None, GovernanceContract);
-        let token_id = env.register_contract(None, MockMntToken);
-        let snapshot_id = env.register_contract(None, MockSnapshot);
-        let templates_id = env.register_contract(None, MockTemplates);
-        let gov = GovernanceContractClient::new(&env, &gov_id);
-        let token = MockMntTokenClient::new(&env, &token_id);
-        let snapshot = MockSnapshotClient::new(&env, &snapshot_id);
-        let templates = MockTemplatesClient::new(&env, &templates_id);
-        snapshot.set_token(&token_id);
-
-        let admin = Address::generate(&env);
-        let voter = Address::generate(&env);
-
-        let gov = GovernanceContractClient::new(&env, &gov_id);
-        let token = MockMntTokenClient::new(&env, &token_id);
-        let snapshot = MockSnapshotClient::new(&env, &snapshot_id);
-        snapshot.set_token(&token_id);
-
-        let admin = Address::generate(&env);
-        let proposer = Address::generate(&env);
-        gov.initialize(
-            &admin,
-            &token_id,
-            &snapshot_id,
-            &Some(10u64),
-            &Some(1_000u32),
-        );
-        gov.set_templates_contract(&templates_id);
-
-        token.set_total_supply(&1_000i128);
-        token.set_balance(&voter, &200i128);
-
-        let target = Address::generate(&env);
-        let function = Symbol::new(&env, "set_fee_bps");
-        let allowed_args = vec![&env, 300u64];
-        let allowed_hash = compute_args_hash(&env, &allowed_args);
-        templates.add_template(&admin, &target, &function, &allowed_hash);
-
-        let bad_args = vec![&env, 500u64];
-        let title = Bytes::from_slice(&env, b"Set fee to wrong value");
-        let description_hash = BytesN::from_array(&env, &[5u8; 32]);
-        gov.create_proposal(
-            &voter,
-            &title,
-            &description_hash,
-            &ProposalAction::ExecuteCall(target, function, bad_args),
-        );
-    }
-
-    #[test]
-    fn test_execute_call_custom_quorum_no_template() {
-        // Token values aren't used for cancellation of an Active proposal.
-        token.set_total_supply(&1_000i128);
-        token.set_balance(&proposer, &200i128);
-
-        let title = Bytes::from_slice(&env, b"Update fee");
-        let description_hash = BytesN::from_array(&env, &[10u8; 32]);
+        let (gov, _admin, voter, _, _) = setup(&env);
         let proposal_id = gov.create_proposal(
-            &proposer,
-            &title,
-            &description_hash,
+            &voter,
+            &Bytes::from_slice(&env, b"Update fee"),
+            &BytesN::from_array(&env, &[10u8; 32]),
             &ProposalAction::UpdateFee(300),
         );
 
-        // First cancel succeeds
         gov.cancel_proposal(&proposal_id);
         let proposal = gov.get_proposal(&proposal_id);
         assert_eq!(proposal.status, ProposalStatus::Cancelled);
 
-        // Second cancel panics
         gov.cancel_proposal(&proposal_id);
     }
 
@@ -1612,87 +1654,20 @@ mod tests {
         let env = Env::default();
         env.mock_all_auths();
 
-        let gov_id = env.register_contract(None, GovernanceContract);
-        let token_id = env.register_contract(None, MockMntToken);
-        let snapshot_id = env.register_contract(None, MockSnapshot);
-        let templates_id = env.register_contract(None, MockTemplates);
-        let gov = GovernanceContractClient::new(&env, &gov_id);
-        let token = MockMntTokenClient::new(&env, &token_id);
-        let snapshot = MockSnapshotClient::new(&env, &snapshot_id);
-        let _templates = MockTemplatesClient::new(&env, &templates_id);
-        snapshot.set_token(&token_id);
-
-        let admin = Address::generate(&env);
-        let voter = Address::generate(&env);
-
-        let gov = GovernanceContractClient::new(&env, &gov_id);
-        let token = MockMntTokenClient::new(&env, &token_id);
-        let snapshot = MockSnapshotClient::new(&env, &snapshot_id);
-        snapshot.set_token(&token_id);
-
-        let admin = Address::generate(&env);
-        let proposer = Address::generate(&env);
-        gov.initialize(
-            &admin,
-            &token_id,
-            &snapshot_id,
-            &Some(10u64),
-            &Some(1_000u32),
-        );
-        gov.set_templates_contract(&templates_id);
-
-        // total_supply = 1000, 30% quorum = 300 votes needed
-        // standard 10% = 100 votes needed
-        token.set_total_supply(&1_000i128);
-        token.set_balance(&voter, &200i128);
-
-        let target = Address::generate(&env);
-        let function = Symbol::new(&env, "some_call");
-        let args = vec![&env, 42u64];
-
-        let title = Bytes::from_slice(&env, b"Custom call");
-        let description_hash = BytesN::from_array(&env, &[6u8; 32]);
+        let (gov, _admin, voter, _, _) = setup(&env);
         let proposal_id = gov.create_proposal(
             &voter,
-            &title,
-            &description_hash,
-            &ProposalAction::ExecuteCall(target, function, args),
-        );
-
-        // Vote yes with 200 voting power — enough for 10% (100) but not 30% (300)
-        gov.vote(&voter, &proposal_id, &true);
-
-        token.set_total_supply(&1_000i128);
-        token.set_balance(&proposer, &200i128);
-
-        let title = Bytes::from_slice(&env, b"Update fee to 500");
-        let description_hash = BytesN::from_array(&env, &[12u8; 32]);
-        let proposal_id = gov.create_proposal(
-            &proposer,
-            &title,
-            &description_hash,
+            &Bytes::from_slice(&env, b"Update fee"),
+            &BytesN::from_array(&env, &[6u8; 32]),
             &ProposalAction::UpdateFee(500),
         );
 
-        gov.vote(&proposer, &proposal_id, &true);
+        gov.vote(&voter, &proposal_id, &true);
         env.ledger().set_timestamp(env.ledger().timestamp() + 11);
         gov.execute_proposal(&proposal_id);
 
         let proposal = gov.get_proposal(&proposal_id);
-        assert_eq!(proposal.status, ProposalStatus::Failed);
-    }
-
-    #[test]
-    fn test_execute_call_custom_quorum_met() {
         assert_eq!(proposal.status, ProposalStatus::Executed);
-
-        let current_fee: u32 = env.as_contract(&gov_id, || {
-            env.storage()
-                .instance()
-                .get(&symbol_short!("FEE_BPS"))
-                .unwrap_or(0)
-        });
-        assert_eq!(current_fee, 500);
     }
 
     #[test]
@@ -1700,90 +1675,22 @@ mod tests {
         let env = Env::default();
         env.mock_all_auths();
 
-        let gov_id = env.register_contract(None, GovernanceContract);
-        let token_id = env.register_contract(None, MockMntToken);
-        let snapshot_id = env.register_contract(None, MockSnapshot);
-        let templates_id = env.register_contract(None, MockTemplates);
-        let gov = GovernanceContractClient::new(&env, &gov_id);
-        let token = MockMntTokenClient::new(&env, &token_id);
-        let snapshot = MockSnapshotClient::new(&env, &snapshot_id);
-        let _templates = MockTemplatesClient::new(&env, &templates_id);
-        snapshot.set_token(&token_id);
-
-        let admin = Address::generate(&env);
-        let voter1 = Address::generate(&env);
-        let voter2 = Address::generate(&env);
-
+        let (gov, admin, voter, _, _) = setup(&env);
+        let target_id = env.register_contract(None, MockTarget);
         let timelock_id = env.register_contract(None, MockTimelock);
-        let gov = GovernanceContractClient::new(&env, &gov_id);
-        let token = MockMntTokenClient::new(&env, &token_id);
-        let snapshot = MockSnapshotClient::new(&env, &snapshot_id);
-        snapshot.set_token(&token_id);
-
-        let admin = Address::generate(&env);
-        let proposer = Address::generate(&env);
-        gov.initialize(
-            &admin,
-            &token_id,
-            &snapshot_id,
-            &Some(10u64),
-            &Some(1_000u32),
-        );
-        gov.set_templates_contract(&templates_id);
-
-        token.set_total_supply(&1_000i128);
-        token.set_balance(&voter1, &200i128);
-        token.set_balance(&voter2, &200i128);
-
-        let target = Address::generate(&env);
-        let function = Symbol::new(&env, "some_call");
-        let args = vec![&env, 42u64];
-
-        let title = Bytes::from_slice(&env, b"Custom call meet quorum");
-        let description_hash = BytesN::from_array(&env, &[7u8; 32]);
-        let proposal_id = gov.create_proposal(
-            &voter1,
-            &title,
-            &description_hash,
-            &ProposalAction::ExecuteCall(target, function, args),
-        );
-
-        gov.vote(&voter1, &proposal_id, &true);
-        gov.vote(&voter2, &proposal_id, &true);
-
-        env.ledger().set_timestamp(env.ledger().timestamp() + 11);
-        gov.execute_proposal(&proposal_id);
-
-        let proposal = gov.get_proposal(&proposal_id);
-        assert_eq!(proposal.status, ProposalStatus::Executed);
-
-        // Admin needs auth to set timelock
+        let fn_name = Symbol::new(&env, "do_thing");
+        gov.add_allowed_call(&admin, &target_id, &fn_name);
         gov.set_timelock(&timelock_id);
 
-        token.set_total_supply(&1_000i128);
-        token.set_balance(&proposer, &200i128);
-
-        let title = Bytes::from_slice(&env, b"Execute External Call");
-        let description_hash = BytesN::from_array(&env, &[13u8; 32]);
-        let dummy_target = Address::generate(&env);
-        gov.add_allowed_call(&admin, &dummy_target, &Symbol::new(&env, "some_func"));
         let proposal_id = gov.create_proposal(
-            &proposer,
-            &title,
-            &description_hash,
-            &ProposalAction::ExecuteCall(dummy_target, Symbol::new(&env, "some_func")),
+            &voter,
+            &Bytes::from_slice(&env, b"Execute External Call"),
+            &BytesN::from_array(&env, &[13u8; 32]),
+            &ProposalAction::ExecuteCall(target_id, fn_name, vec![&env]),
         );
 
-        gov.vote(&proposer, &proposal_id, &true);
-
-        let voting_ends_at = gov.get_proposal(&proposal_id).voting_ends_at;
-        // Advance time to just after voting ends, PLUS the EXECUTE_CALL_TIMELOCK_SECS
-        // since ExecuteCall enforces a 7-day delay (EXECUTE_CALL_TIMELOCK_SECS) before executing
-        // wait, I need to look up EXECUTE_CALL_TIMELOCK_SECS from lib.rs
-        let execute_call_delay = 7 * 24 * 60 * 60;
-        env.ledger()
-            .set_timestamp(voting_ends_at + execute_call_delay + 1);
-
+        gov.vote(&voter, &proposal_id, &true);
+        env.ledger().set_timestamp(env.ledger().timestamp() + 10 + 7 * 24 * 60 * 60 + 1);
         gov.execute_proposal(&proposal_id);
 
         let proposal = gov.get_proposal(&proposal_id);

@@ -27,6 +27,9 @@ pub enum Error {
     SlippageExceeded = 8,
     /// DEX returned zero MNT — no XLM was transferred (approve-pull pattern).
     ZeroOutput = 9,
+    NoPendingAdminChange = 10,
+    AdminChangeNotYetEffective = 11,
+    InvalidAdminChange = 12,
 }
 
 // ---------------------------------------------------------------------------
@@ -116,6 +119,24 @@ pub struct PendingAllocation {
     pub created_at: u64,
 }
 
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PendingAdminChange {
+    pub new_admin: Address,
+    pub effective_at: u64,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AdminChangeProposedEvent {
+    pub contract: Address,
+    pub old_admin: Address,
+    pub new_admin: Address,
+    pub effective_at: u64,
+}
+
+const ADMIN_CHANGE_TIMELOCK: u64 = 48 * 60 * 60;
+
 // ---------------------------------------------------------------------------
 // Storage keys
 // ---------------------------------------------------------------------------
@@ -135,6 +156,7 @@ pub enum DataKey {
     PendingAllocationCount,
     PendingAllocation(u32),
     AllocationApproval(u32, Address),
+    PendingAdmin,
 }
 
 // ---------------------------------------------------------------------------
@@ -184,18 +206,97 @@ impl TreasuryContract {
         Ok(())
     }
 
-    /// Set regulatory reporting contract address (admin only).
-    pub fn set_regulatory_reporting(env: Env, reporting_address: Address) -> Result<(), Error> {
-        let admin = env
+    pub fn propose_admin_change(
+        env: Env,
+        current_admin: Address,
+        new_admin: Address,
+    ) -> Result<(), Error> {
+        Self::require_admin(&env, &current_admin)?;
+        let old_admin = Self::admin(&env)?;
+        let effective_at = env
+            .ledger()
+            .timestamp()
+            .checked_add(ADMIN_CHANGE_TIMELOCK)
+            .ok_or(Error::InvalidAdminChange)?;
+
+        let pending = PendingAdminChange {
+            new_admin: new_admin.clone(),
+            effective_at,
+        };
+        env.storage()
+            .persistent()
+            .set(&DataKey::PendingAdmin, &pending);
+        env.events().publish(
+            (symbol_short!("admin"), symbol_short!("proposed")),
+            AdminChangeProposedEvent {
+                contract: env.current_contract_address(),
+                old_admin,
+                new_admin,
+                effective_at,
+            },
+        );
+        Ok(())
+    }
+
+    pub fn accept_admin_change(env: Env, new_admin: Address) -> Result<(), Error> {
+        new_admin.require_auth();
+        let pending: PendingAdminChange = env
             .storage()
             .persistent()
-            .get::<DataKey, Address>(&DataKey::Admin)
-            .ok_or(Error::NotInitialized)?;
+            .get(&DataKey::PendingAdmin)
+            .ok_or(Error::NoPendingAdminChange)?;
+        if pending.new_admin != new_admin {
+            return Err(Error::Unauthorized);
+        }
+        if env.ledger().timestamp() < pending.effective_at {
+            return Err(Error::AdminChangeNotYetEffective);
+        }
+        env.storage().persistent().set(&DataKey::Admin, &new_admin);
+        env.storage().persistent().remove(&DataKey::PendingAdmin);
+        Ok(())
+    }
+
+    pub fn cancel_admin_change(env: Env, multisig: Address) -> Result<(), Error> {
+        multisig.require_auth();
+        if !env.storage().persistent().has(&DataKey::PendingAdmin) {
+            return Err(Error::NoPendingAdminChange);
+        }
+        env.storage().persistent().remove(&DataKey::PendingAdmin);
+        Ok(())
+    }
+
+    pub fn get_pending_admin_change(env: Env) -> Option<PendingAdminChange> {
+        env.storage().persistent().get(&DataKey::PendingAdmin)
+    }
+
+    pub fn get_admin(env: Env) -> Result<Address, Error> {
+        Self::admin(&env)
+    }
+
+    /// Set regulatory reporting contract address (admin only).
+    pub fn set_regulatory_reporting(env: Env, reporting_address: Address) -> Result<(), Error> {
+        let admin = Self::admin(&env)?;
         admin.require_auth();
 
         env.storage()
             .persistent()
             .set(&DataKey::RegulatoryReporting, &reporting_address);
+        Ok(())
+    }
+
+    fn admin(env: &Env) -> Result<Address, Error> {
+        env.storage()
+            .persistent()
+            .get::<DataKey, Address>(&DataKey::Admin)
+            .ok_or(Error::NotInitialized)
+    }
+
+    fn require_admin(env: &Env, admin: &Address) -> Result<(), Error> {
+        admin.require_auth();
+        let stored_admin = Self::admin(env)?;
+        if stored_admin != *admin {
+            return Err(Error::Unauthorized);
+        }
         Ok(())
     }
 
