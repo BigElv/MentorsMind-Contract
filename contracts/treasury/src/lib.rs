@@ -666,10 +666,21 @@ impl TreasuryContract {
             &total_amount,
         );
 
+        let lp_amount = total_amount / 10;
+        let staker_amount = total_amount - lp_amount;
+
+        if lp_amount > 0 {
+            env.invoke_contract::<()>(
+                &staking_contract,
+                &Symbol::new(&env, "add_to_lp_reward_pool"),
+                (lp_amount,).into_val(&env),
+            );
+        }
+
         env.invoke_contract::<()>(
             &staking_contract,
             &Symbol::new(&env, "distribute_revenue"),
-            (token.clone(), total_amount).into_val(&env),
+            (token.clone(), staker_amount).into_val(&env),
         );
 
         env.events().publish(

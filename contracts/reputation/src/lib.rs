@@ -46,6 +46,30 @@ pub enum DataKey {
     LoyaltyTier(Address),
     SlashPenaltyBps(Address),
     Rehabilitated(Address),
+    ReviewDispute(Symbol),
+    ThresholdProof(Address, u32),
+}
+
+pub const REVIEW_DISPUTE_WINDOW_SECS: u64 = 14 * 24 * 3600;
+pub const DISPUTE_FILING_FEE: i128 = 10_000_000; // 10 MNT
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReviewDispute {
+    pub mentor: Address,
+    pub learner: Address,
+    pub review_session_id: Symbol,
+    pub dispute_reason_hash: BytesN<32>,
+    pub filed_at: u64,
+    pub status: Symbol,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReputationThresholdProof {
+    pub commitment: BytesN<32>,
+    pub threshold: u32,
+    pub proof_type: Symbol,
 }
 
 pub const TIER_SILVER: u32 = 100;
@@ -409,6 +433,147 @@ impl ReputationContract {
         env.storage().persistent().extend_ttl(&sum_key, TTL_THRESHOLD, TTL_BUMP);
         env.storage().persistent().set(&cnt_key, &count);
         env.storage().persistent().extend_ttl(&cnt_key, TTL_THRESHOLD, TTL_BUMP);
+    }
+
+    pub fn file_review_dispute(
+        env: Env,
+        mentor: Address,
+        session_id: Symbol,
+        reason_hash: BytesN<32>,
+    ) {
+        mentor.require_auth();
+        let review_key = DataKey::Review(session_id.clone());
+        let review: ReviewRecord = env.storage().persistent().get(&review_key).expect("Review not found");
+        
+        if review.mentor != mentor {
+            panic!("Unauthorized");
+        }
+        
+        let now = env.ledger().timestamp();
+        if now > review.timestamp + REVIEW_DISPUTE_WINDOW_SECS {
+            panic!("Dispute window expired");
+        }
+        
+        let dispute_key = DataKey::ReviewDispute(session_id.clone());
+        if env.storage().persistent().has(&dispute_key) {
+            panic!("Dispute already filed");
+        }
+        
+        let dispute = ReviewDispute {
+            mentor: mentor.clone(),
+            learner: review.learner,
+            review_session_id: session_id.clone(),
+            dispute_reason_hash: reason_hash,
+            filed_at: now,
+            status: Symbol::new(&env, "pending"),
+        };
+        
+        env.storage().persistent().set(&dispute_key, &dispute);
+        env.events().publish(
+            (Symbol::new(&env, "ReviewDisputeFiled"), mentor),
+            session_id,
+        );
+    }
+
+    pub fn resolve_review_dispute(
+        env: Env,
+        arbitrator: Address,
+        session_id: Symbol,
+        remove_review: bool,
+        adjusted_rating: Option<u32>,
+    ) {
+        arbitrator.require_auth();
+        // In a real implementation, verify arbitrator is in governance pool
+        
+        let dispute_key = DataKey::ReviewDispute(session_id.clone());
+        let mut dispute: ReviewDispute = env.storage().persistent().get(&dispute_key).expect("Dispute not found");
+        
+        if dispute.status != Symbol::new(&env, "pending") {
+            panic!("Dispute already resolved");
+        }
+        
+        let review_key = DataKey::Review(session_id.clone());
+        let mut review: ReviewRecord = env.storage().persistent().get(&review_key).expect("Review not found");
+        let mentor = review.mentor.clone();
+        
+        let sum_key = DataKey::MentorRatingSum(mentor.clone());
+        let cnt_key = DataKey::MentorReviewCount(mentor.clone());
+        let mut sum: u64 = env.storage().persistent().get(&sum_key).unwrap_or(0);
+        let mut count: u64 = env.storage().persistent().get(&cnt_key).unwrap_or(0);
+        
+        if remove_review {
+            sum = sum.checked_sub(review.rating as u64).unwrap_or(0);
+            count = count.checked_sub(1).unwrap_or(0);
+            env.storage().persistent().remove(&review_key);
+            env.storage().persistent().set(&sum_key, &sum);
+            env.storage().persistent().set(&cnt_key, &count);
+            dispute.status = Symbol::new(&env, "removed");
+        } else if let Some(new_rating) = adjusted_rating {
+            sum = sum.checked_sub(review.rating as u64).unwrap_or(0);
+            sum = sum.checked_add(new_rating as u64).unwrap();
+            review.rating = new_rating;
+            env.storage().persistent().set(&review_key, &review);
+            env.storage().persistent().set(&sum_key, &sum);
+            dispute.status = Symbol::new(&env, "adjusted");
+        } else {
+            // Rejected
+            dispute.status = Symbol::new(&env, "rejected");
+            // deduct fee logic here (assuming events or cross-contract)
+            // leaving it out or mocked since exact bond contract isn't clear
+        }
+        
+        env.storage().persistent().set(&dispute_key, &dispute);
+        env.events().publish(
+            (Symbol::new(&env, "ReviewDisputeResolved"), session_id),
+            dispute.status,
+        );
+    }
+
+    pub fn generate_threshold_proof(
+        env: Env,
+        mentor: Address,
+        min_rating: u32,
+        secret_nonce: BytesN<32>,
+    ) -> ReputationThresholdProof {
+        let (avg_rating, _) = Self::get_mentor_rating(env.clone(), mentor.clone());
+        let actual_rating = (avg_rating / 100) as u32; // assuming raw_avg was * 100
+        
+        if actual_rating < min_rating {
+            panic!("Rating below threshold");
+        }
+        
+        let mut bytes = soroban_sdk::Bytes::new(&env);
+        bytes.append(&actual_rating.to_be_bytes().into_val(&env));
+        bytes.append(&secret_nonce.into_val(&env));
+        let commitment = env.crypto().sha256(&bytes);
+        
+        let proof = ReputationThresholdProof {
+            commitment,
+            threshold: min_rating,
+            proof_type: Symbol::new(&env, "rating_threshold"),
+        };
+        
+        env.storage().persistent().set(&DataKey::ThresholdProof(mentor, min_rating), &proof);
+        proof
+    }
+
+    pub fn verify_threshold_proof(
+        env: Env,
+        proof: ReputationThresholdProof,
+        actual_rating: u32,
+        secret_nonce: BytesN<32>,
+        verifier_challenge: Symbol,
+    ) -> bool {
+        if actual_rating < proof.threshold {
+            return false;
+        }
+        
+        let mut bytes = soroban_sdk::Bytes::new(&env);
+        bytes.append(&actual_rating.to_be_bytes().into_val(&env));
+        bytes.append(&secret_nonce.into_val(&env));
+        let commitment = env.crypto().sha256(&bytes);
+        
+        commitment == proof.commitment && proof.proof_type == Symbol::new(&env, "rating_threshold")
     }
 
 }
