@@ -1,7 +1,7 @@
 #![no_std]
 use soroban_sdk::{
     contract, contractclient, contractimpl, contracttype, symbol_short, Address, BytesN, Env,
-    Symbol,
+    Symbol, Vec,
 };
 
 #[contracttype]
@@ -19,6 +19,15 @@ pub struct KycRecord {
     pub level: KycLevel,
     pub expiry: u64,
     pub kyc_provider_hash: BytesN<32>,
+}
+
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct KycBatchEntry {
+    pub user: Address,
+    pub level: KycLevel,
+    pub expiry: u64,
+    pub provider_hash: BytesN<32>,
 }
 
 #[contracttype]
@@ -83,6 +92,36 @@ impl KycRegistry {
 
         env.events()
             .publish((symbol_short!("kyc_set"), user), record.level);
+    }
+
+    /// Batch set KYC levels for multiple institutional users (Issue #754).
+    /// Operator only. Validates all expiries in the batch before mutating state.
+    pub fn batch_set_kyc_level(env: Env, operator: Address, entries: Vec<KycBatchEntry>) {
+        Self::require_operator(&env, &operator);
+        let now = env.ledger().timestamp();
+
+        // Validate all entries first (fail-fast batch rule)
+        for entry in entries.iter() {
+            if entry.expiry <= now {
+                panic!("KYC expiry must be in the future");
+            }
+        }
+
+        let count = entries.len();
+        for entry in entries.iter() {
+            let record = KycRecord {
+                level: entry.level,
+                expiry: entry.expiry,
+                kyc_provider_hash: entry.provider_hash,
+            };
+
+            env.storage()
+                .persistent()
+                .set(&DataKey::Kyc(entry.user.clone()), &record);
+        }
+
+        env.events()
+            .publish((symbol_short!("kyc_btch"), operator), count);
     }
 
     /// Get the KYC level for a user. Returns None if expired or not found.
