@@ -54,6 +54,7 @@ pub struct PlatformStats {
     pub total_learners: u32,
     pub mnt_staked: i128,
     pub contract_versions: Map<Symbol, u32>,
+    pub flagged_learners: Vec<Address>,
 }
 
 /// Mirrors `interface_registry::InterfaceEntry` for `list_interfaces` decoding.
@@ -448,6 +449,22 @@ impl HealthDashboardContract {
             contract_versions.set(entry.interface_id.clone(), entry.version);
         }
 
+        // Flag learners with avg < 3.0 across 5+ sessions
+        let mut flagged_learners: Vec<Address> = Vec::new(env);
+        for learner in learner_vec.iter() {
+            if let Ok(Ok((avg_times_100, count))) = env.try_invoke_contract::<(u64, u64), soroban_sdk::Error>(
+                &cfg.reputation,
+                &Symbol::new(env, "get_learner_rating"),
+                (learner.clone(),).into_val(env),
+            ) {
+                // avg < 3.0 means avg_times_100 < 300
+                // count >= 5 for meaningful sample
+                if count >= 5 && avg_times_100 < 300 {
+                    flagged_learners.push_back(learner.clone());
+                }
+            }
+        }
+
         PlatformStats {
             total_value_locked,
             active_escrows,
@@ -457,6 +474,7 @@ impl HealthDashboardContract {
             total_learners: learner_vec.len(),
             mnt_staked,
             contract_versions,
+            flagged_learners,
         }
     }
 
@@ -742,6 +760,8 @@ mod test {
         assert_eq!(s.total_learners, 2);
         assert_eq!(s.mnt_staked, 5000);
         assert_eq!(s.contract_versions.get(symbol_short!("escrow")), Some(2));
+        // flagged_learners should be empty since mock reputation doesn't implement get_learner_rating
+        assert_eq!(s.flagged_learners.len(), 0);
     }
 
     #[test]

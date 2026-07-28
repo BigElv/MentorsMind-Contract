@@ -11,18 +11,18 @@
     [],
     [
       [
-        "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAITA4",
+        "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHK3M",
         {
           "function": {
             "contract_fn": {
               "contract_address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAFCT4",
-              "function_name": "submit_review",
+              "function_name": "submit_learner_review",
               "args": [
                 {
-                  "symbol": "s1"
+                  "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHK3M"
                 },
                 {
-                  "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHK3M"
+                  "symbol": "ls1"
                 },
                 {
                   "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAITA4"
@@ -43,18 +43,18 @@
     [],
     [
       [
-        "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAITA4",
+        "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHK3M",
         {
           "function": {
             "contract_fn": {
               "contract_address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAFCT4",
-              "function_name": "submit_review",
+              "function_name": "submit_learner_review",
               "args": [
                 {
-                  "symbol": "s2"
+                  "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHK3M"
                 },
                 {
-                  "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHK3M"
+                  "symbol": "ls2"
                 },
                 {
                   "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAITA4"
@@ -75,18 +75,18 @@
     [],
     [
       [
-        "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAITA4",
+        "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHK3M",
         {
           "function": {
             "contract_fn": {
               "contract_address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAFCT4",
-              "function_name": "submit_review",
+              "function_name": "submit_learner_review",
               "args": [
                 {
-                  "symbol": "s3"
+                  "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHK3M"
                 },
                 {
-                  "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHK3M"
+                  "symbol": "ls3"
                 },
                 {
                   "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAITA4"
@@ -124,7 +124,7 @@
               "ext": "v0",
               "contract": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
               "key": {
-                "symbol": "s1"
+                "symbol": "ls1"
               },
               "durability": "persistent",
               "val": {
@@ -144,7 +144,7 @@
               "ext": "v0",
               "contract": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
               "key": {
-                "symbol": "s2"
+                "symbol": "ls2"
               },
               "durability": "persistent",
               "val": {
@@ -164,7 +164,7 @@
               "ext": "v0",
               "contract": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
               "key": {
-                "symbol": "s3"
+                "symbol": "ls3"
               },
               "durability": "persistent",
               "val": {
@@ -209,10 +209,10 @@
               "key": {
                 "vec": [
                   {
-                    "symbol": "MentorRatingSum"
+                    "symbol": "LearnerRatingSum"
                   },
                   {
-                    "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHK3M"
+                    "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAITA4"
                   }
                 ]
               },
@@ -236,37 +236,10 @@
               "key": {
                 "vec": [
                   {
-                    "symbol": "MentorReviewCount"
+                    "symbol": "LearnerReview"
                   },
                   {
-                    "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHK3M"
-                  }
-                ]
-              },
-              "durability": "persistent",
-              "val": {
-                "u64": "3"
-              }
-            }
-          },
-          "ext": "v0"
-        },
-        "live_until": 1000000
-      },
-      {
-        "entry": {
-          "last_modified_ledger_seq": 0,
-          "data": {
-            "contract_data": {
-              "ext": "v0",
-              "contract": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAFCT4",
-              "key": {
-                "vec": [
-                  {
-                    "symbol": "Review"
-                  },
-                  {
-                    "symbol": "s1"
+                    "symbol": "ls1"
                   }
                 ]
               },
@@ -299,7 +272,7 @@
                   },
                   {
                     "key": {
-                      "symbol": "rating"
+                      "symbol": "participation_rating"
                     },
                     "val": {
                       "u32": 2
@@ -310,12 +283,12 @@
                       "symbol": "session_id"
                     },
                     "val": {
-                      "symbol": "s1"
+                      "symbol": "ls1"
                     }
                   },
                   {
                     "key": {
-                      "symbol": "timestamp"
+                      "symbol": "submitted_at"
                     },
                     "val": {
                       "u64": "1000000"
@@ -339,10 +312,10 @@
               "key": {
                 "vec": [
                   {
-                    "symbol": "Review"
+                    "symbol": "LearnerReview"
                   },
                   {
-                    "symbol": "s2"
+                    "symbol": "ls2"
                   }
                 ]
               },
@@ -375,7 +348,7 @@
                   },
                   {
                     "key": {
-                      "symbol": "rating"
+                      "symbol": "participation_rating"
                     },
                     "val": {
                       "u32": 4
@@ -386,12 +359,12 @@
                       "symbol": "session_id"
                     },
                     "val": {
-                      "symbol": "s2"
+                      "symbol": "ls2"
                     }
                   },
                   {
                     "key": {
-                      "symbol": "timestamp"
+                      "symbol": "submitted_at"
                     },
                     "val": {
                       "u64": "1000000"
@@ -415,10 +388,10 @@
               "key": {
                 "vec": [
                   {
-                    "symbol": "Review"
+                    "symbol": "LearnerReview"
                   },
                   {
-                    "symbol": "s3"
+                    "symbol": "ls3"
                   }
                 ]
               },
@@ -451,7 +424,7 @@
                   },
                   {
                     "key": {
-                      "symbol": "rating"
+                      "symbol": "participation_rating"
                     },
                     "val": {
                       "u32": 5
@@ -462,18 +435,45 @@
                       "symbol": "session_id"
                     },
                     "val": {
-                      "symbol": "s3"
+                      "symbol": "ls3"
                     }
                   },
                   {
                     "key": {
-                      "symbol": "timestamp"
+                      "symbol": "submitted_at"
                     },
                     "val": {
                       "u64": "1000000"
                     }
                   }
                 ]
+              }
+            }
+          },
+          "ext": "v0"
+        },
+        "live_until": 1000000
+      },
+      {
+        "entry": {
+          "last_modified_ledger_seq": 0,
+          "data": {
+            "contract_data": {
+              "ext": "v0",
+              "contract": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAFCT4",
+              "key": {
+                "vec": [
+                  {
+                    "symbol": "LearnerReviewCount"
+                  },
+                  {
+                    "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAITA4"
+                  }
+                ]
+              },
+              "durability": "persistent",
+              "val": {
+                "u64": "3"
               }
             }
           },
@@ -519,7 +519,7 @@
           "data": {
             "contract_data": {
               "ext": "v0",
-              "contract": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAITA4",
+              "contract": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHK3M",
               "key": {
                 "ledger_key_nonce": {
                   "nonce": "801925984706572462"
@@ -539,7 +539,7 @@
           "data": {
             "contract_data": {
               "ext": "v0",
-              "contract": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAITA4",
+              "contract": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHK3M",
               "key": {
                 "ledger_key_nonce": {
                   "nonce": "1033654523790656264"
@@ -559,7 +559,7 @@
           "data": {
             "contract_data": {
               "ext": "v0",
-              "contract": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAITA4",
+              "contract": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHK3M",
               "key": {
                 "ledger_key_nonce": {
                   "nonce": "5541220902715666415"

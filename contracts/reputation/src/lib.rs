@@ -24,10 +24,24 @@ pub struct ReviewRecord {
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LearnerReviewRecord {
+    pub session_id: Symbol,
+    pub mentor: Address,
+    pub learner: Address,
+    pub participation_rating: u32,
+    pub comment_hash: BytesN<32>,
+    pub submitted_at: u64,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum DataKey {
     Review(Symbol),
     MentorRatingSum(Address),
     MentorReviewCount(Address),
+    LearnerReview(Symbol),
+    LearnerRatingSum(Address),
+    LearnerReviewCount(Address),
     LoyaltyPoints(Address),
     LoyaltyTier(Address),
     SlashPenaltyBps(Address),
@@ -176,6 +190,23 @@ impl ReputationContract {
         (final_avg, count)
     }
 
+    /// Returns (avg_participation_rating * 100, review_count) for a learner.
+    /// Same format as get_mentor_rating for consistency.
+    pub fn get_learner_rating(env: Env, learner: Address) -> (u64, u64) {
+        let sum_key = DataKey::LearnerRatingSum(learner.clone());
+        let cnt_key = DataKey::LearnerReviewCount(learner.clone());
+
+        let sum: u64 = env.storage().persistent().get(&sum_key).unwrap_or(0);
+        let count: u64 = env.storage().persistent().get(&cnt_key).unwrap_or(0);
+
+        if count == 0 {
+            return (0, 0);
+        }
+
+        let avg = (sum * 100) / count;
+        (avg, count)
+    }
+
     /// Apply compounding slash penalty BPS to a mentor's reputation score (Issue #751).
     /// First slash reduces by 5% (500 BPS), second slash reduces by additional 10% (1500 BPS total), etc.
     pub fn apply_slash_penalty(env: Env, mentor: Address, slash_count: u32) {
@@ -213,6 +244,99 @@ impl ReputationContract {
             .persistent()
             .get(&DataKey::Review(session_id))
             .expect("Review not found")
+    }
+
+    /// Returns the learner review record for a given session.
+    pub fn get_learner_review(env: Env, session_id: Symbol) -> LearnerReviewRecord {
+        env.storage()
+            .persistent()
+            .get(&DataKey::LearnerReview(session_id))
+            .expect("Learner review not found")
+    }
+
+    /// Submit a learner review for a completed session.
+    /// Caller must be the mentor; session must be Released in escrow.
+    pub fn submit_learner_review(
+        env: Env,
+        mentor: Address,
+        session_id: Symbol,
+        learner: Address,
+        participation_rating: u32,
+        comment_hash: BytesN<32>,
+    ) {
+        // Auth: caller must be mentor
+        mentor.require_auth();
+
+        // Validate rating 1–5
+        if participation_rating < 1 || participation_rating > 5 {
+            panic!("InvalidRating");
+        }
+
+        // Prevent duplicate learner review for same session
+        let learner_review_key = DataKey::LearnerReview(session_id.clone());
+        if env.storage().persistent().has(&learner_review_key) {
+            panic!("DuplicateLearnerReview");
+        }
+
+        // Cross-contract: verify session is Released
+        let escrow_addr: Address = env
+            .storage()
+            .instance()
+            .get(&ESCROW)
+            .expect("EscrowContractNotSet");
+
+        let escrow: EscrowRecord = env.invoke_contract(
+            &escrow_addr,
+            &Symbol::new(&env, "get_escrow_by_session"),
+            (session_id.clone(),).into_val(&env),
+        );
+
+        if escrow.status != shared::EscrowStatus::Released {
+            panic!("SessionNotReleased");
+        }
+
+        // Store learner review
+        let record = LearnerReviewRecord {
+            session_id: session_id.clone(),
+            mentor: mentor.clone(),
+            learner: learner.clone(),
+            participation_rating,
+            comment_hash,
+            submitted_at: env.ledger().timestamp(),
+        };
+        env.storage().persistent().set(&learner_review_key, &record);
+        env.storage()
+            .persistent()
+            .extend_ttl(&learner_review_key, TTL_THRESHOLD, TTL_BUMP);
+
+        // Update learner rating running average
+        let sum_key = DataKey::LearnerRatingSum(learner.clone());
+        let cnt_key = DataKey::LearnerReviewCount(learner.clone());
+
+        let current_sum: u64 = env.storage().persistent().get(&sum_key).unwrap_or(0u64);
+        let current_count: u64 = env.storage().persistent().get(&cnt_key).unwrap_or(0u64);
+
+        let new_sum = current_sum.checked_add(participation_rating as u64).expect("sum overflow");
+        let new_count = current_count.checked_add(1).expect("count overflow");
+
+        env.storage().persistent().set(&sum_key, &new_sum);
+        env.storage()
+            .persistent()
+            .extend_ttl(&sum_key, TTL_THRESHOLD, TTL_BUMP);
+        env.storage().persistent().set(&cnt_key, &new_count);
+        env.storage()
+            .persistent()
+            .extend_ttl(&cnt_key, TTL_THRESHOLD, TTL_BUMP);
+
+        // Emit event
+        env.events().publish(
+            (
+                symbol_short!("lr_review"),
+                Symbol::new(&env, "learner_review_submitted"),
+                learner.clone(),
+            ),
+            (session_id, mentor, participation_rating, env.ledger().timestamp()),
+        );
     }
 
 
@@ -437,5 +561,111 @@ mod tests {
         mock.set_status(&session_id, &true);
         client.submit_review(&session_id, &mentor, &learner, &3, &comment_hash);
         client.submit_review(&session_id, &mentor, &learner, &4, &comment_hash);
+    }
+
+    #[test]
+    fn test_submit_learner_review_success() {
+        let (env, client, escrow_id, mentor, learner) = setup();
+        let session_id = Symbol::new(&env, "session1");
+        let comment_hash = BytesN::from_array(&env, &[1u8; 32]);
+
+        // Mark session as released in mock escrow
+        let mock = MockEscrowClient::new(&env, &escrow_id);
+        mock.set_status(&session_id, &true);
+
+        client.submit_learner_review(&mentor, &session_id, &learner, &5, &comment_hash);
+
+        let (avg, count) = client.get_learner_rating(&learner);
+        assert_eq!(count, 1);
+        assert_eq!(avg, 500); // 5 * 100
+
+        let learner_review = client.get_learner_review(&session_id);
+        assert_eq!(learner_review.participation_rating, 5);
+        assert_eq!(learner_review.mentor, mentor);
+        assert_eq!(learner_review.learner, learner);
+    }
+
+    #[test]
+    fn test_learner_rating_computation() {
+        let (env, client, escrow_id, mentor, learner) = setup();
+        let mock = MockEscrowClient::new(&env, &escrow_id);
+        let comment_hash = BytesN::from_array(&env, &[0u8; 32]);
+
+        // Submit 3 learner reviews with ratings 2, 4, 5
+        for i in 1u32..=3 {
+            let sid = match i {
+                1 => Symbol::new(&env, "ls1"),
+                2 => Symbol::new(&env, "ls2"),
+                _ => Symbol::new(&env, "ls3"),
+            };
+            mock.set_status(&sid, &true);
+            client.submit_learner_review(&mentor, &sid, &learner, &(i * 2).min(5), &comment_hash);
+        }
+
+        let (avg, count) = client.get_learner_rating(&learner);
+        assert_eq!(count, 3);
+        // ratings: 2, 4, 5 → sum=11, avg*100 = 1100/3 = 366
+        assert_eq!(avg, 366);
+    }
+
+    #[test]
+    #[should_panic(expected = "DuplicateLearnerReview")]
+    fn test_duplicate_learner_review() {
+        let (env, client, escrow_id, mentor, learner) = setup();
+        let session_id = Symbol::new(&env, "s_dup_lr");
+        let comment_hash = BytesN::from_array(&env, &[0u8; 32]);
+        let mock = MockEscrowClient::new(&env, &escrow_id);
+        mock.set_status(&session_id, &true);
+        client.submit_learner_review(&mentor, &session_id, &learner, &3, &comment_hash);
+        client.submit_learner_review(&mentor, &session_id, &learner, &4, &comment_hash);
+    }
+
+    #[test]
+    #[should_panic(expected = "InvalidRating")]
+    fn test_invalid_learner_rating() {
+        let (env, client, escrow_id, mentor, learner) = setup();
+        let session_id = Symbol::new(&env, "s_bad_lr");
+        let comment_hash = BytesN::from_array(&env, &[0u8; 32]);
+        let mock = MockEscrowClient::new(&env, &escrow_id);
+        mock.set_status(&session_id, &true);
+        client.submit_learner_review(&mentor, &session_id, &learner, &6, &comment_hash);
+    }
+
+    #[test]
+    #[should_panic(expected = "SessionNotReleased")]
+    fn test_learner_review_session_not_released() {
+        let (env, client, _escrow_id, mentor, learner) = setup();
+        let session_id = Symbol::new(&env, "s_active_lr");
+        let comment_hash = BytesN::from_array(&env, &[0u8; 32]);
+        // Not marking as released → status stays Active
+        client.submit_learner_review(&mentor, &session_id, &learner, &4, &comment_hash);
+    }
+
+    #[test]
+    fn test_bidirectional_reviews() {
+        let (env, client, escrow_id, mentor, learner) = setup();
+        let session_id = Symbol::new(&env, "bidirectional");
+        let comment_hash = BytesN::from_array(&env, &[1u8; 32]);
+        let mock = MockEscrowClient::new(&env, &escrow_id);
+        mock.set_status(&session_id, &true);
+
+        // Learner reviews mentor
+        client.submit_review(&session_id, &mentor, &learner, &4, &comment_hash);
+        let (mentor_avg, mentor_count) = client.get_mentor_rating(&mentor);
+        assert_eq!(mentor_count, 1);
+        assert_eq!(mentor_avg, 400);
+
+        // Mentor reviews learner
+        client.submit_learner_review(&mentor, &session_id, &learner, &5, &comment_hash);
+        let (learner_avg, learner_count) = client.get_learner_rating(&learner);
+        assert_eq!(learner_count, 1);
+        assert_eq!(learner_avg, 500);
+
+        // Verify both reviews exist
+        let mentor_review = client.get_review(&session_id);
+        assert_eq!(mentor_review.rating, 4);
+
+        let learner_review = client.get_learner_review(&session_id);
+        assert_eq!(learner_review.participation_rating, 5);
     }
 }
