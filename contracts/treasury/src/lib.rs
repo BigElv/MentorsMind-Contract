@@ -1,6 +1,6 @@
 #![no_std]
 
-use shared::{ReentrancyGuard, require_not_paused};
+use shared::{require_not_paused, ReentrancyGuard};
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, symbol_short, token, Address, Env,
     IntoVal, Symbol, Vec,
@@ -15,18 +15,18 @@ use soroban_sdk::{
 #[repr(u32)]
 pub enum Error {
     AlreadyInitialized = 1,
-    NotInitialized     = 2,
-    Unauthorized       = 3,
+    NotInitialized = 2,
+    Unauthorized = 3,
     InsufficientBalance = 4,
-    TokenNotApproved   = 5,
+    TokenNotApproved = 5,
     /// buyback_and_burn must be called through the registered timelock.
-    NotTimelock        = 6,
+    NotTimelock = 6,
     /// min_mnt_out must be > 0 (pre-flight slippage guard).
-    InvalidMinOut      = 7,
+    InvalidMinOut = 7,
     /// DEX returned fewer tokens than min_mnt_out (slippage exceeded).
-    SlippageExceeded   = 8,
+    SlippageExceeded = 8,
     /// DEX returned zero MNT — no XLM was transferred (approve-pull pattern).
-    ZeroOutput         = 9,
+    ZeroOutput = 9,
 }
 
 // ---------------------------------------------------------------------------
@@ -37,18 +37,18 @@ pub enum Error {
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BuybackSucceeded {
-    pub xlm_spent:   i128,
-    pub mnt_burned:  i128,
-    pub timestamp:   u64,
+    pub xlm_spent: i128,
+    pub mnt_burned: i128,
+    pub timestamp: u64,
 }
 
 /// Emitted when a buyback-and-burn attempt fails before any XLM leaves treasury.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BuybackFailed {
-    pub xlm_amount:  i128,
+    pub xlm_amount: i128,
     /// Short reason tag: "zero_output" | "slippage" | "invalid_min_out"
-    pub reason:      Symbol,
+    pub reason: Symbol,
 }
 
 // ---------------------------------------------------------------------------
@@ -87,9 +87,9 @@ impl DexInterface {
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AllocationHistory {
-    pub token:     Address,
+    pub token: Address,
     pub recipient: Address,
-    pub amount:    i128,
+    pub amount: i128,
     pub timestamp: u64,
 }
 
@@ -100,7 +100,7 @@ pub struct AllocationHistory {
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TreasuryTokenApprovalEvent {
-    pub token:    Address,
+    pub token: Address,
     pub approved: bool,
 }
 
@@ -163,14 +163,24 @@ impl TreasuryContract {
         if env.storage().persistent().has(&DataKey::Admin) {
             return Err(Error::AlreadyInitialized);
         }
-        env.storage().persistent().set(&DataKey::Admin,           &admin);
-        env.storage().persistent().set(&DataKey::StakingContract, &staking_contract);
-        env.storage().persistent().set(&DataKey::Timelock,        &timelock);
+        env.storage().persistent().set(&DataKey::Admin, &admin);
+        env.storage()
+            .persistent()
+            .set(&DataKey::StakingContract, &staking_contract);
+        env.storage()
+            .persistent()
+            .set(&DataKey::Timelock, &timelock);
         if let Some(guardian) = pause_guardian {
-            env.storage().persistent().set(&DataKey::PauseGuardian, &guardian);
+            env.storage()
+                .persistent()
+                .set(&DataKey::PauseGuardian, &guardian);
         }
-        env.storage().persistent().set(&DataKey::AllocationCount, &0u32);
-        env.storage().persistent().set(&DataKey::RegulatoryReporting, &Address::generate(&env)); // placeholder
+        env.storage()
+            .persistent()
+            .set(&DataKey::AllocationCount, &0u32);
+        env.storage()
+            .persistent()
+            .set(&DataKey::RegulatoryReporting, &Address::generate(&env)); // placeholder
         Ok(())
     }
 
@@ -246,12 +256,18 @@ impl TreasuryContract {
         if approved {
             env.events().publish(
                 (symbol_short!("treasury"), symbol_short!("tok_appr")),
-                TreasuryTokenApprovalEvent { token: token_address, approved: true },
+                TreasuryTokenApprovalEvent {
+                    token: token_address,
+                    approved: true,
+                },
             );
         } else {
             env.events().publish(
                 (symbol_short!("treasury"), symbol_short!("tok_rej")),
-                TreasuryTokenApprovalEvent { token: token_address, approved: false },
+                TreasuryTokenApprovalEvent {
+                    token: token_address,
+                    approved: false,
+                },
             );
         }
         Ok(())
@@ -264,7 +280,10 @@ impl TreasuryContract {
 
     fn _is_token_approved(env: &Env, token_address: &Address) -> bool {
         let key = DataKey::ApprovedToken(token_address.clone());
-        env.storage().persistent().get::<_, bool>(&key).unwrap_or(false)
+        env.storage()
+            .persistent()
+            .get::<_, bool>(&key)
+            .unwrap_or(false)
     }
 
     // -----------------------------------------------------------------------
@@ -329,7 +348,13 @@ impl TreasuryContract {
         }
 
         // Check for large transaction threshold and trigger regulatory reporting
-        Self::_check_and_report_large_tx(&env, Symbol::new(&env, "treasury"), Symbol::new(&env, "allocate"), &recipient, amount);
+        Self::_check_and_report_large_tx(
+            &env,
+            Symbol::new(&env, "treasury"),
+            Symbol::new(&env, "allocate"),
+            &recipient,
+            amount,
+        );
 
         let threshold: i128 = env
             .storage()
@@ -358,9 +383,10 @@ impl TreasuryContract {
             env.storage()
                 .persistent()
                 .set(&DataKey::PendingAllocation(pending_count), &pending);
-            env.storage()
-                .persistent()
-                .set(&DataKey::AllocationApproval(pending_count, admin.clone()), &true);
+            env.storage().persistent().set(
+                &DataKey::AllocationApproval(pending_count, admin.clone()),
+                &true,
+            );
             env.storage()
                 .persistent()
                 .set(&DataKey::PendingAllocationCount, &(pending_count + 1));
@@ -372,8 +398,11 @@ impl TreasuryContract {
             return Ok(());
         }
 
-        token::Client::new(&env, &token)
-            .transfer(&env.current_contract_address(), &recipient, &amount);
+        token::Client::new(&env, &token).transfer(
+            &env.current_contract_address(),
+            &recipient,
+            &amount,
+        );
 
         let count: u32 = env
             .storage()
@@ -383,13 +412,15 @@ impl TreasuryContract {
         env.storage().persistent().set(
             &DataKey::Allocation(count),
             &AllocationHistory {
-                token:     token.clone(),
+                token: token.clone(),
                 recipient: recipient.clone(),
                 amount,
                 timestamp: env.ledger().timestamp(),
             },
         );
-        env.storage().persistent().set(&DataKey::AllocationCount, &(count + 1));
+        env.storage()
+            .persistent()
+            .set(&DataKey::AllocationCount, &(count + 1));
 
         env.events().publish(
             (symbol_short!("allocate"), recipient.clone(), token.clone()),
@@ -487,6 +518,14 @@ impl TreasuryContract {
             .get(&DataKey::PendingAllocation(pending_id))
     }
 
+    /// Return the count of pending (multi-sig) allocations.
+    pub fn pending_allocation_count(env: Env) -> u32 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::PendingAllocationCount)
+            .unwrap_or(0)
+    }
+
     /// Distribute tokens to stakers — pro-rata handled by staking contract.
     pub fn distribute_to_stakers(
         env: Env,
@@ -520,8 +559,11 @@ impl TreasuryContract {
             .get(&DataKey::StakingContract)
             .ok_or(Error::NotInitialized)?;
 
-        token::Client::new(&env, &token)
-            .transfer(&env.current_contract_address(), &staking_contract, &total_amount);
+        token::Client::new(&env, &token).transfer(
+            &env.current_contract_address(),
+            &staking_contract,
+            &total_amount,
+        );
 
         env.invoke_contract::<()>(
             &staking_contract,
@@ -530,7 +572,11 @@ impl TreasuryContract {
         );
 
         env.events().publish(
-            (symbol_short!("distrib"), staking_contract.clone(), token.clone()),
+            (
+                symbol_short!("distrib"),
+                staking_contract.clone(),
+                token.clone(),
+            ),
             total_amount,
         );
         Ok(())
@@ -560,12 +606,12 @@ impl TreasuryContract {
     /// timelock's 48-hour delay to prevent rushed or malicious swaps.
     pub fn buyback_and_burn(
         env: Env,
-        xlm_token:    Address,
-        mnt_token:    Address,
+        xlm_token: Address,
+        mnt_token: Address,
         dex_contract: Address,
-        xlm_amount:   i128,
-        min_mnt_out:  i128,
-        dex_iface:    DexInterface,
+        xlm_amount: i128,
+        min_mnt_out: i128,
+        dex_iface: DexInterface,
     ) -> Result<(), Error> {
         let _guard = ReentrancyGuard::enter(&env, Symbol::new(&env, "buyback"));
 
@@ -685,9 +731,9 @@ impl TreasuryContract {
         env.events().publish(
             (symbol_short!("buyback"), symbol_short!("ok")),
             BuybackSucceeded {
-                xlm_spent:  xlm_amount,
+                xlm_spent: xlm_amount,
                 mnt_burned: mnt_received,
-                timestamp:  env.ledger().timestamp(),
+                timestamp: env.ledger().timestamp(),
             },
         );
 
@@ -761,7 +807,7 @@ mod tests {
             let xlm = token::Client::new(&env, &token_in);
             xlm.transfer_from(
                 &env.current_contract_address(),
-                &recipient,  // pull from treasury (spender == DEX contract)
+                &recipient, // pull from treasury (spender == DEX contract)
                 &env.current_contract_address(), // actually pull from who approved
                 &amount_in,
             );
@@ -827,9 +873,9 @@ mod tests {
     // -----------------------------------------------------------------------
 
     fn setup_test(env: &Env) -> (Address, Address, Address, Address) {
-        let admin    = Address::generate(env);
-        let staking  = env.register_contract(None, MockStaking);
-        let timelock = Address::generate(env);  // simulated timelock address
+        let admin = Address::generate(env);
+        let staking = env.register_contract(None, MockStaking);
+        let timelock = Address::generate(env); // simulated timelock address
         let contract_id = env.register_contract(None, TreasuryContract);
         let client = TreasuryContractClient::new(env, &contract_id);
         client.initialize(&admin, &staking, &timelock);
@@ -837,7 +883,9 @@ mod tests {
     }
 
     fn default_dex_iface(env: &Env) -> DexInterface {
-        DexInterface { swap_fn: Symbol::new(env, "swap_exact_in") }
+        DexInterface {
+            swap_fn: Symbol::new(env, "swap_exact_in"),
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -1074,7 +1122,7 @@ mod tests {
             &mnt_addr,
             &dex_addr,
             &500,
-            &0,  // invalid
+            &0, // invalid
             &default_dex_iface(&env),
         );
 
@@ -1139,9 +1187,10 @@ mod tests {
         treasury_client.set_approved_token(&xlm_addr, &true);
         treasury_client.set_approved_token(&mnt_addr, &true);
 
-        let bad_iface = DexInterface { swap_fn: Symbol::new(&env, "") };
-        let _ = treasury_client.try_buyback_and_burn(
-            &xlm_addr, &mnt_addr, &dex_addr, &1000, &500, &bad_iface,
-        );
+        let bad_iface = DexInterface {
+            swap_fn: Symbol::new(&env, ""),
+        };
+        let _ = treasury_client
+            .try_buyback_and_burn(&xlm_addr, &mnt_addr, &dex_addr, &1000, &500, &bad_iface);
     }
 }
