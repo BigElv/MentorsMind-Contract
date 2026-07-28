@@ -29,7 +29,7 @@
               "ext": "v0",
               "contract": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
               "key": {
-                "symbol": "s_bad"
+                "symbol": "s_bad_lr"
               },
               "durability": "persistent",
               "val": {
