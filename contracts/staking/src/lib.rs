@@ -99,12 +99,24 @@ pub enum DataKey {
     AnomalyDetector,
     BypassAnomalyCheck,
     PendingAdmin,
+    LiquidityProviderRecord(Address),
+    LPRewardPool,
 }
 
 // ---------------------------------------------------------------------------
 // Tier thresholds (raw i128, no decimals assumed — callers pass raw amounts)
 // Thresholds: Bronze ≥ 100, Silver ≥ 500, Gold ≥ 2000
 // ---------------------------------------------------------------------------
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LPRecord {
+    pub lp_token_contract: Address,
+    pub lp_token_amount: i128,
+    pub pair: (Address, Address),
+    pub registered_at: u64,
+    pub last_reward_at: u64,
+}
 
 const TIER_BRONZE: i128 = 100;
 const TIER_SILVER: i128 = 500;
@@ -792,6 +804,96 @@ impl StakingContract {
             .persistent()
             .get(&DataKey::PendingRewards(staker))
             .unwrap_or(0)
+    }
+
+    pub fn add_to_lp_reward_pool(env: Env, amount: i128) {
+        // Anyone can call this to add rewards to the pool, typically the treasury.
+        let pool_balance: i128 = env.storage().persistent().get(&DataKey::LPRewardPool).unwrap_or(0);
+        env.storage().persistent().set(&DataKey::LPRewardPool, &(pool_balance + amount));
+    }
+
+    pub fn register_lp_position(
+        env: Env,
+        lp_holder: Address,
+        lp_token_contract: Address,
+        lp_amount: i128,
+        token_a: Address,
+        token_b: Address,
+    ) -> Result<(), Error> {
+        lp_holder.require_auth();
+        if lp_amount <= 0 {
+            return Err(Error::InvalidAmount);
+        }
+        let now = env.ledger().timestamp();
+        let record = LPRecord {
+            lp_token_contract,
+            lp_token_amount: lp_amount,
+            pair: (token_a, token_b),
+            registered_at: now,
+            last_reward_at: now,
+        };
+        env.storage().persistent().set(&DataKey::LiquidityProviderRecord(lp_holder), &record);
+        Ok(())
+    }
+
+    pub fn verify_lp_position(env: Env, lp_holder: Address) -> bool {
+        let record: Option<LPRecord> = env.storage().persistent().get(&DataKey::LiquidityProviderRecord(lp_holder.clone()));
+        if let Some(r) = record {
+            let client = token::Client::new(&env, &r.lp_token_contract);
+            let balance = client.balance(&lp_holder);
+            return balance >= r.lp_token_amount;
+        }
+        false
+    }
+
+    pub fn lp_staking_tier_boost(env: Env, lp_holder: Address) -> u32 {
+        if !Self::verify_lp_position(env.clone(), lp_holder.clone()) {
+            return 0;
+        }
+        let record: LPRecord = env.storage().persistent().get(&DataKey::LiquidityProviderRecord(lp_holder)).unwrap();
+        // Calculate boost based on lp_token_amount (example: 100 bps per 1000 LP tokens)
+        let boost = (record.lp_token_amount / 1000) as u32;
+        boost.min(500) // cap at 500 bps (5%)
+    }
+
+    pub fn claim_lp_rewards(env: Env, lp_holder: Address, mnt_token: Address) -> Result<(), Error> {
+        lp_holder.require_auth();
+        if !Self::verify_lp_position(env.clone(), lp_holder.clone()) {
+            return Err(Error::InvalidAmount); // Or a specific error
+        }
+        
+        let mut record: LPRecord = env.storage().persistent().get(&DataKey::LiquidityProviderRecord(lp_holder.clone())).unwrap();
+        let now = env.ledger().timestamp();
+        let time_staked = now - record.last_reward_at;
+        
+        if time_staked == 0 {
+            return Ok(());
+        }
+
+        // Calculate rewards: proportional to time and amount
+        // Assuming a rate, e.g., 1 reward token per 1000 LP tokens per day
+        let reward = ((record.lp_token_amount as u128 * time_staked as u128) / (1000 * 86400)) as i128;
+        
+        if reward > 0 {
+            let pool_balance: i128 = env.storage().persistent().get(&DataKey::LPRewardPool).unwrap_or(0);
+            if reward > pool_balance {
+                 // Adjust to pool balance or return error
+                 // For now, let's just pay what's in the pool
+                 let actual_reward = reward.min(pool_balance);
+                 env.storage().persistent().set(&DataKey::LPRewardPool, &(pool_balance - actual_reward));
+                 let token_client = token::Client::new(&env, &mnt_token);
+                 token_client.transfer(&env.current_contract_address(), &lp_holder, &actual_reward);
+            } else {
+                 env.storage().persistent().set(&DataKey::LPRewardPool, &(pool_balance - reward));
+                 let token_client = token::Client::new(&env, &mnt_token);
+                 token_client.transfer(&env.current_contract_address(), &lp_holder, &reward);
+            }
+        }
+        
+        record.last_reward_at = now;
+        env.storage().persistent().set(&DataKey::LiquidityProviderRecord(lp_holder), &record);
+
+        Ok(())
     }
 
     /// Current epoch id (the epoch presently accruing, not yet snapshotted).

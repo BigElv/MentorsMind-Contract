@@ -66,6 +66,25 @@ const MAX_PAST_START_SECS: u64 = 5 * 60; // 5 minutes
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub enum DataKey {
+    HighValueThreshold,
+    PendingHighValueSession(Symbol),
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PendingSession {
+    pub mentor: Address,
+    pub learner: Address,
+    pub amount: i128,
+    pub token: Address,
+    pub requested_at: u64,
+}
+
+pub const HIGH_VALUE_APPROVAL_WINDOW_SECS: u64 = 48 * 3600;
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PendingAdminChange {
     pub new_admin: Address,
     pub effective_at: u64,
@@ -282,6 +301,45 @@ impl EscrowFactory {
         // and within the maximum allowed window.
         Self::validate_future_timestamp(&env, now, session_end, MIN_SESSION_DURATION_SECS, MAX_SESSION_DURATION_SECS);
 
+        let threshold: i128 = env.storage().persistent().get(&DataKey::HighValueThreshold).unwrap_or(50_000_000_000);
+        
+        if amount > threshold {
+            let pending = PendingSession {
+                mentor: mentor.clone(),
+                learner: learner.clone(),
+                amount,
+                token: token.clone(),
+                requested_at: now,
+            };
+            env.storage().persistent().set(&DataKey::PendingHighValueSession(session_id.clone()), &pending);
+            env.events().publish(
+                (Symbol::new(&env, "HighValueSessionPending"), session_id.clone()),
+                (amount, now + HIGH_VALUE_APPROVAL_WINDOW_SECS),
+            );
+            
+            let nonce_key = (SESSION_NONCE, session_id.clone());
+            let current_nonce: u32 = env.storage().persistent().get(&nonce_key).unwrap_or(0);
+            let next_nonce = current_nonce.checked_add(1).expect("nonce overflow");
+            let salt = Self::compute_salt(&env, &session_id, &mentor, &learner, next_nonce);
+            return Self::predicted_address(&env, &implementation, salt);
+        }
+
+        Self::deploy_escrow_internal(env, mentor, learner, amount, token, session_id, implementation, now, session_end)
+    }
+
+    fn deploy_escrow_internal(
+        env: Env,
+        mentor: Address,
+        learner: Address,
+        amount: i128,
+        token: Address,
+        session_id: Symbol,
+        implementation: Address,
+        now: u64,
+        session_end: u64,
+    ) -> Address {
+        let session_key = (ESCROW_MAPPING, session_id.clone());
+
         // Bump this session's nonce *before* computing the salt so a
         // redeployment (after a prior escrow for the same session_id
         // expired and was superseded) gets a fresh address instead of
@@ -380,6 +438,43 @@ impl EscrowFactory {
         }
 
         escrow_address
+    }
+
+    pub fn approve_high_value_session(env: Env, multisig: Address, session_id: Symbol) -> Address {
+        multisig.require_auth();
+        
+        let key = DataKey::PendingHighValueSession(session_id.clone());
+        let pending: PendingSession = env.storage().persistent().get(&key).expect("Session not pending");
+        
+        let now = env.ledger().timestamp();
+        if now > pending.requested_at + HIGH_VALUE_APPROVAL_WINDOW_SECS {
+            // Expired approval: Automatically refund learner.
+            // Assumption: factory holds the tokens that were transferred for this pending session.
+            let token_client = soroban_sdk::token::Client::new(&env, &pending.token);
+            token_client.transfer(&env.current_contract_address(), &pending.learner, &pending.amount);
+            env.storage().persistent().remove(&key);
+            panic!("Approval expired, refunded learner");
+        }
+        
+        env.storage().persistent().remove(&key);
+        
+        let implementation: Address = env.storage().persistent().get(&IMPLEMENTATION).expect("Implementation not set");
+        let session_end = now.checked_add(DEFAULT_SESSION_DURATION_SECS).expect("timestamp overflow");
+        
+        let address = Self::deploy_escrow_internal(
+            env.clone(),
+            pending.mentor,
+            pending.learner,
+            pending.amount,
+            pending.token,
+            session_id.clone(),
+            implementation,
+            now,
+            session_end,
+        );
+        
+        env.events().publish((Symbol::new(&env, "HighValueSessionApproved"), session_id), multisig);
+        address
     }
 
     /// Get escrow address by session ID
