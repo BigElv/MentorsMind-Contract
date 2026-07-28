@@ -22,7 +22,7 @@
 
 use soroban_sdk::{
     contract, contractclient, contracterror, contractimpl, contracttype, Address, BytesN, Env,
-    Symbol, Vec, IntoVal,
+    IntoVal, Symbol, Vec,
 };
 
 /// Default window (seconds) within which evidence may be submitted after session end.
@@ -125,6 +125,9 @@ pub enum DataKey {
     CooldownEnabled,
     AnomalyDetector,
     BypassAnomalyCheck,
+    /// Optional `health_dashboard` contract address notified of dispute
+    /// lifecycle events (opened / resolved) for platform analytics (#760).
+    HealthDashboard,
 }
 
 #[contractclient(name = "EscrowContractClient")]
@@ -210,6 +213,14 @@ impl DisputeEvidenceContract {
         Ok(())
     }
 
+    /// Configure the `health_dashboard` contract notified of dispute
+    /// lifecycle events. Admin only; optional (skipped when unset, #760).
+    pub fn set_health_dashboard(env: Env, admin: Address, dashboard: Address) -> Result<(), Error> {
+        Self::require_admin(&env, &admin)?;
+        env.storage().instance().set(&DataKey::HealthDashboard, &dashboard);
+        Ok(())
+    }
+
     /// Record that a dispute was opened.
     ///
     /// # Security
@@ -249,6 +260,19 @@ impl DisputeEvidenceContract {
             (Symbol::new(&env, "dispute_opened"), escrow_id),
             opened_at,
         );
+
+        if let Some(dashboard) = env
+            .storage()
+            .instance()
+            .get::<_, Address>(&DataKey::HealthDashboard)
+        {
+            env.invoke_contract::<()>(
+                &dashboard,
+                &Symbol::new(&env, "record_dispute_opened"),
+                (escrow_id, opened_at).into_val(&env),
+            );
+        }
+
         Ok(())
     }
 
@@ -429,24 +453,41 @@ impl DisputeEvidenceContract {
         }
 
         // Time-lock: enforce minimum deliberation period.
-        if let Some(opened_at) = env
+        let opened_at_opt: Option<u64> = env
             .storage()
             .persistent()
-            .get::<_, u64>(&DataKey::DisputeOpenedAt(escrow_id))
-        {
+            .get(&DataKey::DisputeOpenedAt(escrow_id));
+        if let Some(opened_at) = opened_at_opt {
             let earliest_resolution = opened_at.saturating_add(MIN_RESOLUTION_DELAY_SECS);
             if env.ledger().timestamp() < earliest_resolution {
                 return Err(Error::ResolutionTimelockActive);
             }
         }
 
+        let resolved_at = env.ledger().timestamp();
         let resolution = DisputeResolution {
             arbitrator: arbitrator.clone(),
             release_to_mentor,
             note: note.clone(),
-            resolved_at: env.ledger().timestamp(),
+            resolved_at,
         };
         env.storage().persistent().set(&key, &resolution);
+
+        if let Some(dashboard) = env
+            .storage()
+            .instance()
+            .get::<_, Address>(&DataKey::HealthDashboard)
+        {
+            let resolution_time_secs = opened_at_opt
+                .map(|opened_at| resolved_at.saturating_sub(opened_at))
+                .unwrap_or(0);
+            env.invoke_contract::<()>(
+                &dashboard,
+                &Symbol::new(&env, "record_resolution"),
+                (escrow_id, release_to_mentor, resolution_time_secs).into_val(&env),
+            );
+        }
+
         env.events().publish(
             (Symbol::new(&env, "dispute_resolved"), escrow_id),
             resolution,
@@ -537,7 +578,7 @@ mod tests {
         let escrow_contract = env.register_contract(None, MockEscrow);
         let contract_id = env.register_contract(None, DisputeEvidenceContract);
         let client = DisputeEvidenceContractClient::new(&env, &contract_id);
-        client.initialize(&admin, &escrow_contract).unwrap();
+        client.initialize(&admin, &escrow_contract);
         let escrow = EscrowContractClient::new(&env, &escrow_contract).get_escrow(&1);
         (env, admin, escrow.mentor, escrow.learner, client)
     }
@@ -556,9 +597,10 @@ mod tests {
 
     fn advance_time(env: &Env, secs: u64) {
         let t = env.ledger().timestamp();
+        let protocol_version = env.ledger().protocol_version();
         env.ledger().set(LedgerInfo {
             timestamp: t + secs,
-            protocol_version: 22,
+            protocol_version,
             sequence_number: env.ledger().sequence() + 1,
             network_id: Default::default(),
             base_reserve: 10,
@@ -574,11 +616,10 @@ mod tests {
     fn stores_evidence_until_cap() {
         let (env, _admin, mentor, _learner, client) = setup_disputed();
         // Disable cooldown to allow rapid sequential submissions for cap test
-        client.set_cooldown_enabled(&_admin, &false).unwrap();
+        client.set_cooldown_enabled(&_admin, &false);
         for seed in 1u8..=5 {
             client
-                .submit_evidence(&1, &mentor, &hash32(&env, seed), &hash32(&env, seed.wrapping_add(100)), &None)
-                .unwrap();
+                .submit_evidence(&1, &mentor, &hash32(&env, seed), &hash32(&env, seed.wrapping_add(100)), &None);
         }
         assert_eq!(client.get_evidence_count(&1), MAX_EVIDENCE_ITEMS);
     }
@@ -601,11 +642,10 @@ mod tests {
     #[test]
     fn submit_evidence_rejects_duplicate_hash_same_submitter() {
         let (env, admin, mentor, _learner, client) = setup_disputed();
-        client.set_cooldown_enabled(&admin, &false).unwrap();
+        client.set_cooldown_enabled(&admin, &false);
         let hash = hash32(&env, 7);
         client
-            .submit_evidence(&1, &mentor, &hash, &hash32(&env, 8), &None)
-            .unwrap();
+            .submit_evidence(&1, &mentor, &hash, &hash32(&env, 8), &None);
         let result = client.try_submit_evidence(&1, &mentor, &hash, &hash32(&env, 9), &None);
         assert!(
             result.is_err(),
@@ -616,16 +656,14 @@ mod tests {
     #[test]
     fn submit_evidence_allows_same_hash_from_different_submitters() {
         let (env, admin, mentor, learner, client) = setup_disputed();
-        client.set_cooldown_enabled(&admin, &false).unwrap();
+        client.set_cooldown_enabled(&admin, &false);
         let hash = hash32(&env, 7);
         client
-            .submit_evidence(&1, &mentor, &hash, &hash32(&env, 8), &None)
-            .unwrap();
+            .submit_evidence(&1, &mentor, &hash, &hash32(&env, 8), &None);
         // Different submitter, same content_hash — allowed (e.g. both
         // parties independently attest to the same document).
         client
-            .submit_evidence(&1, &learner, &hash, &hash32(&env, 8), &None)
-            .unwrap();
+            .submit_evidence(&1, &learner, &hash, &hash32(&env, 8), &None);
         assert_eq!(client.get_evidence_count(&1), 2);
     }
 
@@ -634,8 +672,7 @@ mod tests {
         let (env, _admin, mentor, _learner, client) = setup_disputed();
         let hash = hash32(&env, 42);
         client
-            .submit_evidence(&1, &mentor, &hash, &hash32(&env, 43), &None)
-            .unwrap();
+            .submit_evidence(&1, &mentor, &hash, &hash32(&env, 43), &None);
         assert!(client.verify_evidence_integrity(&1, &0, &hash));
     }
 
@@ -643,8 +680,7 @@ mod tests {
     fn verify_evidence_integrity_fails_on_tampered_hash() {
         let (env, _admin, mentor, _learner, client) = setup_disputed();
         client
-            .submit_evidence(&1, &mentor, &hash32(&env, 42), &hash32(&env, 43), &None)
-            .unwrap();
+            .submit_evidence(&1, &mentor, &hash32(&env, 42), &hash32(&env, 43), &None);
         // A different (tampered) hash must not verify.
         assert!(!client.verify_evidence_integrity(&1, &0, &hash32(&env, 99)));
     }
@@ -662,8 +698,7 @@ mod tests {
         sig_bytes[0] = 9;
         let attestation = BytesN::from_array(&env, &sig_bytes);
         client
-            .submit_evidence(&1, &mentor, &hash32(&env, 1), &hash32(&env, 2), &Some(attestation.clone()))
-            .unwrap();
+            .submit_evidence(&1, &mentor, &hash32(&env, 1), &hash32(&env, 2), &Some(attestation.clone()));
         let items = client.get_evidence(&1);
         assert_eq!(items.get(0).unwrap().submitter_attestation, attestation);
     }
@@ -672,8 +707,7 @@ mod tests {
     fn submit_evidence_without_attestation_stores_zero_sentinel() {
         let (env, _admin, mentor, _learner, client) = setup_disputed();
         client
-            .submit_evidence(&1, &mentor, &hash32(&env, 1), &hash32(&env, 2), &None)
-            .unwrap();
+            .submit_evidence(&1, &mentor, &hash32(&env, 1), &hash32(&env, 2), &None);
         let items = client.get_evidence(&1);
         assert_eq!(
             items.get(0).unwrap().submitter_attestation,
@@ -687,8 +721,7 @@ mod tests {
     fn second_submission_within_cooldown_fails() {
         let (env, _admin, mentor, _learner, client) = setup_disputed();
         client
-            .submit_evidence(&1, &mentor, &hash32(&env, 1), &hash32(&env, 2), &None)
-            .unwrap();
+            .submit_evidence(&1, &mentor, &hash32(&env, 1), &hash32(&env, 2), &None);
         // Immediately retry (within cooldown) → must fail
         let result = client.try_submit_evidence(&1, &mentor, &hash32(&env, 3), &hash32(&env, 4), &None);
         assert!(result.is_err(), "second submission within cooldown must fail");
@@ -698,12 +731,10 @@ mod tests {
     fn submission_allowed_after_cooldown_elapses() {
         let (env, _admin, mentor, _learner, client) = setup_disputed();
         client
-            .submit_evidence(&1, &mentor, &hash32(&env, 1), &hash32(&env, 2), &None)
-            .unwrap();
+            .submit_evidence(&1, &mentor, &hash32(&env, 1), &hash32(&env, 2), &None);
         advance_time(&env, SUBMISSION_COOLDOWN_SECS + 1);
         client
-            .submit_evidence(&1, &mentor, &hash32(&env, 3), &hash32(&env, 4), &None)
-            .unwrap();
+            .submit_evidence(&1, &mentor, &hash32(&env, 3), &hash32(&env, 4), &None);
         assert_eq!(client.get_evidence_count(&1), 2);
     }
 
@@ -712,25 +743,21 @@ mod tests {
         let (env, _admin, mentor, learner, client) = setup_disputed();
         // mentor submits
         client
-            .submit_evidence(&1, &mentor, &hash32(&env, 1), &hash32(&env, 2), &None)
-            .unwrap();
+            .submit_evidence(&1, &mentor, &hash32(&env, 1), &hash32(&env, 2), &None);
         // learner submits in the same window — separate cooldown key
         client
-            .submit_evidence(&1, &learner, &hash32(&env, 3), &hash32(&env, 4), &None)
-            .unwrap();
+            .submit_evidence(&1, &learner, &hash32(&env, 3), &hash32(&env, 4), &None);
         assert_eq!(client.get_evidence_count(&1), 2);
     }
 
     #[test]
     fn cooldown_disabled_allows_rapid_submission() {
         let (env, admin, mentor, _learner, client) = setup_disputed();
-        client.set_cooldown_enabled(&admin, &false).unwrap();
+        client.set_cooldown_enabled(&admin, &false);
         client
-            .submit_evidence(&1, &mentor, &hash32(&env, 1), &hash32(&env, 2), &None)
-            .unwrap();
+            .submit_evidence(&1, &mentor, &hash32(&env, 1), &hash32(&env, 2), &None);
         client
-            .submit_evidence(&1, &mentor, &hash32(&env, 3), &hash32(&env, 4), &None)
-            .unwrap();
+            .submit_evidence(&1, &mentor, &hash32(&env, 3), &hash32(&env, 4), &None);
         assert_eq!(client.get_evidence_count(&1), 2);
     }
 
@@ -740,7 +767,7 @@ mod tests {
     fn resolution_before_timelock_fails() {
         let (env, admin, _mentor, _learner, client) = setup_disputed();
         let arbitrator = Address::generate(&env);
-        client.record_dispute_opened(&1).unwrap();
+        client.record_dispute_opened(&1);
 
         // Do NOT advance time
         let result = client.try_submit_resolution(
@@ -757,13 +784,12 @@ mod tests {
     fn resolution_after_timelock_succeeds() {
         let (env, admin, _mentor, _learner, client) = setup_disputed();
         let arbitrator = Address::generate(&env);
-        client.record_dispute_opened(&1).unwrap();
+        client.record_dispute_opened(&1);
 
         advance_time(&env, MIN_RESOLUTION_DELAY_SECS + 1);
 
         client
-            .submit_resolution(&1, &arbitrator, &true, &Symbol::new(&env, "mentor_wins"))
-            .unwrap();
+            .submit_resolution(&1, &arbitrator, &true, &Symbol::new(&env, "mentor_wins"));
 
         let res = client.get_resolution(&1);
         assert_eq!(res.arbitrator, arbitrator);
@@ -777,8 +803,7 @@ mod tests {
         // No `record_dispute_opened` call — guard is skipped for backwards compat
         let arbitrator = Address::generate(&env);
         client
-            .submit_resolution(&1, &arbitrator, &false, &Symbol::new(&env, "learner_wins"))
-            .unwrap();
+            .submit_resolution(&1, &arbitrator, &false, &Symbol::new(&env, "learner_wins"));
         let res = client.get_resolution(&1);
         assert!(!res.release_to_mentor);
     }
@@ -788,7 +813,7 @@ mod tests {
     #[test]
     fn record_dispute_opened_is_idempotent() {
         let (env, admin, _mentor, _learner, client) = setup_disputed();
-        client.record_dispute_opened(&1).unwrap();
+        client.record_dispute_opened(&1);
         let result = client.try_record_dispute_opened(&1);
         assert!(result.is_err(), "second call must return AlreadyRecorded");
         let _ = admin;
@@ -804,7 +829,7 @@ mod tests {
     fn get_dispute_opened_at_returns_timestamp_after_record() {
         let (env, _admin, _mentor, _learner, client) = setup_disputed();
         let before = env.ledger().timestamp();
-        client.record_dispute_opened(&1).unwrap();
+        client.record_dispute_opened(&1);
         let after = env.ledger().timestamp();
         let opened = client.get_dispute_opened_at(&1).unwrap();
         assert!(opened >= before && opened <= after);
@@ -817,8 +842,7 @@ mod tests {
         let (env, _admin, _mentor, _learner, client) = setup_disputed();
         let arb = Address::generate(&env);
         client
-            .submit_resolution(&1, &arb, &true, &Symbol::new(&env, "a"))
-            .unwrap();
+            .submit_resolution(&1, &arb, &true, &Symbol::new(&env, "a"));
         let result = client.try_submit_resolution(&1, &arb, &false, &Symbol::new(&env, "b"));
         assert!(result.is_err(), "second resolution must be rejected");
     }
@@ -829,19 +853,18 @@ mod tests {
     fn resolution_at_exact_timelock_boundary_succeeds() {
         let (env, _admin, _mentor, _learner, client) = setup_disputed();
         let arb = Address::generate(&env);
-        client.record_dispute_opened(&1).unwrap();
+        client.record_dispute_opened(&1);
         // Advance exactly the minimum delay (no extra second).
         advance_time(&env, MIN_RESOLUTION_DELAY_SECS);
         client
-            .submit_resolution(&1, &arb, &true, &Symbol::new(&env, "ok"))
-            .unwrap();
+            .submit_resolution(&1, &arb, &true, &Symbol::new(&env, "ok"));
     }
 
     #[test]
     fn resolution_one_second_before_timelock_fails() {
         let (env, _admin, _mentor, _learner, client) = setup_disputed();
         let arb = Address::generate(&env);
-        client.record_dispute_opened(&1).unwrap();
+        client.record_dispute_opened(&1);
         advance_time(&env, MIN_RESOLUTION_DELAY_SECS.saturating_sub(1));
         let result = client.try_submit_resolution(&1, &arb, &true, &Symbol::new(&env, "ok"));
         assert!(result.is_err(), "resolution 1s before timelock must fail");
@@ -858,7 +881,7 @@ mod tests {
         let arb = Address::generate(&env);
 
         for offset in [0, 1, 10, 100, MIN_RESOLUTION_DELAY_SECS / 2] {
-            client.record_dispute_opened(&1).unwrap();
+            client.record_dispute_opened(&1);
             advance_time(&env, offset);
             let result = client.try_submit_resolution(&1, &arb, &true, &Symbol::new(&env, "r"));
             if offset < MIN_RESOLUTION_DELAY_SECS {
@@ -890,31 +913,132 @@ mod tests {
     fn evidence_submitted_event_contains_correct_payload() {
         let (env, _admin, mentor, _learner, client) = setup_disputed();
         let hash = hash32(&env, 1);
-        client
-            .submit_evidence(&1, &mentor, &hash, &hash32(&env, 2), &None)
-            .unwrap();
-        let events = env.events().all();
-        let last = events.last().unwrap();
-        assert_eq!(
-            last.1,
-            (Symbol::new(&env, "evidence_submitted"), 1u64).into_val(&env)
-        );
-        let payload = EvidenceItem::try_from_val(&env, &last.2).unwrap();
-        assert_eq!(payload.content_hash, hash);
+        let uri_hash = hash32(&env, 2);
+        client.submit_evidence(&1, &mentor, &hash, &uri_hash, &None);
+
+        let expected_item = EvidenceItem {
+            submitter: mentor.clone(),
+            content_hash: hash,
+            evidence_uri_hash: uri_hash,
+            submitter_attestation: BytesN::from_array(&env, &[0u8; 64]),
+            submitted_at: env.ledger().timestamp(),
+        };
+
+        let topics: Vec<soroban_sdk::Val> =
+            (Symbol::new(&env, "evidence_submitted"), 1u64).into_val(&env);
+        let data: soroban_sdk::Val = expected_item.into_val(&env);
+        let mut expected: Vec<(Address, Vec<soroban_sdk::Val>, soroban_sdk::Val)> = Vec::new(&env);
+        expected.push_back((client.address.clone(), topics, data));
+
+        assert_eq!(env.events().all(), expected);
     }
 
     #[test]
     fn dispute_resolved_event_emitted_on_resolution() {
         let (env, _admin, _mentor, _learner, client) = setup_disputed();
         let arb = Address::generate(&env);
-        client
-            .submit_resolution(&1, &arb, &true, &Symbol::new(&env, "ok"))
-            .unwrap();
-        let events = env.events().all();
-        let last = events.last().unwrap();
-        assert_eq!(
-            last.1,
-            (Symbol::new(&env, "dispute_resolved"), 1u64).into_val(&env)
-        );
+        client.submit_resolution(&1, &arb, &true, &Symbol::new(&env, "ok"));
+
+        // `events().all()` only reflects the *last* contract invocation, so
+        // the expected resolution is built from known inputs rather than by
+        // calling `get_resolution` (which would itself become "the last
+        // invocation" and clear the events we're asserting on).
+        let expected_resolution = DisputeResolution {
+            arbitrator: arb,
+            release_to_mentor: true,
+            note: Symbol::new(&env, "ok"),
+            resolved_at: env.ledger().timestamp(),
+        };
+        let topics: Vec<soroban_sdk::Val> =
+            (Symbol::new(&env, "dispute_resolved"), 1u64).into_val(&env);
+        let data: soroban_sdk::Val = expected_resolution.into_val(&env);
+        let mut expected: Vec<(Address, Vec<soroban_sdk::Val>, soroban_sdk::Val)> = Vec::new(&env);
+        expected.push_back((client.address.clone(), topics, data));
+
+        assert_eq!(env.events().all(), expected);
+    }
+
+    // ─── #760: health_dashboard integration hooks ─────────────────────────
+
+    #[contracttype]
+    #[derive(Clone)]
+    enum DashboardMockKey {
+        OpenedCall(u64),
+        ResolutionCall(u64),
+    }
+
+    #[contract]
+    struct MockHealthDashboard;
+
+    #[contractimpl]
+    impl MockHealthDashboard {
+        pub fn record_dispute_opened(env: Env, escrow_id: u64, opened_at: u64) {
+            env.storage()
+                .persistent()
+                .set(&DashboardMockKey::OpenedCall(escrow_id), &opened_at);
+        }
+
+        pub fn record_resolution(
+            env: Env,
+            escrow_id: u64,
+            release_to_mentor: bool,
+            resolution_time_secs: u64,
+        ) {
+            env.storage().persistent().set(
+                &DashboardMockKey::ResolutionCall(escrow_id),
+                &(release_to_mentor, resolution_time_secs),
+            );
+        }
+
+        pub fn get_opened_call(env: Env, escrow_id: u64) -> Option<u64> {
+            env.storage()
+                .persistent()
+                .get(&DashboardMockKey::OpenedCall(escrow_id))
+        }
+
+        pub fn get_resolution_call(env: Env, escrow_id: u64) -> Option<(bool, u64)> {
+            env.storage()
+                .persistent()
+                .get(&DashboardMockKey::ResolutionCall(escrow_id))
+        }
+    }
+
+    #[test]
+    fn record_dispute_opened_notifies_configured_health_dashboard() {
+        let (env, admin, _mentor, _learner, client) = setup_disputed();
+        let dashboard_id = env.register_contract(None, MockHealthDashboard);
+        client.set_health_dashboard(&admin, &dashboard_id);
+
+        client.record_dispute_opened(&1);
+
+        let dashboard_client = MockHealthDashboardClient::new(&env, &dashboard_id);
+        assert!(dashboard_client.get_opened_call(&1).is_some());
+    }
+
+    #[test]
+    fn record_dispute_opened_without_dashboard_configured_is_backwards_compatible() {
+        let (env, _admin, _mentor, _learner, client) = setup_disputed();
+        // No set_health_dashboard call — must still succeed.
+        client.record_dispute_opened(&1);
+        let _ = env;
+    }
+
+    #[test]
+    fn submit_resolution_notifies_configured_health_dashboard_with_favor_and_duration() {
+        let (env, admin, _mentor, _learner, client) = setup_disputed();
+        let dashboard_id = env.register_contract(None, MockHealthDashboard);
+        client.set_health_dashboard(&admin, &dashboard_id);
+
+        client.record_dispute_opened(&1);
+        advance_time(&env, MIN_RESOLUTION_DELAY_SECS + 500);
+
+        let arbitrator = Address::generate(&env);
+        client.submit_resolution(&1, &arbitrator, &true, &Symbol::new(&env, "mentor_wins"));
+
+        let dashboard_client = MockHealthDashboardClient::new(&env, &dashboard_id);
+        let (release_to_mentor, resolution_time_secs) =
+            dashboard_client.get_resolution_call(&1).unwrap();
+        assert!(release_to_mentor);
+        assert_eq!(resolution_time_secs, MIN_RESOLUTION_DELAY_SECS + 500);
     }
 }

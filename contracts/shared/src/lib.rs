@@ -9,6 +9,7 @@ use soroban_sdk::contracterror;
 /// behavior aligned across contracts that make the same safety assumptions.
 pub mod escrow;
 pub mod events;
+pub mod gas_estimation;
 pub mod pause_guard;
 pub mod reentrancy_guard;
 pub mod sig_validation;
@@ -19,6 +20,7 @@ pub mod ttl_utils;
 pub mod interface_id;
 
 pub use escrow::{EscrowRecord, EscrowStatus};
+pub use gas_estimation::GasEstimate;
 pub use pause_guard::{ContractPaused, is_paused, require_not_paused};
 pub use reentrancy_guard::ReentrancyGuard;
 pub use sig_validation::{

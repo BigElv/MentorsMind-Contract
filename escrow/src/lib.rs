@@ -1,7 +1,12 @@
 #![no_std]
 #![allow(deprecated)]
 #![allow(dead_code)]
-use shared::{EscrowRecord, EscrowStatus};
+pub use shared::EscrowStatus;
+use shared::events::{
+    emit_escrow_event, evt_escrow_created, evt_escrow_disputed, evt_escrow_refunded,
+    evt_escrow_released, evt_escrow_resolved,
+};
+use shared::{EscrowRecord, GasEstimate};
 use soroban_sdk::{contract, contractimpl, contracttype, symbol_short, token, Address, Env, Symbol, Vec, IntoVal, BytesN};
 
 #[contracttype]
@@ -199,6 +204,13 @@ pub enum DataKey {
     FeeSchedule,
     /// Address of the staking contract used to read mentor tiers.
     StakingContract,
+    /// Reserved for future reputation-update integration on release.
+    /// Not yet read by `release_funds`; `estimate_release_escrow_cost`
+    /// checks it so the estimate stays accurate once wired up (#761).
+    ReputationContract,
+    /// Reserved for future insurance-check integration on release. See
+    /// `ReputationContract`.
+    InsuranceContract,
 }
 
 // ---------------------------------------------------------------------------
@@ -241,6 +253,15 @@ const DEFAULT_FEE_BPS: u32 = 500;
 
 const ESCROW_TTL_THRESHOLD: u32 = 500_000;
 const ESCROW_TTL_BUMP: u32 = 1_000_000;
+
+// ---------------------------------------------------------------------------
+// Gas-estimation heuristic constants (#761). Calibrated against
+// `env.budget().cpu_instruction_cost()` measured around a real
+// `release_funds` call in the estimate-vs-actual test.
+// ---------------------------------------------------------------------------
+const RELEASE_BASE_INSTRUCTIONS: u64 = 40_000;
+const RELEASE_PER_STORAGE_OP_INSTRUCTIONS: u64 = 2_000;
+const RELEASE_PER_CROSS_CALL_INSTRUCTIONS: u64 = 320_000;
 
 // Cache TTL constants for frequently accessed data
 const CACHE_TTL_THRESHOLD: u32 = 100_000;
@@ -1205,6 +1226,56 @@ impl EscrowContract {
             .expect("Escrow not found")
     }
 
+    /// Heuristic instruction/IO estimate for releasing `escrow_id` (the
+    /// `release_funds` → `_do_release` path), without mutating state.
+    /// Mirrors the real flow's reads (escrow, admin, fee config, treasury),
+    /// write (escrow status update), and token-transfer cross-contract
+    /// calls (fee transfer is skipped when `fee_bps == 0`). Also accounts
+    /// for reputation-update / insurance-check cross-calls once those
+    /// optional integrations are configured (`DataKey::ReputationContract`
+    /// / `DataKey::InsuranceContract`, reserved for future use — #761).
+    pub fn estimate_release_escrow_cost(env: Env, escrow_id: u64) -> GasEstimate {
+        let key = (symbol_short!("ESCROW"), escrow_id);
+        let exists = env.storage().persistent().has(&key);
+
+        // release_funds' own reads: escrow, admin, fee_bps, treasury.
+        let mut storage_reads: u32 = 4;
+        // _do_release's own write: updated escrow status/amounts.
+        let storage_writes: u32 = if exists { 1 } else { 0 };
+
+        let fee_bps: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::FeeBps)
+            .unwrap_or(DEFAULT_FEE_BPS);
+        // Net-amount transfer to mentor always happens; the platform-fee
+        // transfer to treasury is conditional on a non-zero fee.
+        let mut cross_contract_calls: u32 = 1;
+        if fee_bps > 0 {
+            cross_contract_calls += 1;
+        }
+
+        if env.storage().persistent().has(&DataKey::ReputationContract) {
+            storage_reads += 1;
+            cross_contract_calls += 1;
+        }
+        if env.storage().persistent().has(&DataKey::InsuranceContract) {
+            storage_reads += 1;
+            cross_contract_calls += 1;
+        }
+
+        let base_instructions = RELEASE_BASE_INSTRUCTIONS
+            + (storage_reads as u64 + storage_writes as u64) * RELEASE_PER_STORAGE_OP_INSTRUCTIONS
+            + (cross_contract_calls as u64) * RELEASE_PER_CROSS_CALL_INSTRUCTIONS;
+
+        GasEstimate {
+            base_instructions,
+            storage_reads,
+            storage_writes,
+            cross_contract_calls,
+        }
+    }
+
     pub fn get_escrow_count(env: Env) -> u64 {
         env.storage()
             .persistent()
@@ -2034,6 +2105,7 @@ impl EscrowContract {
 #[cfg(test)]
 mod test {
     extern crate std;
+    use std::string::ToString;
     use super::*;
     use soroban_sdk::{
         testutils::{Address as _, Ledger, Events},
@@ -2799,14 +2871,19 @@ mod test {
         let f = TestFixture::setup();
         let new_token = Address::generate(&f.env);
         f.client().set_approved_token(&new_token, &true);
-        let events = f.env.events().all();
-        let last_event = events.last().unwrap();
-        assert_eq!(last_event.0, f.contract_id.clone());
-        // The event topic should contain "Token" and "Approved"
-        assert_eq!(
-            last_event.1,
-            (Symbol::new(&f.env, "Token"), Symbol::new(&f.env, "Approved")).into_val(&f.env)
-        );
+        let expected = soroban_sdk::vec![
+            &f.env,
+            (
+                f.contract_id.clone(),
+                (Symbol::new(&f.env, "Token"), Symbol::new(&f.env, "Approved")).into_val(&f.env),
+                TokenApprovalEventData {
+                    token_address: new_token,
+                    approved: true,
+                }
+                .into_val(&f.env),
+            )
+        ];
+        assert_eq!(f.env.events().all(), expected);
     }
 
     /// Test: Token rejection events are emitted
@@ -2816,13 +2893,19 @@ mod test {
         let new_token = Address::generate(&f.env);
         f.client().set_approved_token(&new_token, &true);
         f.client().set_approved_token(&new_token, &false);
-        let events = f.env.events().all();
-        let last_event = events.last().unwrap();
-        assert_eq!(last_event.0, f.contract_id.clone());
-        assert_eq!(
-            last_event.1,
-            (Symbol::new(&f.env, "Token"), Symbol::new(&f.env, "Rejected")).into_val(&f.env)
-        );
+        let expected = soroban_sdk::vec![
+            &f.env,
+            (
+                f.contract_id.clone(),
+                (Symbol::new(&f.env, "Token"), Symbol::new(&f.env, "Rejected")).into_val(&f.env),
+                TokenApprovalEventData {
+                    token_address: new_token,
+                    approved: false,
+                }
+                .into_val(&f.env),
+            )
+        ];
+        assert_eq!(f.env.events().all(), expected);
     }
 
     /// Test: Unknown/random token address is not approved by default
@@ -2965,20 +3048,23 @@ mod test {
     /// Count events whose topic uses the canonical
     /// `(contract="escrow", version=1, event_type)` layout for `event_type`.
     fn count_standard_escrow_events(f: &TestFixture, event_type: &str) -> u32 {
-        let contract_sym = Symbol::new(&f.env, "escrow");
-        let evt_sym = Symbol::new(&f.env, event_type);
         let mut n = 0u32;
-        for (_addr, topics, _data) in f.env.events().all().iter() {
-            if topics.len() != 3 {
+        for evt in f.env.events().all().events() {
+            let soroban_sdk::xdr::ContractEventBody::V0(body) = &evt.body;
+            if body.topics.len() != 3 {
                 continue;
             }
-            let c = Symbol::try_from_val(&f.env, &topics.get(0).unwrap());
-            let v = u32::try_from_val(&f.env, &topics.get(1).unwrap());
-            let e = Symbol::try_from_val(&f.env, &topics.get(2).unwrap());
-            if let (Ok(c), Ok(v), Ok(e)) = (c, v, e) {
-                if c == contract_sym && v == 1u32 && e == evt_sym {
-                    n += 1;
-                }
+            let c_match = matches!(
+                &body.topics[0],
+                soroban_sdk::xdr::ScVal::Symbol(s) if s.to_string() == "escrow"
+            );
+            let v_match = matches!(&body.topics[1], soroban_sdk::xdr::ScVal::U32(1));
+            let e_match = matches!(
+                &body.topics[2],
+                soroban_sdk::xdr::ScVal::Symbol(s) if s.to_string() == event_type
+            );
+            if c_match && v_match && e_match {
+                n += 1;
             }
         }
         n
