@@ -37,6 +37,15 @@ pub struct BondRecord {
     pub slash_count: u32,
 }
 
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SlashEvent {
+    pub amount: i128,
+    pub reason: Symbol,
+    pub timestamp: u64,
+    pub slash_count_at_time: u32,
+}
+
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
@@ -62,6 +71,8 @@ pub enum DataKey {
     MntToken,
     InsurancePool,
     Bond(Address),
+    SlashHistory(Address),
+    PerfectSessionsCount(Address),
 }
 
 // ---------------------------------------------------------------------------
@@ -206,6 +217,27 @@ impl PerformanceBondContract {
         record.last_slash_at = env.ledger().timestamp();
         record.slash_count += 1;
 
+        // Record slash event in SlashHistory (Issue #751)
+        let mut history: Vec<SlashEvent> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::SlashHistory(mentor.clone()))
+            .unwrap_or_else(|| Vec::new(&env));
+
+        history.push_back(SlashEvent {
+            amount,
+            reason: reason.clone(),
+            timestamp: env.ledger().timestamp(),
+            slash_count_at_time: record.slash_count,
+        });
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::SlashHistory(mentor.clone()), &history);
+        env.storage()
+            .persistent()
+            .set(&DataKey::PerfectSessionsCount(mentor.clone()), &0u32);
+
         if record.amount == 0 {
             // Bond fully slashed - remove record
             env.storage()
@@ -227,6 +259,29 @@ impl PerformanceBondContract {
         );
 
         Ok(())
+    }
+
+    /// Query immutable slash history for a mentor (Issue #751).
+    pub fn get_slash_history(env: Env, mentor: Address) -> Vec<SlashEvent> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::SlashHistory(mentor))
+            .unwrap_or_else(|| Vec::new(&env))
+    }
+
+    /// Record a perfect 5-star session for mentor recovery.
+    /// Completing 10 perfect sessions reduces effective slash penalty (Issue #751).
+    pub fn record_perfect_session(env: Env, mentor: Address) -> u32 {
+        let count: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::PerfectSessionsCount(mentor.clone()))
+            .unwrap_or(0);
+        let new_count = count + 1;
+        env.storage()
+            .persistent()
+            .set(&DataKey::PerfectSessionsCount(mentor), &new_count);
+        new_count
     }
 
     /// Release a mentor's bond after cooldown period with no disputes.

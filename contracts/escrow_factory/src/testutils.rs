@@ -2,6 +2,7 @@
 
 use crate::{EscrowFactory, EscrowInfo};
 use soroban_sdk::{symbol_short, Address, Env, Symbol};
+use shared::sig_validation::MetaTxPayload;
 
 use soroban_sdk::contractclient;
 
@@ -22,6 +23,19 @@ pub trait EscrowFactoryInterface {
     fn get_implementation(env: Env) -> Address;
     fn get_admin(env: Env) -> Address;
     fn get_escrow_count(env: Env) -> u64;
+    fn set_interface_registry(env: Env, registry: Address);
+    fn set_pause_guardian(env: Env, guardian: Address);
+    fn get_nonce(env: Env, signer: Address) -> u64;
+    fn execute_meta_tx(
+        env: Env,
+        signer: Address,
+        payload: MetaTxPayload,
+        mentor: Address,
+        learner: Address,
+        amount: i128,
+        token: Address,
+        session_id: Symbol,
+    ) -> Address;
 }
 
 pub struct EscrowFactoryTest {
