@@ -17,6 +17,12 @@ pub trait CreditScoreContractTrait {
     fn get_score(env: Env, address: Address) -> u32;
 }
 
+use shared::{
+    get_all_params, get_param, init_protocol_params, set_param,
+    key_interest_rate_bps, key_min_credit_score,
+    DEFAULT_INTEREST_RATE_BPS, DEFAULT_MIN_CREDIT_SCORE,
+};
+
 // ---------------------------------------------------------------------------
 // Storage Keys
 // ---------------------------------------------------------------------------
@@ -147,6 +153,7 @@ impl LendingPool {
         admin: Address,
         usdc_token: Address,
         credit_score_contract: Address,
+        rbac_contract: Address,
     ) -> Result<(), Error> {
         if env.storage().instance().has(&DataKey::Admin) {
             return Err(Error::AlreadyInitialized);
@@ -175,6 +182,7 @@ impl LendingPool {
         // Initialize regulatory reporting with placeholder
         env.storage().instance().set(&DataKey::RegulatoryReporting, &Address::generate(&env));
 
+        init_protocol_params(&env, &rbac_contract);
         Ok(())
     }
 
@@ -224,6 +232,25 @@ impl LendingPool {
                     .into_val(env),
             );
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Protocol parameter registry
+    // -----------------------------------------------------------------------
+
+    /// Read a protocol parameter by key, with compile-time default fallback.
+    pub fn get_param(env: Env, key: Symbol, default: i128) -> i128 {
+        get_param(&env, &key, default)
+    }
+
+    /// Update a protocol parameter. Caller must hold `GOVERNANCE_ADMIN`.
+    pub fn set_param(env: Env, caller: Address, key: Symbol, value: i128) {
+        set_param(&env, &caller, &key, value);
+    }
+
+    /// Return all current `(Symbol, i128)` parameter pairs for monitoring.
+    pub fn get_all_params(env: Env) -> Vec<(Symbol, i128)> {
+        get_all_params(&env)
     }
 
     // -----------------------------------------------------------------------
@@ -380,13 +407,31 @@ impl LendingPool {
 
     /// Pure fee computation (replaces cached version)
     /// fee = amount * current_rate / 10_000
+    ///
+    /// The interest rate is read from the protocol parameter registry first,
+    /// falling back to `DEFAULT_INTEREST_RATE_BPS` if governance hasn't acted.
     fn compute_fee(env: &Env, amount: i128) -> i128 {
-        let rate = Self::get_current_rate(env.clone());
+        // Use the governance-controlled interest rate if set, else the two-slope
+        // dynamic model rate.  Governance sets a flat override via INT_RATE;
+        // when that key is unset (== DEFAULT_INTEREST_RATE_BPS still at default),
+        // we fall through to the full model.
+        let gov_rate = env
+            .storage()
+            .persistent()
+            .get::<_, i128>(&shared::params::ParamKey::Param(key_interest_rate_bps()))
+            .unwrap_or(0);
+        let rate = if gov_rate > 0 { gov_rate } else { Self::get_current_rate(env.clone()) };
         amount
             .checked_mul(rate)
             .expect("Overflow")
             .checked_div(10_000)
             .expect("Division error")
+    }
+
+    /// Returns the minimum credit score required to borrow, sourced from
+    /// the protocol parameter registry with compile-time fallback.
+    pub fn min_credit_score(env: Env) -> i128 {
+        get_param(&env, &key_min_credit_score(), DEFAULT_MIN_CREDIT_SCORE)
     }
 
     // -----------------------------------------------------------------------
