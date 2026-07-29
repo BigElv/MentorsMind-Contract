@@ -9,6 +9,7 @@ use soroban_sdk::{
 pub enum DataKey {
     Admin,
     MNTToken,
+    SnapshotContract,
     Delegate(Address),            // mapping: delegator -> delegate
     Delegators,                   // Vec<Address>
     MaxDelegationDepth,           // u32: configurable max depth for cycle detection
@@ -21,6 +22,8 @@ pub enum DataKey {
     SubtreeWeight(Address),
     /// Historical delegation snapshot: (snapshot_id, delegator) -> delegate address at that snapshot
     DelegationAtSnapshot(u32, Address),
+    /// Snapshot-time delegated power cache: (snapshot_id, delegate) -> total delegated power
+    DelegationSnapshot(u32, Address),
 }
 
 #[contracterror]
@@ -319,12 +322,33 @@ impl DelegationContract {
     /// Stores (snapshot_id, delegator) -> delegate for all current delegations.
     /// Called by snapshot contract at proposal creation time.
     /// TTL: delegation snapshot entries expire after 90 days.
+    pub fn set_snapshot_contract(env: Env, admin: Address, snapshot_contract: Address) {
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .expect("not initialized");
+        admin.require_auth();
+        if admin != stored_admin {
+            panic!("unauthorized");
+        }
+        env.storage()
+            .instance()
+            .set(&DataKey::SnapshotContract, &snapshot_contract);
+    }
+
     pub fn snapshot_delegations(env: Env, snapshot_id: u32) {
         let delegators: soroban_sdk::Vec<Address> = env
             .storage()
             .persistent()
             .get(&DataKey::Delegators)
             .unwrap_or_else(|| soroban_sdk::Vec::new(&env));
+
+        let snapshot_contract: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::SnapshotContract)
+            .expect("snapshot contract not set");
 
         let ninety_days_ledgers = 90 * 24 * 60 * 60 / 5; // ~5s per ledger
 
@@ -342,6 +366,33 @@ impl DelegationContract {
                     ninety_days_ledgers,
                     ninety_days_ledgers,
                 );
+
+                // Get delegator's staked balance at snapshot from snapshot contract
+                let balance: i128 = env.invoke_contract(
+                    &snapshot_contract,
+                    &Symbol::new(&env, "get_snapshot_balance"),
+                    (snapshot_id, delegator.clone()).into_val(&env),
+                );
+
+                // Accumulate delegated power for the delegate at this snapshot
+                if balance > 0 {
+                    let power_key =
+                        DataKey::DelegationSnapshot(snapshot_id, delegate.clone());
+                    let current: i128 = env
+                        .storage()
+                        .persistent()
+                        .get(&power_key)
+                        .unwrap_or(0);
+                    env.storage().persistent().set(
+                        &power_key,
+                        &current.checked_add(balance).expect("overflow"),
+                    );
+                    env.storage().persistent().extend_ttl(
+                        &power_key,
+                        ninety_days_ledgers,
+                        ninety_days_ledgers,
+                    );
+                }
             }
         }
     }
@@ -356,6 +407,20 @@ impl DelegationContract {
         env.storage()
             .persistent()
             .get(&DataKey::DelegationAtSnapshot(snapshot_id, delegator))
+    }
+
+    /// Get the total delegated power received by `delegate` at a specific snapshot.
+    /// Returns the sum of staked balances (at snapshot time) of all delegators
+    /// whose delegate (at snapshot time) is the given address.
+    pub fn get_delegated_power_at_snapshot(
+        env: Env,
+        delegate: Address,
+        snapshot_id: u32,
+    ) -> i128 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::DelegationSnapshot(snapshot_id, delegate))
+            .unwrap_or(0)
     }
 
     /// Subtree weight of `addr`: its own token balance plus the subtree

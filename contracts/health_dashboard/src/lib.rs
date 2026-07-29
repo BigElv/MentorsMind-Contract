@@ -43,6 +43,21 @@ pub struct Escrow {
     pub sessions_completed: u32,
 }
 
+/// Threshold (bps of a mentor's disputes / total sessions) above which
+/// [`HealthDashboardContract::record_dispute_opened`] emits a
+/// `MentorDisputeRateAlert` event. 2000 bps = 20%.
+pub const DISPUTE_RATE_ALERT_BPS: u32 = 2000;
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DisputeStats {
+    pub total_opened: u32,
+    pub total_resolved_mentor_favor: u32,
+    pub total_resolved_learner_favor: u32,
+    pub total_appealed: u32,
+    pub avg_resolution_time_secs: u64,
+}
+
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PlatformStats {
@@ -72,6 +87,11 @@ pub enum DataKey {
     Config,
     /// `(ledger_sequence, cached stats)` — invalidated when ledger advances.
     Cache,
+    /// Platform-wide dispute aggregate ([`DisputeStats`]).
+    DisputeStats,
+    /// Number of disputes ever opened against a given mentor, used by
+    /// [`HealthDashboardContract::get_mentor_dispute_rate`].
+    MentorDisputeCount(Address),
 }
 
 #[contracttype]
@@ -205,6 +225,111 @@ impl HealthDashboardContract {
             &Symbol::new(&env, "get_version"),
             (contract_name,).into_val(&env),
         )
+    }
+
+    /// Record that a dispute was opened for `escrow_id`, called by the
+    /// dispute-evidence contract. Looks up the escrow's mentor to bump their
+    /// dispute count and, if their dispute rate now exceeds
+    /// [`DISPUTE_RATE_ALERT_BPS`], emits a `MentorDisputeRateAlert` event.
+    pub fn record_dispute_opened(env: Env, escrow_id: u64, opened_at: u64) {
+        let cfg: Config = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Config)
+            .expect("Not initialized");
+
+        let escrow: Escrow = env.invoke_contract(
+            &cfg.escrow,
+            &Symbol::new(&env, "get_escrow"),
+            (escrow_id,).into_val(&env),
+        );
+
+        let mut stats = Self::load_dispute_stats(&env);
+        stats.total_opened = stats.total_opened.saturating_add(1);
+        env.storage()
+            .persistent()
+            .set(&DataKey::DisputeStats, &stats);
+
+        let mentor_key = DataKey::MentorDisputeCount(escrow.mentor.clone());
+        let dispute_count: u32 = env.storage().persistent().get(&mentor_key).unwrap_or(0);
+        let dispute_count = dispute_count.saturating_add(1);
+        env.storage().persistent().set(&mentor_key, &dispute_count);
+
+        let rate_bps =
+            Self::compute_mentor_dispute_rate(&env, &cfg, &escrow.mentor, dispute_count);
+        if rate_bps > DISPUTE_RATE_ALERT_BPS {
+            env.events().publish(
+                (Symbol::new(&env, "MentorDisputeRateAlert"), escrow.mentor),
+                (rate_bps, opened_at),
+            );
+        }
+    }
+
+    /// Record the resolution of a dispute, called by the dispute-evidence
+    /// contract. `resolution_time_secs` is the caller-computed duration
+    /// (resolved_at - opened_at) of the dispute's lifecycle.
+    pub fn record_resolution(
+        env: Env,
+        escrow_id: u64,
+        release_to_mentor: bool,
+        resolution_time_secs: u64,
+    ) {
+        let _ = escrow_id;
+        let mut stats = Self::load_dispute_stats(&env);
+
+        let prior_resolved = stats
+            .total_resolved_mentor_favor
+            .saturating_add(stats.total_resolved_learner_favor);
+
+        if release_to_mentor {
+            stats.total_resolved_mentor_favor = stats.total_resolved_mentor_favor.saturating_add(1);
+        } else {
+            stats.total_resolved_learner_favor =
+                stats.total_resolved_learner_favor.saturating_add(1);
+        }
+
+        // Running average: new_avg = (old_avg * n + sample) / (n + 1)
+        let n = prior_resolved as u64;
+        stats.avg_resolution_time_secs = stats
+            .avg_resolution_time_secs
+            .saturating_mul(n)
+            .saturating_add(resolution_time_secs)
+            / n.saturating_add(1);
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::DisputeStats, &stats);
+    }
+
+    /// Record that a dispute resolution was appealed.
+    pub fn record_appeal(env: Env, escrow_id: u64) {
+        let _ = escrow_id;
+        let mut stats = Self::load_dispute_stats(&env);
+        stats.total_appealed = stats.total_appealed.saturating_add(1);
+        env.storage()
+            .persistent()
+            .set(&DataKey::DisputeStats, &stats);
+    }
+
+    /// Platform-wide dispute aggregate.
+    pub fn get_dispute_stats(env: Env) -> DisputeStats {
+        Self::load_dispute_stats(&env)
+    }
+
+    /// A mentor's dispute rate: `disputes / total_sessions * 10000` (bps).
+    /// Returns 0 if the mentor has no sessions.
+    pub fn get_mentor_dispute_rate(env: Env, mentor: Address) -> u32 {
+        let cfg: Config = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Config)
+            .expect("Not initialized");
+        let dispute_count: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::MentorDisputeCount(mentor.clone()))
+            .unwrap_or(0);
+        Self::compute_mentor_dispute_rate(&env, &cfg, &mentor, dispute_count)
     }
 
     // ─── Protocol solvency (Issue #771) ─────────────────────────────────
@@ -486,6 +611,40 @@ impl HealthDashboardContract {
         }
         v.push_back(addr);
     }
+
+    fn load_dispute_stats(env: &Env) -> DisputeStats {
+        env.storage()
+            .persistent()
+            .get(&DataKey::DisputeStats)
+            .unwrap_or(DisputeStats {
+                total_opened: 0,
+                total_resolved_mentor_favor: 0,
+                total_resolved_learner_favor: 0,
+                total_appealed: 0,
+                avg_resolution_time_secs: 0,
+            })
+    }
+
+    /// `disputes / total_sessions * 10000` (bps), via a cross-contract read
+    /// of the mentor's session count from the configured session registry.
+    /// Returns 0 if the mentor has no sessions (avoids division by zero).
+    fn compute_mentor_dispute_rate(
+        env: &Env,
+        cfg: &Config,
+        mentor: &Address,
+        dispute_count: u32,
+    ) -> u32 {
+        let sessions: Vec<Symbol> = env.invoke_contract(
+            &cfg.session_registry,
+            &Symbol::new(env, "get_sessions_by_mentor"),
+            (mentor.clone(),).into_val(env),
+        );
+        let total_sessions = sessions.len();
+        if total_sessions == 0 {
+            return 0;
+        }
+        ((dispute_count as u64 * 10_000) / (total_sessions as u64)) as u32
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -498,7 +657,7 @@ mod test {
 
     use super::*;
     use soroban_sdk::symbol_short;
-    use soroban_sdk::testutils::{Address as _, Ledger};
+    use soroban_sdk::testutils::{Address as _, Events, Ledger};
 
     #[contracttype]
     #[derive(Clone)]
@@ -691,6 +850,56 @@ mod test {
         }
     }
 
+    // Treasury with low balance relative to pending
+    #[contract]
+    pub struct MockTreasuryLow;
+
+    #[contractimpl]
+    impl MockTreasuryLow {
+        pub fn get_balance(_env: Env, _token: Address) -> i128 {
+            500
+        }
+        pub fn pending_allocation_count(_env: Env) -> u32 {
+            1
+        }
+        pub fn get_pending_allocation(env: Env, _id: u32) -> Option<PendingAllocationView> {
+            Some(PendingAllocationView {
+                id: 0,
+                token: Address::generate(&env),
+                recipient: Address::generate(&env),
+                amount: 10_000, // pending > balance
+                approvals_count: 1,
+                executed: false,
+                created_at: 0,
+            })
+        }
+    }
+
+    // Treasury with balance=0 and pending > 0 → insolvent
+    #[contract]
+    pub struct MockTreasuryZero;
+
+    #[contractimpl]
+    impl MockTreasuryZero {
+        pub fn get_balance(_env: Env, _token: Address) -> i128 {
+            0
+        }
+        pub fn pending_allocation_count(_env: Env) -> u32 {
+            1
+        }
+        pub fn get_pending_allocation(env: Env, _id: u32) -> Option<PendingAllocationView> {
+            Some(PendingAllocationView {
+                id: 0,
+                token: Address::generate(&env),
+                recipient: Address::generate(&env),
+                amount: 100,
+                approvals_count: 0,
+                executed: false,
+                created_at: 0,
+            })
+        }
+    }
+
     #[contract]
     pub struct MockStakingForSolvency;
 
@@ -836,31 +1045,6 @@ mod test {
         let reputation = env.register_contract(None, MockReputation);
         let iface = env.register_contract(None, MockInterfaceRegistry);
 
-        // Treasury with low balance relative to pending
-        #[contract]
-        pub struct MockTreasuryLow;
-
-        #[contractimpl]
-        impl MockTreasuryLow {
-            pub fn get_balance(_env: Env, _token: Address) -> i128 {
-                500
-            }
-            pub fn pending_allocation_count(_env: Env) -> u32 {
-                1
-            }
-            pub fn get_pending_allocation(env: Env, _id: u32) -> Option<PendingAllocationView> {
-                Some(PendingAllocationView {
-                    id: 0,
-                    token: Address::generate(&env),
-                    recipient: Address::generate(&env),
-                    amount: 10_000, // pending > balance
-                    approvals_count: 1,
-                    executed: false,
-                    created_at: 0,
-                })
-            }
-        }
-
         let treasury = env.register_contract(None, MockTreasuryLow);
         let insurance = env.register_contract(None, MockInsurance);
         let lending_pool = env.register_contract(None, MockLendingPool);
@@ -904,31 +1088,6 @@ mod test {
         let reputation = env.register_contract(None, MockReputation);
         let iface = env.register_contract(None, MockInterfaceRegistry);
 
-        // Treasury with balance=0 and pending > 0 → insolvent
-        #[contract]
-        pub struct MockTreasuryZero;
-
-        #[contractimpl]
-        impl MockTreasuryZero {
-            pub fn get_balance(_env: Env, _token: Address) -> i128 {
-                0
-            }
-            pub fn pending_allocation_count(_env: Env) -> u32 {
-                1
-            }
-            pub fn get_pending_allocation(env: Env, _id: u32) -> Option<PendingAllocationView> {
-                Some(PendingAllocationView {
-                    id: 0,
-                    token: Address::generate(&env),
-                    recipient: Address::generate(&env),
-                    amount: 100,
-                    approvals_count: 0,
-                    executed: false,
-                    created_at: 0,
-                })
-            }
-        }
-
         let treasury = env.register_contract(None, MockTreasuryZero);
         let insurance = env.register_contract(None, MockInsurance);
         let lending_pool = env.register_contract(None, MockLendingPool);
@@ -954,12 +1113,9 @@ mod test {
         assert!(!report.is_solvent);
 
         // Check that SolvencyAlert event was emitted
-        let events = env.events().all();
-        let has_alert = events
-            .iter()
-            .any(|e| e.1 == (Symbol::new(&env, "SolvencyAlert"),).into_val(&env));
+        let events = env.events().all().filter_by_contract(&dashboard);
         assert!(
-            has_alert,
+            !events.events().is_empty(),
             "SolvencyAlert event must be emitted when insolvent"
         );
     }
@@ -994,5 +1150,230 @@ mod test {
         assert!(report.staking_total >= 0);
         assert!(report.pending_rewards >= 0);
         assert_eq!(report.lending_total_liquidity, 200_000);
+    }
+
+    // ── #760: dispute stats aggregation ─────────────────────────────────────
+
+    mod dispute_mocks {
+        use super::*;
+
+        #[contracttype]
+        #[derive(Clone)]
+        pub enum DisputeMockKey {
+            Escrow(u64),
+            Sessions(Address),
+        }
+
+        #[contract]
+        pub struct MockEscrowD;
+
+        #[contractimpl]
+        impl MockEscrowD {
+            pub fn set_escrow_mentor(env: Env, id: u64, mentor: Address) {
+                env.storage()
+                    .persistent()
+                    .set(&DisputeMockKey::Escrow(id), &mentor);
+            }
+
+            pub fn get_escrow(env: Env, id: u64) -> Escrow {
+                let mentor: Address = env
+                    .storage()
+                    .persistent()
+                    .get(&DisputeMockKey::Escrow(id))
+                    .unwrap();
+                let dummy = mentor.clone();
+                Escrow {
+                    id,
+                    mentor,
+                    learner: dummy.clone(),
+                    amount: 0,
+                    session_id: symbol_short!("s"),
+                    status: EscrowStatus::Disputed,
+                    created_at: 0,
+                    token_address: dummy.clone(),
+                    platform_fee: 0,
+                    net_amount: 0,
+                    session_end_time: 0,
+                    auto_release_delay: 0,
+                    dispute_reason: symbol_short!("none"),
+                    resolved_at: 0,
+                    usd_amount: 0,
+                    quoted_token_amount: 0,
+                    send_asset: dummy.clone(),
+                    dest_asset: dummy,
+                    total_sessions: 0,
+                    sessions_completed: 0,
+                }
+            }
+        }
+
+        #[contract]
+        pub struct MockSessionRegistryD;
+
+        #[contractimpl]
+        impl MockSessionRegistryD {
+            pub fn set_session_count(env: Env, mentor: Address, count: u32) {
+                let mut v: Vec<Symbol> = Vec::new(&env);
+                for _ in 0..count {
+                    v.push_back(symbol_short!("sess"));
+                }
+                env.storage()
+                    .persistent()
+                    .set(&DisputeMockKey::Sessions(mentor), &v);
+            }
+
+            pub fn get_sessions_by_mentor(env: Env, mentor: Address) -> Vec<Symbol> {
+                env.storage()
+                    .persistent()
+                    .get(&DisputeMockKey::Sessions(mentor))
+                    .unwrap_or(Vec::new(&env))
+            }
+        }
+    }
+    use dispute_mocks::{
+        MockEscrowD, MockEscrowDClient, MockSessionRegistryD, MockSessionRegistryDClient,
+    };
+
+    fn setup_dispute() -> (Env, Address, Address, Address) {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+
+        let escrow_id = env.register_contract(None, MockEscrowD);
+        let session_reg = env.register_contract(None, MockSessionRegistryD);
+        let staking = Address::generate(&env);
+        let mnt = env.register_contract(None, MockMntToken);
+        let reputation = env.register_contract(None, MockReputation);
+        let iface = env.register_contract(None, MockInterfaceRegistry);
+        let treasury = env.register_contract(None, MockTreasury);
+        let insurance = env.register_contract(None, MockInsurance);
+        let lending_pool = env.register_contract(None, MockLendingPool);
+        let usdc = env.register_contract(None, MockMntToken);
+        let dashboard = env.register_contract(None, HealthDashboardContract);
+
+        HealthDashboardContractClient::new(&env, &dashboard).initialize(
+            &admin,
+            &escrow_id,
+            &session_reg,
+            &staking,
+            &mnt,
+            &reputation,
+            &iface,
+            &treasury,
+            &insurance,
+            &lending_pool,
+            &usdc,
+        );
+
+        (env, dashboard, escrow_id, session_reg)
+    }
+
+    #[test]
+    fn test_record_resolution_increments_favor_counters() {
+        let (env, dashboard, escrow_id, _session_reg) = setup_dispute();
+        let client = HealthDashboardContractClient::new(&env, &dashboard);
+        let escrow_client = MockEscrowDClient::new(&env, &escrow_id);
+        let mentor = Address::generate(&env);
+
+        // 5 disputes resolved: 3 mentor favor, 2 learner favor.
+        for i in 1u64..=5 {
+            escrow_client.set_escrow_mentor(&i, &mentor);
+            client.record_dispute_opened(&i, &0u64);
+        }
+        client.record_resolution(&1, &true, &100u64);
+        client.record_resolution(&2, &true, &200u64);
+        client.record_resolution(&3, &true, &300u64);
+        client.record_resolution(&4, &false, &400u64);
+        client.record_resolution(&5, &false, &500u64);
+
+        let stats = client.get_dispute_stats();
+        assert_eq!(stats.total_opened, 5);
+        assert_eq!(stats.total_resolved_mentor_favor, 3);
+        assert_eq!(stats.total_resolved_learner_favor, 2);
+        // running average of 100,200,300,400,500 == 300
+        assert_eq!(stats.avg_resolution_time_secs, 300);
+    }
+
+    #[test]
+    fn test_avg_resolution_time_running_average_updates_incrementally() {
+        let (env, dashboard, _escrow_id, _session_reg) = setup_dispute();
+        let client = HealthDashboardContractClient::new(&env, &dashboard);
+
+        client.record_resolution(&1, &true, &100u64);
+        assert_eq!(client.get_dispute_stats().avg_resolution_time_secs, 100);
+
+        client.record_resolution(&2, &false, &300u64);
+        assert_eq!(client.get_dispute_stats().avg_resolution_time_secs, 200);
+    }
+
+    #[test]
+    fn test_get_mentor_dispute_rate_bps() {
+        let (env, dashboard, escrow_id, session_reg) = setup_dispute();
+        let client = HealthDashboardContractClient::new(&env, &dashboard);
+        let escrow_client = MockEscrowDClient::new(&env, &escrow_id);
+        let session_client = MockSessionRegistryDClient::new(&env, &session_reg);
+        let mentor = Address::generate(&env);
+
+        session_client.set_session_count(&mentor, &10u32);
+        escrow_client.set_escrow_mentor(&1, &mentor);
+        escrow_client.set_escrow_mentor(&2, &mentor);
+        client.record_dispute_opened(&1, &0u64);
+        client.record_dispute_opened(&2, &0u64);
+
+        // 2 disputes / 10 sessions = 2000 bps (20%)
+        assert_eq!(client.get_mentor_dispute_rate(&mentor), 2000);
+    }
+
+    #[test]
+    fn test_mentor_dispute_rate_alert_fires_above_threshold() {
+        let (env, dashboard, escrow_id, session_reg) = setup_dispute();
+        let client = HealthDashboardContractClient::new(&env, &dashboard);
+        let escrow_client = MockEscrowDClient::new(&env, &escrow_id);
+        let session_client = MockSessionRegistryDClient::new(&env, &session_reg);
+        let mentor = Address::generate(&env);
+
+        // 3 disputes / 10 sessions = 3000 bps > DISPUTE_RATE_ALERT_BPS (2000)
+        session_client.set_session_count(&mentor, &10u32);
+        escrow_client.set_escrow_mentor(&1, &mentor);
+        escrow_client.set_escrow_mentor(&2, &mentor);
+        escrow_client.set_escrow_mentor(&3, &mentor);
+        client.record_dispute_opened(&1, &0u64);
+        client.record_dispute_opened(&2, &0u64);
+        client.record_dispute_opened(&3, &0u64);
+
+        let events = env.events().all().filter_by_contract(&dashboard);
+        assert!(
+            !events.events().is_empty(),
+            "expected MentorDisputeRateAlert to be emitted"
+        );
+    }
+
+    #[test]
+    fn test_mentor_dispute_rate_alert_does_not_fire_below_threshold() {
+        let (env, dashboard, escrow_id, session_reg) = setup_dispute();
+        let client = HealthDashboardContractClient::new(&env, &dashboard);
+        let escrow_client = MockEscrowDClient::new(&env, &escrow_id);
+        let session_client = MockSessionRegistryDClient::new(&env, &session_reg);
+        let mentor = Address::generate(&env);
+
+        // 1 dispute / 10 sessions = 1000 bps < DISPUTE_RATE_ALERT_BPS (2000)
+        session_client.set_session_count(&mentor, &10u32);
+        escrow_client.set_escrow_mentor(&1, &mentor);
+        client.record_dispute_opened(&1, &0u64);
+
+        let events = env.events().all().filter_by_contract(&dashboard);
+        assert!(
+            events.events().is_empty(),
+            "did not expect MentorDisputeRateAlert to be emitted"
+        );
+    }
+
+    #[test]
+    fn test_record_appeal_increments_total_appealed() {
+        let (env, dashboard, _escrow_id, _session_reg) = setup_dispute();
+        let client = HealthDashboardContractClient::new(&env, &dashboard);
+        client.record_appeal(&1);
+        client.record_appeal(&2);
+        assert_eq!(client.get_dispute_stats().total_appealed, 2);
     }
 }

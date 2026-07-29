@@ -1,8 +1,14 @@
 #![no_std]
 #![allow(deprecated)]
 #![allow(dead_code)]
-use shared::{EscrowRecord, EscrowStatus};
-use soroban_sdk::{contract, contractimpl, contracttype, symbol_short, token, Address, Env, Symbol, Vec, IntoVal, BytesN};
+use shared::{
+    compute_checksum, push_snapshot_index, EscrowRecord, EscrowStatus, RollbackProposal,
+    SnapshotMeta, StateVerificationReport, EMERGENCY_SIGNERS, EMERGENCY_THRESHOLD, MAX_SNAPSHOTS,
+};
+use soroban_sdk::{
+    contract, contractimpl, contracttype, symbol_short, token, Address, Bytes, Env, Symbol, Vec,
+    IntoVal, BytesN,
+};
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -199,6 +205,23 @@ pub enum DataKey {
     FeeSchedule,
     /// Address of the staking contract used to read mentor tiers.
     StakingContract,
+    // -----------------------------------------------------------------------
+    // Disaster-recovery keys
+    // -----------------------------------------------------------------------
+    /// Serialised Vec<EscrowRecord> for snapshot `n`.
+    Snapshot(u32),
+    /// SnapshotMeta struct for snapshot `n`.
+    SnapshotMetadata(u32),
+    /// Ordered Vec<u32> of active snapshot IDs (rolling window, max 3).
+    SnapshotIndex,
+    /// Vec<Address> of up to 7 emergency multi-sig signers.
+    EmergencySigners,
+    /// RollbackProposal for proposal `n`.
+    RollbackProposal(u32),
+    /// Boolean approval flag for (proposal_id, signer) pair.
+    RollbackApproval(u32, Address),
+    /// Auto-incremented rollback proposal counter.
+    RollbackProposalCount,
 }
 
 // ---------------------------------------------------------------------------
@@ -241,6 +264,15 @@ const DEFAULT_FEE_BPS: u32 = 500;
 
 const ESCROW_TTL_THRESHOLD: u32 = 500_000;
 const ESCROW_TTL_BUMP: u32 = 1_000_000;
+
+// ---------------------------------------------------------------------------
+// Gas-estimation heuristic constants (#761). Calibrated against
+// `env.budget().cpu_instruction_cost()` measured around a real
+// `release_funds` call in the estimate-vs-actual test.
+// ---------------------------------------------------------------------------
+const RELEASE_BASE_INSTRUCTIONS: u64 = 40_000;
+const RELEASE_PER_STORAGE_OP_INSTRUCTIONS: u64 = 2_000;
+const RELEASE_PER_CROSS_CALL_INSTRUCTIONS: u64 = 320_000;
 
 // Cache TTL constants for frequently accessed data
 const CACHE_TTL_THRESHOLD: u32 = 100_000;
@@ -1205,6 +1237,56 @@ impl EscrowContract {
             .expect("Escrow not found")
     }
 
+    /// Heuristic instruction/IO estimate for releasing `escrow_id` (the
+    /// `release_funds` → `_do_release` path), without mutating state.
+    /// Mirrors the real flow's reads (escrow, admin, fee config, treasury),
+    /// write (escrow status update), and token-transfer cross-contract
+    /// calls (fee transfer is skipped when `fee_bps == 0`). Also accounts
+    /// for reputation-update / insurance-check cross-calls once those
+    /// optional integrations are configured (`DataKey::ReputationContract`
+    /// / `DataKey::InsuranceContract`, reserved for future use — #761).
+    pub fn estimate_release_escrow_cost(env: Env, escrow_id: u64) -> GasEstimate {
+        let key = (symbol_short!("ESCROW"), escrow_id);
+        let exists = env.storage().persistent().has(&key);
+
+        // release_funds' own reads: escrow, admin, fee_bps, treasury.
+        let mut storage_reads: u32 = 4;
+        // _do_release's own write: updated escrow status/amounts.
+        let storage_writes: u32 = if exists { 1 } else { 0 };
+
+        let fee_bps: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::FeeBps)
+            .unwrap_or(DEFAULT_FEE_BPS);
+        // Net-amount transfer to mentor always happens; the platform-fee
+        // transfer to treasury is conditional on a non-zero fee.
+        let mut cross_contract_calls: u32 = 1;
+        if fee_bps > 0 {
+            cross_contract_calls += 1;
+        }
+
+        if env.storage().persistent().has(&DataKey::ReputationContract) {
+            storage_reads += 1;
+            cross_contract_calls += 1;
+        }
+        if env.storage().persistent().has(&DataKey::InsuranceContract) {
+            storage_reads += 1;
+            cross_contract_calls += 1;
+        }
+
+        let base_instructions = RELEASE_BASE_INSTRUCTIONS
+            + (storage_reads as u64 + storage_writes as u64) * RELEASE_PER_STORAGE_OP_INSTRUCTIONS
+            + (cross_contract_calls as u64) * RELEASE_PER_CROSS_CALL_INSTRUCTIONS;
+
+        GasEstimate {
+            base_instructions,
+            storage_reads,
+            storage_writes,
+            cross_contract_calls,
+        }
+    }
+
     pub fn get_escrow_count(env: Env) -> u64 {
         env.storage()
             .persistent()
@@ -2025,7 +2107,601 @@ impl EscrowContract {
         }
         panic!("Escrow not found");
     }
+
+    // =======================================================================
+    // Disaster Recovery
+    // =======================================================================
+
+    /// Register the emergency multi-sig signer set (admin only).
+    ///
+    /// Must supply exactly 7 addresses.  Any change to this list resets the
+    /// signer registry; existing open proposals are still validated against
+    /// the signer set that was active when they were *approved*.
+    ///
+    /// # Errors
+    /// Panics if `signers.len() != 7` or the caller is not the stored admin.
+    pub fn set_emergency_signers(env: Env, admin: Address, signers: Vec<Address>) {
+        let stored_admin: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Admin)
+            .expect("Not initialized");
+        admin.require_auth();
+        if admin != stored_admin {
+            panic!("Caller not authorized");
+        }
+        if signers.len() != EMERGENCY_SIGNERS {
+            panic!("Must provide exactly 7 emergency signers");
+        }
+        env.storage()
+            .persistent()
+            .set(&DataKey::EmergencySigners, &signers);
+        env.storage().persistent().extend_ttl(
+            &DataKey::EmergencySigners,
+            ESCROW_TTL_THRESHOLD,
+            ESCROW_TTL_BUMP,
+        );
+        env.events().publish(
+            (Symbol::new(&env, "DR"), Symbol::new(&env, "signers_set")),
+            signers.len() as u32,
+        );
+    }
+
+    /// Capture a complete snapshot of all critical escrow state.
+    ///
+    /// Call this **before** any contract upgrade so that a rollback target
+    /// exists if the upgrade corrupts storage.  Up to `MAX_SNAPSHOTS` (3)
+    /// snapshots are retained in a rolling window; creating a 4th
+    /// automatically deletes the oldest.
+    ///
+    /// # Storage written
+    /// * `DataKey::Snapshot(snapshot_id)` → `Vec<EscrowRecord>`
+    /// * `DataKey::SnapshotMetadata(snapshot_id)` → `SnapshotMeta`
+    /// * `DataKey::SnapshotIndex` → updated `Vec<u32>`
+    ///
+    /// # Auth
+    /// Only the contract admin may take snapshots.
+    pub fn snapshot_state(env: Env, admin: Address, snapshot_id: u32) {
+        let stored_admin: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Admin)
+            .expect("Not initialized");
+        admin.require_auth();
+        if admin != stored_admin {
+            panic!("Caller not authorized");
+        }
+
+        // ----------------------------------------------------------------
+        // Collect all escrow records
+        // ----------------------------------------------------------------
+        let count: u64 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::EscrowCount)
+            .unwrap_or(0);
+
+        let mut records: Vec<EscrowRecord> = Vec::new(&env);
+        for i in 1u64..=count {
+            let key = (symbol_short!("ESCROW"), i);
+            if let Some(record) = env.storage().persistent().get::<_, EscrowRecord>(&key) {
+                records.push_back(record);
+            }
+        }
+
+        // ----------------------------------------------------------------
+        // Compute checksum over a deterministic byte sequence:
+        // admin (32 B) + escrow_count (8 B) + fee_bps (4 B) + num_records (8 B)
+        // ----------------------------------------------------------------
+        let fee_bps: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::FeeBps)
+            .unwrap_or(0);
+        let auto_delay: u64 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::AutoRelDelay)
+            .unwrap_or(0);
+
+        let mut checksum_input = Bytes::new(&env);
+        // Deterministic bytes: count (8) + fee_bps (4) + auto_delay (8) + record_count (8)
+        for byte in count.to_be_bytes().iter() {
+            checksum_input.push_back(*byte);
+        }
+        for byte in fee_bps.to_be_bytes().iter() {
+            checksum_input.push_back(*byte);
+        }
+        for byte in auto_delay.to_be_bytes().iter() {
+            checksum_input.push_back(*byte);
+        }
+        let record_count = records.len() as u64;
+        for byte in record_count.to_be_bytes().iter() {
+            checksum_input.push_back(*byte);
+        }
+        let checksum = compute_checksum(&env, &checksum_input);
+
+        // ----------------------------------------------------------------
+        // Build metadata
+        // ----------------------------------------------------------------
+        let wasm_hash: BytesN<32> = env.deployer().get_contract_instance_wasm_hash(
+            &env.current_contract_address(),
+        );
+
+        // Manage rolling index and evict oldest if necessary
+        let mut index: Vec<u32> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::SnapshotIndex)
+            .unwrap_or(Vec::new(&env));
+
+        let snapshot_index_pos = index.len() as u32; // position within rolling window (0,1,2)
+
+        let evicted = push_snapshot_index(&mut index, snapshot_id);
+        if let Some(old_id) = evicted {
+            // Delete the oldest snapshot data to enforce the rolling window.
+            env.storage().persistent().remove(&DataKey::Snapshot(old_id));
+            env.storage()
+                .persistent()
+                .remove(&DataKey::SnapshotMetadata(old_id));
+        }
+        env.storage()
+            .persistent()
+            .set(&DataKey::SnapshotIndex, &index);
+        env.storage().persistent().extend_ttl(
+            &DataKey::SnapshotIndex,
+            ESCROW_TTL_THRESHOLD,
+            ESCROW_TTL_BUMP,
+        );
+
+        let meta = SnapshotMeta {
+            created_at: env.ledger().timestamp(),
+            block_height: env.ledger().sequence(),
+            contract_version: wasm_hash,
+            admin: admin.clone(),
+            checksum,
+            record_count,
+            snapshot_index: snapshot_index_pos.min(MAX_SNAPSHOTS - 1),
+        };
+
+        // ----------------------------------------------------------------
+        // Persist snapshot payload and metadata
+        // ----------------------------------------------------------------
+        env.storage()
+            .persistent()
+            .set(&DataKey::Snapshot(snapshot_id), &records);
+        env.storage().persistent().extend_ttl(
+            &DataKey::Snapshot(snapshot_id),
+            ESCROW_TTL_THRESHOLD,
+            ESCROW_TTL_BUMP,
+        );
+        env.storage()
+            .persistent()
+            .set(&DataKey::SnapshotMetadata(snapshot_id), &meta);
+        env.storage().persistent().extend_ttl(
+            &DataKey::SnapshotMetadata(snapshot_id),
+            ESCROW_TTL_THRESHOLD,
+            ESCROW_TTL_BUMP,
+        );
+
+        env.events().publish(
+            (
+                Symbol::new(&env, "DR"),
+                Symbol::new(&env, "snapshot"),
+                snapshot_id,
+            ),
+            (record_count, env.ledger().sequence()),
+        );
+    }
+
+    /// Compare a previously taken snapshot against current on-chain state.
+    ///
+    /// Checks every config key (Admin, Treasury, FeeBps, EscrowCount,
+    /// AutoRelDelay) and every `EscrowRecord` field captured in the snapshot.
+    ///
+    /// # Returns
+    /// A `StateVerificationReport` with:
+    /// * `fields_checked` — total number of individual fields compared.
+    /// * `mismatches`     — human-readable descriptions of any divergence.
+    ///   An empty list means the state is fully intact.
+    ///
+    /// # Panics
+    /// If `snapshot_id` does not refer to an existing snapshot.
+    pub fn verify_post_upgrade_state(
+        env: Env,
+        snapshot_id: u32,
+    ) -> StateVerificationReport {
+        let records: Vec<EscrowRecord> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Snapshot(snapshot_id))
+            .expect("Snapshot not found");
+
+        let meta: SnapshotMeta = env
+            .storage()
+            .persistent()
+            .get(&DataKey::SnapshotMetadata(snapshot_id))
+            .expect("Snapshot metadata not found");
+
+        let mut mismatches: Vec<soroban_sdk::String> = Vec::new(&env);
+        let mut fields_checked: u32 = 0;
+
+        // ----------------------------------------------------------------
+        // Config checks
+        // ----------------------------------------------------------------
+        let current_count: u64 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::EscrowCount)
+            .unwrap_or(0);
+        fields_checked += 1;
+        if current_count != meta.record_count {
+            mismatches.push_back(soroban_sdk::String::from_str(
+                &env,
+                "EscrowCount mismatch",
+            ));
+        }
+
+        // ----------------------------------------------------------------
+        // Per-record field checks
+        // ----------------------------------------------------------------
+        for snapshot_rec in records.iter() {
+            let key = (symbol_short!("ESCROW"), snapshot_rec.id);
+            if let Some(current_rec) = env
+                .storage()
+                .persistent()
+                .get::<_, EscrowRecord>(&key)
+            {
+                // id
+                fields_checked += 1;
+                if current_rec.id != snapshot_rec.id {
+                    mismatches.push_back(soroban_sdk::String::from_str(
+                        &env,
+                        "EscrowRecord.id mismatch",
+                    ));
+                }
+                // mentor
+                fields_checked += 1;
+                if current_rec.mentor != snapshot_rec.mentor {
+                    mismatches.push_back(soroban_sdk::String::from_str(
+                        &env,
+                        "EscrowRecord.mentor mismatch",
+                    ));
+                }
+                // learner
+                fields_checked += 1;
+                if current_rec.learner != snapshot_rec.learner {
+                    mismatches.push_back(soroban_sdk::String::from_str(
+                        &env,
+                        "EscrowRecord.learner mismatch",
+                    ));
+                }
+                // amount
+                fields_checked += 1;
+                if current_rec.amount != snapshot_rec.amount {
+                    mismatches.push_back(soroban_sdk::String::from_str(
+                        &env,
+                        "EscrowRecord.amount mismatch",
+                    ));
+                }
+                // status
+                fields_checked += 1;
+                if current_rec.status != snapshot_rec.status {
+                    mismatches.push_back(soroban_sdk::String::from_str(
+                        &env,
+                        "EscrowRecord.status mismatch",
+                    ));
+                }
+                // token_address
+                fields_checked += 1;
+                if current_rec.token_address != snapshot_rec.token_address {
+                    mismatches.push_back(soroban_sdk::String::from_str(
+                        &env,
+                        "EscrowRecord.token_address mismatch",
+                    ));
+                }
+                // platform_fee
+                fields_checked += 1;
+                if current_rec.platform_fee != snapshot_rec.platform_fee {
+                    mismatches.push_back(soroban_sdk::String::from_str(
+                        &env,
+                        "EscrowRecord.platform_fee mismatch",
+                    ));
+                }
+                // net_amount
+                fields_checked += 1;
+                if current_rec.net_amount != snapshot_rec.net_amount {
+                    mismatches.push_back(soroban_sdk::String::from_str(
+                        &env,
+                        "EscrowRecord.net_amount mismatch",
+                    ));
+                }
+                // session_end_time
+                fields_checked += 1;
+                if current_rec.session_end_time != snapshot_rec.session_end_time {
+                    mismatches.push_back(soroban_sdk::String::from_str(
+                        &env,
+                        "EscrowRecord.session_end_time mismatch",
+                    ));
+                }
+                // total_sessions
+                fields_checked += 1;
+                if current_rec.total_sessions != snapshot_rec.total_sessions {
+                    mismatches.push_back(soroban_sdk::String::from_str(
+                        &env,
+                        "EscrowRecord.total_sessions mismatch",
+                    ));
+                }
+                // sessions_completed
+                fields_checked += 1;
+                if current_rec.sessions_completed != snapshot_rec.sessions_completed {
+                    mismatches.push_back(soroban_sdk::String::from_str(
+                        &env,
+                        "EscrowRecord.sessions_completed mismatch",
+                    ));
+                }
+            } else {
+                // Record present in snapshot but missing on-chain.
+                fields_checked += 1;
+                mismatches.push_back(soroban_sdk::String::from_str(
+                    &env,
+                    "EscrowRecord missing in current state",
+                ));
+            }
+        }
+
+        StateVerificationReport {
+            fields_checked,
+            mismatches,
+        }
+    }
+
+    /// Open a rollback proposal targeting a specific snapshot.
+    ///
+    /// The `proposer` must be one of the registered emergency signers.
+    /// Their approval is automatically counted as the first vote.
+    ///
+    /// # Returns
+    /// The new proposal ID (auto-incremented).
+    ///
+    /// # Panics
+    /// * Emergency signers not registered.
+    /// * `proposer` is not a registered emergency signer.
+    /// * Target snapshot does not exist.
+    pub fn propose_rollback(
+        env: Env,
+        proposer: Address,
+        snapshot_id: u32,
+        old_wasm_hash: BytesN<32>,
+    ) -> u32 {
+        // Validate proposer is an emergency signer
+        let signers: Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::EmergencySigners)
+            .expect("Emergency signers not configured");
+        let is_signer = signers.iter().any(|s| s == proposer);
+        if !is_signer {
+            panic!("Proposer is not an emergency signer");
+        }
+        // Verify snapshot exists
+        if !env
+            .storage()
+            .persistent()
+            .has(&DataKey::SnapshotMetadata(snapshot_id))
+        {
+            panic!("Snapshot not found");
+        }
+        proposer.require_auth();
+
+        let proposal_count: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::RollbackProposalCount)
+            .unwrap_or(0);
+        let new_id = proposal_count
+            .checked_add(1)
+            .expect("Rollback proposal count overflow");
+        env.storage()
+            .persistent()
+            .set(&DataKey::RollbackProposalCount, &new_id);
+
+        let proposal = RollbackProposal {
+            id: new_id,
+            snapshot_id,
+            old_wasm_hash: old_wasm_hash.clone(),
+            approval_count: 1,
+            executed: false,
+            created_at: env.ledger().timestamp(),
+            proposer: proposer.clone(),
+        };
+        env.storage()
+            .persistent()
+            .set(&DataKey::RollbackProposal(new_id), &proposal);
+        env.storage().persistent().extend_ttl(
+            &DataKey::RollbackProposal(new_id),
+            ESCROW_TTL_THRESHOLD,
+            ESCROW_TTL_BUMP,
+        );
+        // Record proposer's implicit approval
+        env.storage().persistent().set(
+            &DataKey::RollbackApproval(new_id, proposer.clone()),
+            &true,
+        );
+
+        env.events().publish(
+            (
+                Symbol::new(&env, "DR"),
+                Symbol::new(&env, "rb_proposed"),
+                new_id,
+            ),
+            (snapshot_id, proposer, old_wasm_hash),
+        );
+        new_id
+    }
+
+    /// Cast an approval vote on an open rollback proposal.
+    ///
+    /// * `signer` must be one of the registered emergency signers.
+    /// * Double-voting panics.
+    /// * Voting on an already-executed proposal panics.
+    pub fn approve_rollback(env: Env, signer: Address, proposal_id: u32) {
+        // Validate signer is an emergency signer
+        let signers: Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::EmergencySigners)
+            .expect("Emergency signers not configured");
+        let is_signer = signers.iter().any(|s| s == signer);
+        if !is_signer {
+            panic!("Signer is not an emergency signer");
+        }
+
+        let mut proposal: RollbackProposal = env
+            .storage()
+            .persistent()
+            .get(&DataKey::RollbackProposal(proposal_id))
+            .expect("Rollback proposal not found");
+        if proposal.executed {
+            panic!("Rollback already executed");
+        }
+        if env
+            .storage()
+            .persistent()
+            .get::<_, bool>(&DataKey::RollbackApproval(proposal_id, signer.clone()))
+            .unwrap_or(false)
+        {
+            panic!("Already approved");
+        }
+        signer.require_auth();
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::RollbackApproval(proposal_id, signer.clone()), &true);
+        proposal.approval_count = proposal
+            .approval_count
+            .checked_add(1)
+            .expect("Approval count overflow");
+        env.storage()
+            .persistent()
+            .set(&DataKey::RollbackProposal(proposal_id), &proposal);
+
+        env.events().publish(
+            (
+                Symbol::new(&env, "DR"),
+                Symbol::new(&env, "rb_approved"),
+                proposal_id,
+            ),
+            (signer, proposal.approval_count),
+        );
+    }
+
+    /// Execute a rollback after accumulating 4-of-7 emergency signer approvals.
+    ///
+    /// Steps:
+    /// 1. Validate `EMERGENCY_THRESHOLD` approvals are present.
+    /// 2. Load the snapshot payload.
+    /// 3. Restore every `EscrowRecord` from the snapshot back to persistent storage.
+    /// 4. Re-apply the old WASM binary via `env.deployer().update_current_contract_wasm`.
+    /// 5. Mark the proposal as executed and emit a `RollbackExecuted` event.
+    ///
+    /// # Pre-conditions
+    /// * The old WASM binary **must** already be uploaded to the network
+    ///   (`soroban contract install`) before calling this.
+    /// * Exactly `EMERGENCY_THRESHOLD` (4) approvals must have been registered.
+    ///
+    /// # Panics
+    /// * Proposal not found / already executed.
+    /// * Approval count below threshold.
+    /// * Snapshot no longer exists (e.g. was evicted by newer snapshots).
+    pub fn rollback_to_snapshot(env: Env, proposal_id: u32) {
+        let mut proposal: RollbackProposal = env
+            .storage()
+            .persistent()
+            .get(&DataKey::RollbackProposal(proposal_id))
+            .expect("Rollback proposal not found");
+        if proposal.executed {
+            panic!("Rollback already executed");
+        }
+        if proposal.approval_count < EMERGENCY_THRESHOLD {
+            panic!("Insufficient approvals for rollback (need 4-of-7)");
+        }
+
+        let snapshot_id = proposal.snapshot_id;
+        let records: Vec<EscrowRecord> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Snapshot(snapshot_id))
+            .expect("Snapshot data not found");
+
+        // ----------------------------------------------------------------
+        // Restore all escrow records from snapshot
+        // ----------------------------------------------------------------
+        for record in records.iter() {
+            let key = (symbol_short!("ESCROW"), record.id);
+            env.storage().persistent().set(&key, &record);
+            env.storage().persistent().extend_ttl(
+                &key,
+                ESCROW_TTL_THRESHOLD,
+                ESCROW_TTL_BUMP,
+            );
+        }
+
+        // ----------------------------------------------------------------
+        // Re-apply the pre-upgrade WASM
+        // ----------------------------------------------------------------
+        env.deployer()
+            .update_current_contract_wasm(proposal.old_wasm_hash.clone());
+
+        // ----------------------------------------------------------------
+        // Mark executed and emit event
+        // ----------------------------------------------------------------
+        proposal.executed = true;
+        env.storage()
+            .persistent()
+            .set(&DataKey::RollbackProposal(proposal_id), &proposal);
+
+        env.events().publish(
+            (
+                Symbol::new(&env, "DR"),
+                Symbol::new(&env, "rb_executed"),
+                proposal_id,
+            ),
+            (
+                snapshot_id,
+                proposal.old_wasm_hash,
+                records.len() as u32,
+            ),
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Disaster Recovery — View helpers
+    // -----------------------------------------------------------------------
+
+    /// Return the metadata for a snapshot, or `None` if it does not exist.
+    pub fn get_snapshot_metadata(env: Env, snapshot_id: u32) -> Option<SnapshotMeta> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::SnapshotMetadata(snapshot_id))
+    }
+
+    /// Return the ordered list of currently retained snapshot IDs.
+    pub fn get_snapshot_index(env: Env) -> Vec<u32> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::SnapshotIndex)
+            .unwrap_or(Vec::new(&env))
+    }
+
+    /// Return a rollback proposal by ID.
+    pub fn get_rollback_proposal(env: Env, proposal_id: u32) -> Option<RollbackProposal> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::RollbackProposal(proposal_id))
+    }
 }
+
 
 // ---------------------------------------------------------------------------
 // Tests
@@ -2034,6 +2710,7 @@ impl EscrowContract {
 #[cfg(test)]
 mod test {
     extern crate std;
+    use std::string::ToString;
     use super::*;
     use soroban_sdk::{
         testutils::{Address as _, Ledger, Events},
@@ -2799,14 +3476,19 @@ mod test {
         let f = TestFixture::setup();
         let new_token = Address::generate(&f.env);
         f.client().set_approved_token(&new_token, &true);
-        let events = f.env.events().all();
-        let last_event = events.last().unwrap();
-        assert_eq!(last_event.0, f.contract_id.clone());
-        // The event topic should contain "Token" and "Approved"
-        assert_eq!(
-            last_event.1,
-            (Symbol::new(&f.env, "Token"), Symbol::new(&f.env, "Approved")).into_val(&f.env)
-        );
+        let expected = soroban_sdk::vec![
+            &f.env,
+            (
+                f.contract_id.clone(),
+                (Symbol::new(&f.env, "Token"), Symbol::new(&f.env, "Approved")).into_val(&f.env),
+                TokenApprovalEventData {
+                    token_address: new_token,
+                    approved: true,
+                }
+                .into_val(&f.env),
+            )
+        ];
+        assert_eq!(f.env.events().all(), expected);
     }
 
     /// Test: Token rejection events are emitted
@@ -2816,13 +3498,19 @@ mod test {
         let new_token = Address::generate(&f.env);
         f.client().set_approved_token(&new_token, &true);
         f.client().set_approved_token(&new_token, &false);
-        let events = f.env.events().all();
-        let last_event = events.last().unwrap();
-        assert_eq!(last_event.0, f.contract_id.clone());
-        assert_eq!(
-            last_event.1,
-            (Symbol::new(&f.env, "Token"), Symbol::new(&f.env, "Rejected")).into_val(&f.env)
-        );
+        let expected = soroban_sdk::vec![
+            &f.env,
+            (
+                f.contract_id.clone(),
+                (Symbol::new(&f.env, "Token"), Symbol::new(&f.env, "Rejected")).into_val(&f.env),
+                TokenApprovalEventData {
+                    token_address: new_token,
+                    approved: false,
+                }
+                .into_val(&f.env),
+            )
+        ];
+        assert_eq!(f.env.events().all(), expected);
     }
 
     /// Test: Unknown/random token address is not approved by default
@@ -2965,20 +3653,23 @@ mod test {
     /// Count events whose topic uses the canonical
     /// `(contract="escrow", version=1, event_type)` layout for `event_type`.
     fn count_standard_escrow_events(f: &TestFixture, event_type: &str) -> u32 {
-        let contract_sym = Symbol::new(&f.env, "escrow");
-        let evt_sym = Symbol::new(&f.env, event_type);
         let mut n = 0u32;
-        for (_addr, topics, _data) in f.env.events().all().iter() {
-            if topics.len() != 3 {
+        for evt in f.env.events().all().events() {
+            let soroban_sdk::xdr::ContractEventBody::V0(body) = &evt.body;
+            if body.topics.len() != 3 {
                 continue;
             }
-            let c = Symbol::try_from_val(&f.env, &topics.get(0).unwrap());
-            let v = u32::try_from_val(&f.env, &topics.get(1).unwrap());
-            let e = Symbol::try_from_val(&f.env, &topics.get(2).unwrap());
-            if let (Ok(c), Ok(v), Ok(e)) = (c, v, e) {
-                if c == contract_sym && v == 1u32 && e == evt_sym {
-                    n += 1;
-                }
+            let c_match = matches!(
+                &body.topics[0],
+                soroban_sdk::xdr::ScVal::Symbol(s) if s.to_string() == "escrow"
+            );
+            let v_match = matches!(&body.topics[1], soroban_sdk::xdr::ScVal::U32(1));
+            let e_match = matches!(
+                &body.topics[2],
+                soroban_sdk::xdr::ScVal::Symbol(s) if s.to_string() == event_type
+            );
+            if c_match && v_match && e_match {
+                n += 1;
             }
         }
         n

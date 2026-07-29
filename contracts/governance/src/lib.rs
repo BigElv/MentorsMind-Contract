@@ -7,7 +7,7 @@ use shared::events::{
     evt_gov_proposal_failed, evt_gov_proposal_passed, evt_gov_proposal_queued,
     evt_gov_timelock_set, evt_gov_vote_cast,
 };
-use shared::StateMachine;
+use shared::{GasEstimate, StateMachine};
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, symbol_short, vec, Address, Bytes,
     BytesN, Env, IntoVal, Symbol, Vec,
@@ -28,6 +28,15 @@ const DEFAULT_VOTING_PERIOD_SECS: u64 = 7 * 24 * 60 * 60;
 const DEFAULT_QUORUM_BPS: u32 = 1_000; // 10%
 const CUSTOM_PROPOSAL_QUORUM_BPS: u32 = 3_000; // 30%
 const EXECUTE_CALL_TIMELOCK_SECS: u64 = 7 * 24 * 60 * 60; // 7-day mandatory delay
+
+// ---------------------------------------------------------------------------
+// Gas-estimation heuristic constants (#761). Calibrated against
+// `env.budget().cpu_instruction_cost()` measured around a real `vote()`
+// call in `test_estimate_governance_vote_cost_within_tolerance_of_actual`.
+// ---------------------------------------------------------------------------
+const GOV_VOTE_BASE_INSTRUCTIONS: u64 = 43_000;
+const PER_STORAGE_OP_INSTRUCTIONS: u64 = 2_000;
+const PER_CROSS_CALL_INSTRUCTIONS: u64 = 300_000;
 
 // ─── Time-weighted voting constants ──────────────────────────────────────
 /// Early window: 0–33% of voting period — 80% weight (8000 bps)
@@ -160,6 +169,7 @@ pub enum DataKey {
     WeightedVotesAgainst(u32),
     /// Multiplier applied to a specific voter's vote (in bps)
     VoteWeightMultiplier(u32, Address),
+    DelegationContract,
 }
 
 #[contracttype]
@@ -210,6 +220,7 @@ impl GovernanceContract {
         admin: Address,
         mnt_token: Address,
         snapshot_contract: Address,
+        delegation_contract: Address,
         voting_period_secs: Option<u64>,
         quorum_bps: Option<u32>,
     ) {
@@ -233,12 +244,18 @@ impl GovernanceContract {
         env.storage().instance().set(&VOTING_PERIOD_SECS, &period);
         env.storage().instance().set(&QUORUM_BPS, &quorum);
         env.storage().instance().set(&PROPOSAL_COUNT, &0u32);
+        env.storage()
+            .instance()
+            .set(&DataKey::DelegationContract, &delegation_contract);
         env.storage().persistent().set(&ADMIN, &admin);
         env.storage().persistent().set(&TOKEN, &mnt_token);
 
         env.storage()
             .persistent()
             .set(&SNAPSHOT, &snapshot_contract);
+        env.storage()
+            .persistent()
+            .set(&DataKey::DelegationContract, &delegation_contract);
         env.storage().persistent().set(&VOTING_PERIOD_SECS, &period);
 
         env.storage().persistent().set(&VOTING_PERIOD_SECS, &period);
@@ -512,11 +529,27 @@ impl GovernanceContract {
             .persistent()
             .get(&SNAPSHOT)
             .expect("snapshot not set");
-        let weight: i128 = env.invoke_contract(
+        let delegation_contract: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::DelegationContract)
+            .expect("delegation contract not set");
+
+        let snapshot_weight: i128 = env.invoke_contract(
             &snapshot_contract,
             &Symbol::new(&env, "get_voting_power"),
             (proposal_id, voter.clone()).into_val(&env),
         );
+
+        let delegated_power: i128 = env.invoke_contract(
+            &delegation_contract,
+            &Symbol::new(&env, "get_delegated_power_at_snapshot"),
+            (voter.clone(), proposal.snapshot_ledger).into_val(&env),
+        );
+
+        let weight = snapshot_weight
+            .checked_add(delegated_power)
+            .expect("weight overflow");
 
         if weight <= 0 {
             panic!("no voting power");
@@ -591,6 +624,40 @@ impl GovernanceContract {
             evt_gov_vote_cast(&env),
             (voter, support, weight, window.weight_bps, weighted),
         );
+    }
+
+    /// Heuristic instruction/IO estimate for [`Self::vote`] on `proposal_id`
+    /// by `voter`, without mutating state. Mirrors `vote`'s actual read/write
+    /// pattern (proposal lookup, already-voted check, snapshot-power lookup)
+    /// plus one extra read+call if `voter` has a delegate configured
+    /// (delegation resolution, reserved for future use — see
+    /// `DataKey::Delegate`).
+    pub fn estimate_governance_vote_cost(env: Env, proposal_id: u32, voter: Address) -> GasEstimate {
+        let _ = proposal_id;
+        // vote()'s own reads: Proposal(proposal_id), Vote(proposal_id, voter)
+        // has-check, SNAPSHOT config, voting-window lookup.
+        let mut storage_reads: u32 = 4;
+        // vote()'s own writes: Vote flag, VoteWeight, VoteWeightMultiplier,
+        // weighted tally, updated Proposal.
+        let storage_writes: u32 = 5;
+        // vote()'s own cross-contract call: snapshot.get_voting_power.
+        let mut cross_contract_calls: u32 = 1;
+
+        if env.storage().persistent().has(&DataKey::Delegate(voter)) {
+            storage_reads += 1;
+            cross_contract_calls += 1;
+        }
+
+        let base_instructions = GOV_VOTE_BASE_INSTRUCTIONS
+            + (storage_reads as u64 + storage_writes as u64) * PER_STORAGE_OP_INSTRUCTIONS
+            + (cross_contract_calls as u64) * PER_CROSS_CALL_INSTRUCTIONS;
+
+        GasEstimate {
+            base_instructions,
+            storage_reads,
+            storage_writes,
+            cross_contract_calls,
+        }
     }
 
     pub fn execute_proposal(env: Env, proposal_id: u32) {
@@ -1236,6 +1303,37 @@ mod tests {
                 .persistent()
                 .set(&symbol_short!("TOKEN"), &token);
         }
+        pub fn get_snapshot_balance(env: Env, _id: u32, staker: Address) -> i128 {
+            let token: Address = env
+                .storage()
+                .persistent()
+                .get(&symbol_short!("TOKEN"))
+                .unwrap();
+            let args = vec![&env, staker.into_val(&env)];
+            env.invoke_contract::<i128>(&token, &Symbol::new(&env, "balance"), args)
+        }
+    }
+
+    #[contract]
+    pub struct MockDelegation;
+
+    #[contractimpl]
+    impl MockDelegation {
+        pub fn snapshot_delegations(_env: Env, _snapshot_id: u32) {}
+        pub fn get_delegation_at_snapshot(
+            _env: Env,
+            _snapshot_id: u32,
+            _delegator: Address,
+        ) -> Option<Address> {
+            None
+        }
+        pub fn get_delegated_power_at_snapshot(
+            _env: Env,
+            _delegate: Address,
+            _snapshot_id: u32,
+        ) -> i128 {
+            0
+        }
     }
 
     #[test]
@@ -1246,6 +1344,7 @@ mod tests {
         let gov_id = env.register_contract(None, GovernanceContract);
         let token_id = env.register_contract(None, MockMntToken);
         let snapshot_id = env.register_contract(None, MockSnapshot);
+        let delegation_id = env.register_contract(None, MockDelegation);
         let gov = GovernanceContractClient::new(&env, &gov_id);
         let token = MockMntTokenClient::new(&env, &token_id);
         let snapshot = MockSnapshotClient::new(&env, &snapshot_id);
@@ -1257,6 +1356,7 @@ mod tests {
             &admin,
             &token_id,
             &snapshot_id,
+            &delegation_id,
             &Some(10u64),
             &Some(1_000u32),
         );
@@ -1290,6 +1390,7 @@ mod tests {
         let gov_id = env.register_contract(None, GovernanceContract);
         let token_id = env.register_contract(None, MockMntToken);
         let snapshot_id = env.register_contract(None, MockSnapshot);
+        let delegation_id = env.register_contract(None, MockDelegation);
         let gov = GovernanceContractClient::new(&env, &gov_id);
         let token = MockMntTokenClient::new(&env, &token_id);
         let snapshot = MockSnapshotClient::new(&env, &snapshot_id);
@@ -1301,6 +1402,7 @@ mod tests {
             &admin,
             &token_id,
             &snapshot_id,
+            &delegation_id,
             &Some(10u64),
             &Some(1_000u32),
         );
@@ -1334,6 +1436,7 @@ mod tests {
         let gov_id = env.register_contract(None, GovernanceContract);
         let token_id = env.register_contract(None, MockMntToken);
         let snapshot_id = env.register_contract(None, MockSnapshot);
+        let delegation_id = env.register_contract(None, MockDelegation);
         let gov = GovernanceContractClient::new(&env, &gov_id);
         let token = MockMntTokenClient::new(&env, &token_id);
         let snapshot = MockSnapshotClient::new(&env, &snapshot_id);
@@ -1345,6 +1448,7 @@ mod tests {
             &admin,
             &token_id,
             &snapshot_id,
+            &delegation_id,
             &Some(10u64),
             &Some(1_000u32),
         );
@@ -1362,6 +1466,221 @@ mod tests {
 
         gov.vote(&voter, &proposal_id, &true);
         gov.vote(&voter, &proposal_id, &false);
+    }
+
+    // ═════════════════════════════════════════════════════════════════════
+    // Delegation-weighted voting tests
+    // ═════════════════════════════════════════════════════════════════════
+
+    /// A delegation mock that tracks delegator→delegate mappings and
+    /// computes snapshot delegated power by reading snapshot balances
+    /// from the snapshot contract.
+    #[contract]
+    pub struct MockDelegationWithPower;
+
+    #[contractimpl]
+    impl MockDelegationWithPower {
+        pub fn delegate(env: Env, delegator: Address, delegate: Address) {
+            env.storage()
+                .persistent()
+                .set(&(symbol_short!("DEL"), delegator.clone()), &delegate);
+            let mut del_list: soroban_sdk::Vec<Address> = env
+                .storage()
+                .persistent()
+                .get(&symbol_short!("DELLIST"))
+                .unwrap_or_else(|| soroban_sdk::Vec::new(&env));
+            if !del_list.contains(&delegator) {
+                del_list.push_back(delegator);
+                env.storage()
+                    .persistent()
+                    .set(&symbol_short!("DELLIST"), &del_list);
+            }
+        }
+        pub fn snapshot_delegations(env: Env, snapshot_id: u32) {
+            let snapshot_contract: Address = env
+                .storage()
+                .instance()
+                .get(&symbol_short!("SNAP"))
+                .expect("snapshot contract not set");
+            let del_list: soroban_sdk::Vec<Address> = env
+                .storage()
+                .persistent()
+                .get(&symbol_short!("DELLIST"))
+                .unwrap_or_else(|| soroban_sdk::Vec::new(&env));
+            for delegator in del_list.iter() {
+                if let Some(delegate) = env
+                    .storage()
+                    .persistent()
+                    .get::<_, Address>(&(symbol_short!("DEL"), delegator.clone()))
+                {
+                    // Store delegation at snapshot
+                    env.storage().persistent().set(
+                        &(symbol_short!("DEL_SNAP"), snapshot_id, delegator.clone()),
+                        &delegate,
+                    );
+                    // Get delegator's snapshot balance
+                    let balance: i128 = env.invoke_contract(
+                        &snapshot_contract,
+                        &Symbol::new(&env, "get_snapshot_balance"),
+                        (snapshot_id, delegator.clone()).into_val(&env),
+                    );
+                    // Accumulate delegated power for delegate
+                    if balance > 0 {
+                        let pkey =
+                            (symbol_short!("PWRSNAP"), snapshot_id, delegate.clone());
+                        let current: i128 = env
+                            .storage()
+                            .persistent()
+                            .get(&pkey)
+                            .unwrap_or(0);
+                        env.storage()
+                            .persistent()
+                            .set(&pkey, &current.checked_add(balance).expect("overflow"));
+                    }
+                }
+            }
+        }
+        pub fn get_delegation_at_snapshot(
+            env: Env,
+            snapshot_id: u32,
+            delegator: Address,
+        ) -> Option<Address> {
+            env.storage()
+                .persistent()
+                .get(&(symbol_short!("DEL_SNAP"), snapshot_id, delegator))
+        }
+        pub fn get_delegated_power_at_snapshot(
+            env: Env,
+            delegate: Address,
+            snapshot_id: u32,
+        ) -> i128 {
+            env.storage()
+                .persistent()
+                .get(&(symbol_short!("PWRSNAP"), snapshot_id, delegate))
+                .unwrap_or(0)
+        }
+        pub fn set_snapshot_contract(env: Env, snap: Address) {
+            env.storage()
+                .instance()
+                .set(&symbol_short!("SNAP"), &snap);
+        }
+    }
+
+    #[test]
+    fn test_delegation_weighted_vote() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let gov_id = env.register_contract(None, GovernanceContract);
+        let token_id = env.register_contract(None, MockMntToken);
+        let snapshot_id = env.register_contract(None, MockSnapshot);
+        let delegation_id = env.register_contract(None, MockDelegationWithPower);
+        let gov = GovernanceContractClient::new(&env, &gov_id);
+        let token = MockMntTokenClient::new(&env, &token_id);
+        let snapshot = MockSnapshotClient::new(&env, &snapshot_id);
+        let delegation = MockDelegationWithPowerClient::new(&env, &delegation_id);
+
+        snapshot.set_token(&token_id);
+        delegation.set_snapshot_contract(&snapshot_id);
+
+        let admin = Address::generate(&env);
+        let voter = Address::generate(&env);
+        let delegator1 = Address::generate(&env);
+        let delegator2 = Address::generate(&env);
+
+        // Voter has 100 own tokens; delegator1 (80) and delegator2 (120) delegate to voter
+        token.set_total_supply(&1_000i128);
+        token.set_balance(&voter, &100i128);
+        token.set_balance(&delegator1, &80i128);
+        token.set_balance(&delegator2, &120i128);
+
+        delegation.delegate(&delegator1, &voter);
+        delegation.delegate(&delegator2, &voter);
+
+        gov.initialize(
+            &admin,
+            &token_id,
+            &snapshot_id,
+            &delegation_id,
+            &Some(10u64),
+            &Some(1_000u32),
+        );
+
+        let title = Bytes::from_slice(&env, b"Delegation weighted vote");
+        let description_hash = BytesN::from_array(&env, &[30u8; 32]);
+        let proposal_id = gov.create_proposal(
+            &voter,
+            &title,
+            &description_hash,
+            &ProposalAction::UpdateFee(300),
+        );
+
+        // Voter votes with 100 own + 200 delegated = 300 effective weight
+        gov.vote(&voter, &proposal_id, &true);
+
+        let weight = gov.get_vote_weight(&proposal_id, &voter);
+        assert_eq!(weight, 300, "voter should have 100 own + 200 delegated = 300");
+
+        // Delegation changes after snapshot should not affect vote weight
+        delegation.delegate(&delegator1, &Address::generate(&env)); // move delegator1 away
+        let weight_after = gov.get_vote_weight(&proposal_id, &voter);
+        assert_eq!(
+            weight_after, 300,
+            "post-snapshot delegation change must NOT affect vote weight"
+        );
+    }
+
+    #[test]
+    fn test_voter_who_delegated_away_has_only_delegated_power() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let gov_id = env.register_contract(None, GovernanceContract);
+        let token_id = env.register_contract(None, MockMntToken);
+        let snapshot_id = env.register_contract(None, MockSnapshot);
+        let delegation_id = env.register_contract(None, MockDelegationWithPower);
+        let gov = GovernanceContractClient::new(&env, &gov_id);
+        let token = MockMntTokenClient::new(&env, &token_id);
+        let snapshot = MockSnapshotClient::new(&env, &snapshot_id);
+        let delegation = MockDelegationWithPowerClient::new(&env, &delegation_id);
+
+        snapshot.set_token(&token_id);
+        delegation.set_snapshot_contract(&snapshot_id);
+
+        let admin = Address::generate(&env);
+        let voter = Address::generate(&env);
+        let delegator = Address::generate(&env);
+
+        // Voter delegated away their 100 tokens, but receives 200 from delegator
+        token.set_total_supply(&1_000i128);
+        token.set_balance(&voter, &100i128);
+        token.set_balance(&delegator, &200i128);
+
+        delegation.delegate(&voter, &Address::generate(&env)); // voter delegates away
+        delegation.delegate(&delegator, &voter); // delegator delegates to voter
+
+        gov.initialize(
+            &admin,
+            &token_id,
+            &snapshot_id,
+            &delegation_id,
+            &Some(10u64),
+            &Some(1_000u32),
+        );
+
+        let title = Bytes::from_slice(&env, b"Delegated away test");
+        let description_hash = BytesN::from_array(&env, &[31u8; 32]);
+        let proposal_id = gov.create_proposal(
+            &voter,
+            &title,
+            &description_hash,
+            &ProposalAction::UpdateFee(300),
+        );
+
+        // Voter has 0 own (delegated away) + 200 delegated = 200 effective
+        gov.vote(&voter, &proposal_id, &true);
+        let weight = gov.get_vote_weight(&proposal_id, &voter);
+        assert_eq!(weight, 200, "delegated-away voter should have 0 own + 200 delegated = 200");
     }
 
     // --- Template validation tests ---
@@ -1426,6 +1745,7 @@ mod tests {
         let gov_id = env.register_contract(None, GovernanceContract);
         let token_id = env.register_contract(None, MockMntToken);
         let snapshot_id = env.register_contract(None, MockSnapshot);
+        let delegation_id = env.register_contract(None, MockDelegation);
         let gov = GovernanceContractClient::new(env, &gov_id);
         let token = MockMntTokenClient::new(env, &token_id);
         let snapshot = MockSnapshotClient::new(env, &snapshot_id);
@@ -1436,6 +1756,7 @@ mod tests {
             &admin,
             &token_id,
             &snapshot_id,
+            &delegation_id,
             &Some(10u64),
             &Some(1_000u32),
         );
@@ -1557,6 +1878,7 @@ mod tests {
         let gov_id = env.register_contract(None, GovernanceContract);
         let token_id = env.register_contract(None, MockMntToken);
         let snapshot_id = env.register_contract(None, MockSnapshot);
+        let delegation_id = env.register_contract(None, MockDelegation);
         let gov = GovernanceContractClient::new(&env, &gov_id);
 
         let admin = Address::generate(&env);
@@ -1564,6 +1886,7 @@ mod tests {
             &admin,
             &token_id,
             &snapshot_id,
+            &delegation_id,
             &Some(10u64),
             &Some(1_000u32),
         );
@@ -1751,6 +2074,7 @@ mod tests {
         let gov_id = env.register_contract(None, GovernanceContract);
         let token_id = env.register_contract(None, MockMntToken);
         let snapshot_id = env.register_contract(None, MockSnapshot);
+        let delegation_id = env.register_contract(None, MockDelegation);
         let gov = GovernanceContractClient::new(env, &gov_id);
         let token = MockMntTokenClient::new(env, &token_id);
         let snapshot = MockSnapshotClient::new(env, &snapshot_id);
@@ -1761,6 +2085,7 @@ mod tests {
             &admin,
             &token_id,
             &snapshot_id,
+            &delegation_id,
             &Some(voting_period),
             &Some(1_000u32),
         );
@@ -2133,5 +2458,67 @@ mod tests {
         let window = gov.get_voting_window(&proposal_id);
         assert_eq!(window.window, 2, "should be late window");
         assert_eq!(window.weight_bps, 11000, "late weight should be 11000");
+    }
+
+    // ── #761: gas estimation ────────────────────────────────────────────────
+
+    #[test]
+    fn test_estimate_governance_vote_cost_is_nonzero_and_view_only() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (gov, _admin, voter, _token_id, _snapshot_id) = setup(&env);
+
+        let title = Bytes::from_slice(&env, b"Proposal");
+        let description_hash = BytesN::from_array(&env, &[1u8; 32]);
+        let proposal_id = gov.create_proposal(
+            &voter,
+            &title,
+            &description_hash,
+            &ProposalAction::UpdateFee(300),
+        );
+
+        let estimate = gov.estimate_governance_vote_cost(&proposal_id, &voter);
+        assert!(estimate.base_instructions > 0);
+        assert!(estimate.storage_reads > 0);
+        assert!(estimate.storage_writes > 0);
+        assert!(estimate.cross_contract_calls > 0);
+
+        // View-only: voter still hasn't voted, so a real vote still succeeds.
+        gov.vote(&voter, &proposal_id, &true);
+    }
+
+    #[test]
+    fn test_estimate_governance_vote_cost_within_tolerance_of_actual() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (gov, _admin, voter, _token_id, _snapshot_id) = setup(&env);
+
+        let title = Bytes::from_slice(&env, b"Proposal");
+        let description_hash = BytesN::from_array(&env, &[2u8; 32]);
+        let proposal_id = gov.create_proposal(
+            &voter,
+            &title,
+            &description_hash,
+            &ProposalAction::UpdateFee(300),
+        );
+
+        let estimate = gov.estimate_governance_vote_cost(&proposal_id, &voter);
+
+        env.budget().reset_default();
+        gov.vote(&voter, &proposal_id, &true);
+        let actual = env.budget().cpu_instruction_cost();
+
+        let diff = if actual > estimate.base_instructions {
+            actual - estimate.base_instructions
+        } else {
+            estimate.base_instructions - actual
+        };
+        let tolerance = actual / 5; // 20%
+        assert!(
+            diff <= tolerance,
+            "estimate {} vs actual {} exceeds 20% tolerance",
+            estimate.base_instructions,
+            actual
+        );
     }
 }

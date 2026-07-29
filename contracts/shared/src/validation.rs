@@ -13,7 +13,7 @@
 //!     .validate()?;
 //! ```
 
-use soroban_sdk::{contracttype, Env, Symbol};
+use soroban_sdk::{contracttype, Env, Symbol, Vec};
 
 /// Error returned when a validation rule fails.
 #[contracttype]

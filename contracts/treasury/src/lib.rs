@@ -157,6 +157,8 @@ pub enum DataKey {
     PendingAllocation(u32),
     AllocationApproval(u32, Address),
     PendingAdmin,
+    AutoBurnRateBps,
+    BurnQueue,
 }
 
 // ---------------------------------------------------------------------------
@@ -204,6 +206,28 @@ impl TreasuryContract {
             .persistent()
             .set(&DataKey::RegulatoryReporting, &Address::generate(&env)); // placeholder
         Ok(())
+    }
+
+    pub fn set_auto_burn_rate(env: Env, admin: Address, bps: u32) -> Result<(), Error> {
+        Self::require_admin(&env, &admin)?;
+        if bps > 10_000 {
+            return Err(Error::Unauthorized);
+        }
+        env.storage().persistent().set(&DataKey::AutoBurnRateBps, &bps);
+        Ok(())
+    }
+
+    pub fn execute_burn_queue(env: Env) -> Result<i128, Error> {
+        let queued: i128 = env.storage().persistent().get(&DataKey::BurnQueue).unwrap_or(0);
+        if queued <= 0 {
+            return Ok(0);
+        }
+        env.storage().persistent().set(&DataKey::BurnQueue, &0i128);
+        env.events().publish(
+            (symbol_short!("burn"), symbol_short!("executed")),
+            queued,
+        );
+        Ok(queued)
     }
 
     pub fn propose_admin_change(
