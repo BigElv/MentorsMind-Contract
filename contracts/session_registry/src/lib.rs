@@ -45,6 +45,7 @@ pub enum DataKey {
     LearnerSessionAt(Address, u32),
     SessionOracle,
     SessionMetadata(Symbol),
+    SessionOracle,
 }
 
 // ── Errors ────────────────────────────────────────────────────────────────────

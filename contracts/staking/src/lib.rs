@@ -28,6 +28,7 @@ pub enum Error {
     NoPendingAdminChange = 7,
     AdminChangeNotYetEffective = 8,
     InvalidAdminChange = 9,
+    Unauthorized = 10,
 }
 
 // ---------------------------------------------------------------------------
@@ -126,8 +127,13 @@ pub enum DataKey {
 }
 
 // ---------------------------------------------------------------------------
-// Tier thresholds (raw i128, no decimals assumed — callers pass raw amounts)
-// Thresholds: Bronze ≥ 100, Silver ≥ 500, Gold ≥ 2000
+// Multi-factor tier requirements (#762)
+//
+// Tier assignment reflects both economic commitment (stake) and proven
+// quality (reputation rating, sessions completed), so a mentor cannot buy
+// their way into Gold with stake alone. `min_rating` is on the same
+// `avg_rating * 100` scale returned by `reputation::get_mentor_rating`
+// (e.g. 4.5/5.0 == 450).
 // ---------------------------------------------------------------------------
 
 /// Compact per-staker record captured inside a DR snapshot.
@@ -157,21 +163,31 @@ pub struct LPRecord {
     pub last_reward_at: u64,
 }
 
-const TIER_BRONZE: i128 = 100;
-const TIER_SILVER: i128 = 500;
-const TIER_GOLD: i128 = 2_000;
-
-fn compute_tier(amount: i128) -> u32 {
-    if amount >= TIER_GOLD {
-        3
-    } else if amount >= TIER_SILVER {
-        2
-    } else if amount >= TIER_BRONZE {
-        1
-    } else {
-        0
-    }
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TierRequirements {
+    pub bronze_stake: i128,
+    pub silver_stake: i128,
+    pub gold_stake: i128,
+    pub bronze_min_rating: u32,
+    pub silver_min_rating: u32,
+    pub gold_min_rating: u32,
+    pub bronze_min_sessions: u32,
+    pub silver_min_sessions: u32,
+    pub gold_min_sessions: u32,
 }
+
+const DEFAULT_TIER_REQUIREMENTS: TierRequirements = TierRequirements {
+    bronze_stake: 100,
+    silver_stake: 500,
+    gold_stake: 2_000,
+    bronze_min_rating: 350,
+    silver_min_rating: 400,
+    gold_min_rating: 450,
+    bronze_min_sessions: 5,
+    silver_min_sessions: 10,
+    gold_min_sessions: 50,
+};
 
 // ---------------------------------------------------------------------------
 // Contract
@@ -319,6 +335,43 @@ impl StakingContract {
             .set(&DataKey::BypassAnomalyCheck, &bypass);
     }
 
+    /// Configure the `reputation` contract consulted by `compute_tier`.
+    /// Admin only. Quality checks stay disabled (stake-only tiering) until
+    /// both this and `session_registry` are configured.
+    pub fn set_reputation_contract(env: Env, reputation: Address) {
+        let admin: Address = env.storage().instance().get(&DataKey::Admin).expect("Not initialized");
+        admin.require_auth();
+        env.storage().instance().set(&DataKey::ReputationContract, &reputation);
+    }
+
+    /// Configure the `session_registry` contract consulted by
+    /// `compute_tier`. Admin only. See `set_reputation_contract`.
+    pub fn set_session_registry_contract(env: Env, session_registry: Address) {
+        let admin: Address = env.storage().instance().get(&DataKey::Admin).expect("Not initialized");
+        admin.require_auth();
+        env.storage()
+            .instance()
+            .set(&DataKey::SessionRegistryContract, &session_registry);
+    }
+
+    /// Adjust the stake/rating/session thresholds each tier requires.
+    /// Admin (governance) only.
+    pub fn set_tier_requirements(env: Env, admin: Address, requirements: TierRequirements) {
+        let stored: Address = env.storage().instance().get(&DataKey::Admin).expect("Not initialized");
+        admin.require_auth();
+        if stored != admin {
+            panic!("Unauthorized");
+        }
+        env.storage()
+            .instance()
+            .set(&DataKey::TierRequirements, &requirements);
+    }
+
+    /// Current stake/rating/session thresholds for each tier.
+    pub fn get_tier_requirements(env: Env) -> TierRequirements {
+        Self::load_tier_requirements(&env)
+    }
+
     /// Stake MNT tokens for a given lock period.
     ///
     /// - Transfers `amount` MNT from `mentor` to this contract.
@@ -402,7 +455,7 @@ impl StakingContract {
             .checked_mul(86_400u64)
             .expect("Overflow");
         let unlock_at = now.checked_add(lock_seconds).expect("Timestamp overflow");
-        let tier = compute_tier(amount);
+        let tier = Self::compute_tier(&env, amount, &mentor);
 
         let record = StakeRecord {
             mentor: mentor.clone(),
@@ -501,6 +554,11 @@ impl StakingContract {
         }
 
         mentor.require_auth();
+
+        // Recompute tier on this state change (#762). The stake record is
+        // removed below, so this has no persisted effect today, but keeps
+        // tier derivation on a single code path shared with `stake`.
+        let _ = Self::compute_tier(&env, record.amount, &mentor);
 
         let mnt_token: Address = env
             .storage()
@@ -961,6 +1019,67 @@ impl StakingContract {
         env.storage()
             .persistent()
             .get(&DataKey::StakerEpochEntry(staker))
+    }
+
+    fn load_tier_requirements(env: &Env) -> TierRequirements {
+        env.storage()
+            .instance()
+            .get(&DataKey::TierRequirements)
+            .unwrap_or(DEFAULT_TIER_REQUIREMENTS)
+    }
+
+    /// `(avg_rating * 100, completed_session_count)` for `mentor`, or `None`
+    /// if the reputation/session_registry contracts aren't both configured
+    /// — in which case `compute_tier` falls back to stake-only tiering.
+    fn mentor_quality(env: &Env, mentor: &Address) -> Option<(u32, u32)> {
+        let reputation: Address = env.storage().instance().get(&DataKey::ReputationContract)?;
+        let session_registry: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::SessionRegistryContract)?;
+
+        let (rating_x100, _review_count): (u64, u64) = env.invoke_contract(
+            &reputation,
+            &Symbol::new(env, "get_mentor_rating"),
+            (mentor.clone(),).into_val(env),
+        );
+        let sessions: soroban_sdk::Vec<Symbol> = env.invoke_contract(
+            &session_registry,
+            &Symbol::new(env, "get_sessions_by_mentor"),
+            (mentor.clone(),).into_val(env),
+        );
+
+        Some((rating_x100 as u32, sessions.len()))
+    }
+
+    /// Multi-factor tier: stake amount alone is necessary but not
+    /// sufficient — a mentor also needs the tier's minimum reputation
+    /// rating and completed-session count once `reputation` and
+    /// `session_registry` are configured (#762). Without those configured,
+    /// tiering falls back to stake thresholds only.
+    fn compute_tier(env: &Env, amount: i128, mentor: &Address) -> u32 {
+        let reqs = Self::load_tier_requirements(env);
+        let quality = Self::mentor_quality(env, mentor);
+
+        let meets = |min_stake: i128, min_rating: u32, min_sessions: u32| -> bool {
+            if amount < min_stake {
+                return false;
+            }
+            match quality {
+                Some((rating, sessions)) => rating >= min_rating && sessions >= min_sessions,
+                None => true,
+            }
+        };
+
+        if meets(reqs.gold_stake, reqs.gold_min_rating, reqs.gold_min_sessions) {
+            3
+        } else if meets(reqs.silver_stake, reqs.silver_min_rating, reqs.silver_min_sessions) {
+            2
+        } else if meets(reqs.bronze_stake, reqs.bronze_min_rating, reqs.bronze_min_sessions) {
+            1
+        } else {
+            0
+        }
     }
 
     /// Settle every closed epoch in `[StakerNextClaimEpoch(staker), current_epoch)`
@@ -1592,7 +1711,7 @@ mod test {
             let mnt_id = env.register_contract(None, MockMNT);
 
             let staking_id = env.register_contract(None, StakingContract);
-            StakingContractClient::new(&env, &staking_id).initialize(&admin, &mnt_id);
+            StakingContractClient::new(&env, &staking_id).initialize(&admin, &mnt_id, &None);
 
             Fixture {
                 env,
@@ -1785,7 +1904,7 @@ mod test {
     #[test]
     fn test_initialize_rejects_double_init() {
         let f = Fixture::setup();
-        let result = f.client().try_initialize(&f.admin, &f.mnt_id);
+        let result = f.client().try_initialize(&f.admin, &f.mnt_id, &None);
         assert_eq!(result, Err(Ok(Error::AlreadyInitialized)));
     }
 
@@ -1983,5 +2102,179 @@ mod test {
             total_claimed,
             total_distributed
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // #762: multi-factor tier requirements (stake + rating + sessions)
+    // -----------------------------------------------------------------------
+
+    mod quality_mocks {
+        use soroban_sdk::{contract, contractimpl, contracttype, Address, Env, Symbol, Vec};
+
+        #[contracttype]
+        #[derive(Clone)]
+        pub enum QualityMockKey {
+            Rating(Address),
+            Sessions(Address),
+        }
+
+        #[contract]
+        pub struct MockReputationS;
+
+        #[contractimpl]
+        impl MockReputationS {
+            pub fn set_rating(env: Env, mentor: Address, rating_x100: u32) {
+                env.storage()
+                    .persistent()
+                    .set(&QualityMockKey::Rating(mentor), &rating_x100);
+            }
+
+            pub fn get_mentor_rating(env: Env, mentor: Address) -> (u64, u64) {
+                let rating: u32 = env
+                    .storage()
+                    .persistent()
+                    .get(&QualityMockKey::Rating(mentor))
+                    .unwrap_or(0);
+                (rating as u64, 1u64)
+            }
+        }
+
+        #[contract]
+        pub struct MockSessionRegistryS;
+
+        #[contractimpl]
+        impl MockSessionRegistryS {
+            pub fn set_session_count(env: Env, mentor: Address, count: u32) {
+                let mut v: Vec<Symbol> = Vec::new(&env);
+                for _ in 0..count {
+                    v.push_back(Symbol::new(&env, "sess"));
+                }
+                env.storage()
+                    .persistent()
+                    .set(&QualityMockKey::Sessions(mentor), &v);
+            }
+
+            pub fn get_sessions_by_mentor(env: Env, mentor: Address) -> Vec<Symbol> {
+                env.storage()
+                    .persistent()
+                    .get(&QualityMockKey::Sessions(mentor))
+                    .unwrap_or(Vec::new(&env))
+            }
+        }
+    }
+    use quality_mocks::{
+        MockReputationS, MockReputationSClient, MockSessionRegistryS, MockSessionRegistrySClient,
+    };
+
+    struct QualityFixture {
+        base: Fixture,
+        reputation_id: Address,
+        session_registry_id: Address,
+    }
+
+    impl QualityFixture {
+        fn setup() -> Self {
+            let base = Fixture::setup();
+            let reputation_id = base.env.register_contract(None, MockReputationS);
+            let session_registry_id = base.env.register_contract(None, MockSessionRegistryS);
+            base.client().set_reputation_contract(&reputation_id);
+            base.client()
+                .set_session_registry_contract(&session_registry_id);
+            QualityFixture {
+                base,
+                reputation_id,
+                session_registry_id,
+            }
+        }
+
+        fn set_quality(&self, mentor: &Address, rating_x100: u32, sessions: u32) {
+            MockReputationSClient::new(&self.base.env, &self.reputation_id)
+                .set_rating(mentor, &rating_x100);
+            MockSessionRegistrySClient::new(&self.base.env, &self.session_registry_id)
+                .set_session_count(mentor, &sessions);
+        }
+    }
+
+    #[test]
+    fn test_gold_stake_without_sessions_returns_tier_zero() {
+        let f = QualityFixture::setup();
+        let mentor = Address::generate(&f.base.env);
+        f.base.fund(&mentor, 2_000);
+        // No rating/session history configured for this mentor (defaults 0/0).
+
+        f.base.client().stake(&mentor, &2_000, &30);
+
+        assert_eq!(f.base.client().get_tier(&mentor), 0);
+    }
+
+    #[test]
+    fn test_meeting_all_gold_requirements_returns_tier_three() {
+        let f = QualityFixture::setup();
+        let mentor = Address::generate(&f.base.env);
+        f.base.fund(&mentor, 2_000);
+        // 4.8/5.0 rating, 50 completed sessions — meets Gold's 4.5/50 bar.
+        f.set_quality(&mentor, 480, 50);
+
+        f.base.client().stake(&mentor, &2_000, &30);
+
+        assert_eq!(f.base.client().get_tier(&mentor), 3);
+    }
+
+    #[test]
+    fn test_gold_stake_with_silver_quality_downgrades_tier() {
+        let f = QualityFixture::setup();
+        let mentor = Address::generate(&f.base.env);
+        f.base.fund(&mentor, 2_000);
+        // Meets Silver's rating/session bar (4.0/10) but not Gold's (4.5/50).
+        f.set_quality(&mentor, 400, 10);
+
+        f.base.client().stake(&mentor, &2_000, &30);
+
+        assert_eq!(f.base.client().get_tier(&mentor), 2);
+    }
+
+    #[test]
+    fn test_set_tier_requirements_allows_governance_to_adjust_thresholds() {
+        let f = QualityFixture::setup();
+        let mentor = Address::generate(&f.base.env);
+        f.base.fund(&mentor, 1_000);
+        f.set_quality(&mentor, 480, 50);
+
+        let mut reqs = f.base.client().get_tier_requirements();
+        assert_eq!(reqs.gold_stake, 2_000);
+        // Lower Gold's stake bar so 1_000 now qualifies.
+        reqs.gold_stake = 1_000;
+        f.base.client().set_tier_requirements(&f.base.admin, &reqs);
+        assert_eq!(f.base.client().get_tier_requirements().gold_stake, 1_000);
+
+        f.base.client().stake(&mentor, &1_000, &30);
+        assert_eq!(f.base.client().get_tier(&mentor), 3);
+    }
+
+    #[test]
+    fn test_integration_gold_amount_fifty_sessions_rating_4_8_yields_tier_three() {
+        let f = QualityFixture::setup();
+        let mentor = Address::generate(&f.base.env);
+        f.base.fund(&mentor, 2_000);
+        f.set_quality(&mentor, 480, 50);
+
+        f.base.client().stake(&mentor, &2_000, &30);
+
+        let record = f.base.client().get_stake(&mentor);
+        assert_eq!(record.tier, 3);
+        assert_eq!(f.base.client().get_tier(&mentor), 3);
+    }
+
+    #[test]
+    fn test_without_reputation_configured_falls_back_to_stake_only_tier() {
+        // Backwards compatibility: an unconfigured deployment behaves like
+        // the pre-#762 stake-only tiering.
+        let f = Fixture::setup();
+        let mentor = Address::generate(&f.env);
+        f.fund(&mentor, 2_000);
+
+        f.client().stake(&mentor, &2_000, &30);
+
+        assert_eq!(f.client().get_tier(&mentor), 3);
     }
 }

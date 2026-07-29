@@ -10,6 +10,7 @@ use soroban_sdk::contracterror;
 pub mod disaster_recovery;
 pub mod escrow;
 pub mod events;
+pub mod gas_estimation;
 pub mod pause_guard;
 pub mod reentrancy_guard;
 pub mod sig_validation;
@@ -25,6 +26,7 @@ pub use disaster_recovery::{
     StateVerificationReport, EMERGENCY_SIGNERS, EMERGENCY_THRESHOLD, MAX_SNAPSHOTS,
 };
 pub use escrow::{EscrowRecord, EscrowStatus};
+pub use gas_estimation::GasEstimate;
 pub use pause_guard::{ContractPaused, is_paused, require_not_paused};
 pub use reentrancy_guard::ReentrancyGuard;
 pub use sig_validation::{
