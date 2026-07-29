@@ -29,6 +29,10 @@ mentorminds-insurance = { path = "../contracts/insurance", features = ["testutil
 mentorminds-referral = { path = "../contracts/referral", features = ["testutils"] }
 payment_router = { path = "../contracts/payment_router", features = ["testutils"] }
 mentorminds-snapshot = { path = "../contracts/snapshot", features = ["testutils"] }
+mentorminds-multisig = { path = "../multisig", features = ["testutils"] }
+mentorminds-rbac = { path = "../contracts/rbac", features = ["testutils"] }
+mentorminds-performance-bond = { path = "../contracts/performance_bond", features = ["testutils"] }
+mentorminds-subscription = { path = "../contracts/subscription", features = ["testutils"] }
 
 [dev-dependencies]
 
@@ -81,5 +85,9 @@ name = "disaster_recovery"
 path = "disaster_recovery.rs"
 
 [[test]]
-name = "dispute_flow"
-path = "dispute_flow.rs"
+name = "security_regression"
+path = "security_regression.rs"
+
+[[test]]
+name = "protocol_params_integration"
+path = "protocol_params_integration.rs"
