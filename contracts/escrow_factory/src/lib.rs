@@ -7,6 +7,7 @@ use soroban_sdk::xdr::ToXdr;
 
 // Pull in the shared signature-validation utilities.
 use shared::sig_validation::{current_nonce, validate_and_consume_nonce, MetaTxAction, MetaTxPayload};
+use shared::GasEstimate;
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -35,6 +36,15 @@ const SESSION_NONCE: Symbol = symbol_short!("SESS_NCE");
 const INTERFACE_REGISTRY: Symbol = symbol_short!("IF_REG");
 const FACTORY_TTL_THRESHOLD: u32 = 500_000;
 const FACTORY_TTL_BUMP: u32 = 1_000_000;
+
+// ---------------------------------------------------------------------------
+// Gas-estimation heuristic constants (#761). Calibrated against
+// `env.budget().cpu_instruction_cost()` measured around a real
+// `deploy_escrow` call in the estimate-vs-actual test.
+// ---------------------------------------------------------------------------
+const DEPLOY_BASE_INSTRUCTIONS: u64 = 40_000;
+const DEPLOY_PER_STORAGE_OP_INSTRUCTIONS: u64 = 2_000;
+const DEPLOY_PER_CROSS_CALL_INSTRUCTIONS: u64 = 230_000;
 
 // ---------------------------------------------------------------------------
 // Timestamp security constants
@@ -477,6 +487,51 @@ impl EscrowFactory {
         address
     }
 
+    /// Heuristic instruction/IO estimate for `deploy_escrow`, without
+    /// deploying anything. Mirrors the real flow's fixed reads/writes
+    /// (nonce, session mapping, implementation, escrow count, list entry)
+    /// and cross-contract calls (proxy deployment, `initialize`,
+    /// `create_escrow`), then adds the optional pause-guardian /
+    /// anomaly-detector / interface-registry checks based on *current
+    /// storage state* — i.e. whichever of those integrations are actually
+    /// configured right now.
+    pub fn estimate_deploy_escrow_cost(env: Env) -> GasEstimate {
+        // deploy_escrow's own reads: BYPASS_ANOMALY, session-exists check,
+        // IMPLEMENTATION, nonce, ESCROW_COUNT.
+        let mut storage_reads: u32 = 5;
+        // deploy_escrow's own writes: nonce, session mapping, ESCROW_COUNT,
+        // list entry.
+        let storage_writes: u32 = 4;
+        // deploy_escrow's own cross-contract calls: minimal-proxy deploy,
+        // initialize, create_escrow.
+        let mut cross_contract_calls: u32 = 3;
+
+        if env.storage().persistent().has(&PAUSE_GUARDIAN) {
+            storage_reads += 1;
+            cross_contract_calls += 1; // is_paused check
+        }
+        let bypass: bool = env.storage().persistent().get(&BYPASS_ANOMALY).unwrap_or(false);
+        if !bypass && env.storage().persistent().has(&ANOMALY_DETECTOR) {
+            storage_reads += 1;
+            cross_contract_calls += 1; // check_anomaly
+        }
+        if env.storage().persistent().has(&INTERFACE_REGISTRY) {
+            storage_reads += 1;
+            cross_contract_calls += 1; // register_interface
+        }
+
+        let base_instructions = DEPLOY_BASE_INSTRUCTIONS
+            + (storage_reads as u64 + storage_writes as u64) * DEPLOY_PER_STORAGE_OP_INSTRUCTIONS
+            + (cross_contract_calls as u64) * DEPLOY_PER_CROSS_CALL_INSTRUCTIONS;
+
+        GasEstimate {
+            base_instructions,
+            storage_reads,
+            storage_writes,
+            cross_contract_calls,
+        }
+    }
+
     /// Get escrow address by session ID
     pub fn get_escrow_address(env: Env, session_id: Symbol) -> Option<Address> {
         let session_key = (ESCROW_MAPPING, session_id);
@@ -580,11 +635,6 @@ impl EscrowFactory {
             .persistent()
             .get(&IMPLEMENTATION)
             .expect("Implementation not set")
-    }
-
-    /// Get admin address
-    pub fn get_admin(env: Env) -> Address {
-        Self::admin(&env)
     }
 
     /// Get total escrow count
@@ -759,6 +809,13 @@ impl EscrowFactory {
             .persistent()
             .extend_ttl(&ADMIN, FACTORY_TTL_THRESHOLD, FACTORY_TTL_BUMP);
         admin
+    }
+
+    fn require_admin(env: &Env, caller: &Address) {
+        caller.require_auth();
+        if *caller != Self::admin(env) {
+            panic!("Unauthorized");
+        }
     }
 }
 
