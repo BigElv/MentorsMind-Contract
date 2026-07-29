@@ -40,6 +40,10 @@ const SUBMISSION_COOLDOWN_SECS: u64 = 3_600;
 /// 24 hours.
 const MIN_RESOLUTION_DELAY_SECS: u64 = 24 * 60 * 60;
 
+/// Appeal period after an original resolution during which an appeal may be
+/// submitted and a second arbitrator may override the decision.
+const APPEAL_PERIOD_SECS: u64 = 72 * 3600;
+
 // ─── Domain types ─────────────────────────────────────────────────────────────
 
 #[contracttype]
@@ -106,6 +110,9 @@ pub struct DisputeResolution {
     pub release_to_mentor: bool,
     pub note: Symbol,
     pub resolved_at: u64,
+    /// Merkle root of the evidence set at the time of ruling, binding the
+    /// resolution to a specific evidence set for tamper-evident audit.
+    pub evidence_root: BytesN<32>,
 }
 
 #[contracttype]
@@ -125,14 +132,31 @@ pub enum DataKey {
     CooldownEnabled,
     AnomalyDetector,
     BypassAnomalyCheck,
-    /// Optional `health_dashboard` contract address notified of dispute
-    /// lifecycle events (opened / resolved) for platform analytics (#760).
-    HealthDashboard,
+    /// Merkle root of the evidence set for a given escrow. Updated on every
+    /// evidence submission for tamper-evident integrity.
+    EvidenceRoot(u64),
+    /// Address of the governance contract used to select appeal arbitrators.
+    GovernanceContract,
+    /// Appeal deadline for a dispute resolution.
+    AppealPeriodEnds(u64),
+    /// Number of appeals submitted for a dispute.
+    AppealCount(u64),
+    /// Selected appeal arbitrator for a dispute.
+    AppealArbitrator(u64),
+    /// Optional hash explaining why the appellant requested an appeal.
+    AppealReasonHash(u64),
 }
 
 #[contractclient(name = "EscrowContractClient")]
 pub trait EscrowContractTrait {
     fn get_escrow(env: Env, escrow_id: u64) -> Escrow;
+}
+
+#[contractclient(name = "GovernanceContractClient")]
+pub trait GovernanceContractTrait {
+    fn select_arbitrator(env: Env, dispute_id: u64) -> Address;
+    fn get_arbitrator_count(env: Env) -> u32;
+    fn list_arbitrators_page(env: Env, offset: u32, limit: u32) -> Vec<Address>;
 }
 
 #[contracterror]
@@ -157,6 +181,12 @@ pub enum Error {
     /// The same submitter already submitted this exact `content_hash` for
     /// this escrow — duplicate commitments are rejected.
     DuplicateContentHash     = 11,
+    /// An appeal deadline has already passed.
+    AppealPeriodExpired      = 12,
+    /// Only one appeal is allowed per dispute.
+    AppealAlreadySubmitted   = 13,
+    /// A governance contract has not been configured for appeal arbitration.
+    GovernanceContractNotConfigured = 14,
 }
 
 #[contract]
@@ -191,6 +221,18 @@ impl DisputeEvidenceContract {
         env.storage()
             .instance()
             .set(&DataKey::EscrowContract, &escrow_contract);
+        Ok(())
+    }
+
+    pub fn set_governance_contract(
+        env: Env,
+        admin: Address,
+        governance_contract: Address,
+    ) -> Result<(), Error> {
+        Self::require_admin(&env, &admin)?;
+        env.storage()
+            .instance()
+            .set(&DataKey::GovernanceContract, &governance_contract);
         Ok(())
     }
 
@@ -377,8 +419,23 @@ impl DisputeEvidenceContract {
         };
         evidence.push_back(item.clone());
         env.storage().persistent().set(&key, &evidence);
+
+        // Compute and store Merkle root over the entire evidence set.
+        let root = Self::compute_evidence_root(&env, &evidence);
+        env.storage()
+            .persistent()
+            .set(&DataKey::EvidenceRoot(escrow_id), &root);
+
         env.events()
             .publish((Symbol::new(&env, "evidence_submitted"), escrow_id), item);
+        env.events().publish(
+            (
+                Symbol::new(&env, "evidence_root_updated"),
+                escrow_id,
+                evidence.len(),
+            ),
+            root.clone(),
+        );
         Ok(())
     }
 
@@ -421,6 +478,7 @@ impl DisputeEvidenceContract {
         env: Env,
         escrow_id: u64,
         arbitrator: Address,
+        is_appeal: bool,
         release_to_mentor: bool,
         note: Symbol,
     ) -> Result<(), Error> {
@@ -448,44 +506,69 @@ impl DisputeEvidenceContract {
         }
 
         let key = DataKey::Resolution(escrow_id);
-        if env.storage().persistent().has(&key) {
-            return Err(Error::AlreadyResolved);
+        if is_appeal && !env.storage().persistent().has(&key) {
+            return Err(Error::InvalidEscrowState);
         }
-
-        // Time-lock: enforce minimum deliberation period.
-        let opened_at_opt: Option<u64> = env
-            .storage()
-            .persistent()
-            .get(&DataKey::DisputeOpenedAt(escrow_id));
-        if let Some(opened_at) = opened_at_opt {
-            let earliest_resolution = opened_at.saturating_add(MIN_RESOLUTION_DELAY_SECS);
-            if env.ledger().timestamp() < earliest_resolution {
-                return Err(Error::ResolutionTimelockActive);
+        if env.storage().persistent().has(&key) {
+            if !is_appeal {
+                return Err(Error::AlreadyResolved);
+            }
+            let appeal_count: u32 = env
+                .storage()
+                .persistent()
+                .get(&DataKey::AppealCount(escrow_id))
+                .unwrap_or(0);
+            if appeal_count == 0 {
+                return Err(Error::InvalidEscrowState);
+            }
+            let appeal_arbitrator: Address = env
+                .storage()
+                .persistent()
+                .get(&DataKey::AppealArbitrator(escrow_id))
+                .expect("appeal arbitrator missing");
+            if appeal_arbitrator != arbitrator {
+                return Err(Error::Unauthorized);
+            }
+            let appeal_deadline: u64 = env
+                .storage()
+                .persistent()
+                .get(&DataKey::AppealPeriodEnds(escrow_id))
+                .expect("appeal deadline missing");
+            if env.ledger().timestamp() > appeal_deadline {
+                return Err(Error::AppealPeriodExpired);
             }
         }
 
-        let resolved_at = env.ledger().timestamp();
+        // Time-lock: enforce minimum deliberation period for original resolutions.
+        if !is_appeal {
+            if let Some(opened_at) = env
+                .storage()
+                .persistent()
+                .get::<_, u64>(&DataKey::DisputeOpenedAt(escrow_id))
+            {
+                let earliest_resolution = opened_at.saturating_add(MIN_RESOLUTION_DELAY_SECS);
+                if env.ledger().timestamp() < earliest_resolution {
+                    return Err(Error::ResolutionTimelockActive);
+                }
+            }
+        }
+
+        let evidence_root = Self::get_evidence_root(env.clone(), escrow_id);
+
         let resolution = DisputeResolution {
             arbitrator: arbitrator.clone(),
             release_to_mentor,
             note: note.clone(),
-            resolved_at,
+            resolved_at: env.ledger().timestamp(),
+            evidence_root,
         };
         env.storage().persistent().set(&key, &resolution);
 
-        if let Some(dashboard) = env
-            .storage()
-            .instance()
-            .get::<_, Address>(&DataKey::HealthDashboard)
-        {
-            let resolution_time_secs = opened_at_opt
-                .map(|opened_at| resolved_at.saturating_sub(opened_at))
-                .unwrap_or(0);
-            env.invoke_contract::<()>(
-                &dashboard,
-                &Symbol::new(&env, "record_resolution"),
-                (escrow_id, release_to_mentor, resolution_time_secs).into_val(&env),
-            );
+        if !is_appeal {
+            let appeal_deadline = resolution.resolved_at.saturating_add(APPEAL_PERIOD_SECS);
+            env.storage()
+                .persistent()
+                .set(&DataKey::AppealPeriodEnds(escrow_id), &appeal_deadline);
         }
 
         env.events().publish(
@@ -500,6 +583,176 @@ impl DisputeEvidenceContract {
             .persistent()
             .get(&DataKey::Resolution(escrow_id))
             .expect("resolution not found")
+    }
+
+    /// Compute a sequential Merkle root over the evidence set:
+    /// `sha256(sha256(item_1) || sha256(item_2) || ... || sha256(item_n))`
+    fn compute_evidence_root(env: &Env, evidence: &Vec<EvidenceItem>) -> BytesN<32> {
+        use soroban_sdk::crypto::sha256;
+
+        // Hash each evidence item individually, then concatenate and hash the
+        // result to produce a single root commitment.
+        let mut combined = soroban_sdk::Bytes::new(env);
+        for item in evidence.iter() {
+            let mut item_bytes = soroban_sdk::Bytes::new(env);
+            // Include content_hash + evidence_uri_hash + submitted_at in the
+            // item leaf so any field modification invalidates the root.
+            item_bytes.extend_from_slice(&item.content_hash.to_bytes());
+            item_bytes.extend_from_slice(&item.evidence_uri_hash.to_bytes());
+            item_bytes.extend_from_array(&item.submitted_at.to_be_bytes());
+            let leaf = sha256(&item_bytes);
+            combined.extend_from_slice(&leaf.to_bytes());
+        }
+
+        if combined.len() == 0 {
+            // Empty set → zero root.
+            return BytesN::from_array(env, &[0u8; 32]);
+        }
+
+        sha256(&combined)
+    }
+
+    /// Return the stored Merkle root for `escrow_id`, or zero if no evidence
+    /// has been submitted.
+    pub fn get_evidence_root(env: Env, escrow_id: u64) -> BytesN<32> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::EvidenceRoot(escrow_id))
+            .unwrap_or_else(|| BytesN::from_array(&env, &[0u8; 32]))
+    }
+
+    pub fn get_appeal_arbitrator(env: Env, escrow_id: u64) -> Option<Address> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::AppealArbitrator(escrow_id))
+    }
+
+    pub fn get_appeal_reason_hash(env: Env, escrow_id: u64) -> Option<BytesN<32>> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::AppealReasonHash(escrow_id))
+    }
+
+    pub fn get_appeal_deadline(env: Env, escrow_id: u64) -> Option<u64> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::AppealPeriodEnds(escrow_id))
+    }
+
+    /// Recompute the Merkle root from the provided items and compare to the
+    /// stored root. Returns `true` if they match, `false` otherwise.
+    pub fn verify_evidence_set(
+        env: Env,
+        escrow_id: u64,
+        items: Vec<EvidenceItem>,
+    ) -> bool {
+        let stored_root = Self::get_evidence_root(env.clone(), escrow_id);
+        let computed_root = Self::compute_evidence_root(&env, &items);
+        stored_root == computed_root
+    }
+
+    pub fn submit_appeal_for_dispute(
+        env: Env,
+        appellant: Address,
+        escrow_id: u64,
+        reason_hash: BytesN<32>,
+    ) -> Result<(), Error> {
+        appellant.require_auth();
+
+        let escrow = Self::load_escrow(&env, escrow_id);
+        if escrow.status != EscrowStatus::Disputed {
+            return Err(Error::InvalidEscrowState);
+        }
+        if appellant != escrow.mentor && appellant != escrow.learner {
+            return Err(Error::Unauthorized);
+        }
+
+        let resolution: DisputeResolution = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Resolution(escrow_id))
+            .expect("resolution not found");
+
+        let appeal_deadline: u64 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::AppealPeriodEnds(escrow_id))
+            .expect("appeal deadline not set");
+        if env.ledger().timestamp() > appeal_deadline {
+            return Err(Error::AppealPeriodExpired);
+        }
+
+        let appeal_count: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::AppealCount(escrow_id))
+            .unwrap_or(0);
+        if appeal_count >= 1 {
+            return Err(Error::AppealAlreadySubmitted);
+        }
+
+        let governance: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::GovernanceContract)
+            .ok_or(Error::GovernanceContractNotConfigured)?;
+        let appeal_arbitrator = Self::select_appeal_arbitrator(&env, &governance, escrow_id, &resolution.arbitrator)?;
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::AppealCount(escrow_id), &1u32);
+        env.storage()
+            .persistent()
+            .set(&DataKey::AppealArbitrator(escrow_id), &appeal_arbitrator);
+        env.storage()
+            .persistent()
+            .set(&DataKey::AppealReasonHash(escrow_id), &reason_hash);
+
+        let appeal_deadline: u64 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::AppealPeriodEnds(escrow_id))
+            .expect("appeal deadline not set");
+
+        env.events().publish(
+            (Symbol::new(&env, "dispute_appealed"), escrow_id),
+            (appellant, appeal_arbitrator.clone(), appeal_deadline),
+        );
+        Ok(())
+    }
+
+    fn select_appeal_arbitrator(
+        env: &Env,
+        governance: &Address,
+        dispute_id: u64,
+        original_arbitrator: &Address,
+    ) -> Result<Address, Error> {
+        let mut candidate: Address = GovernanceContractClient::new(env, governance)
+            .select_arbitrator(&dispute_id);
+        if &candidate != original_arbitrator {
+            return Ok(candidate);
+        }
+
+        let count = GovernanceContractClient::new(env, governance).get_arbitrator_count();
+        if count <= 1 {
+            return Err(Error::NoAlternativeArbitrator);
+        }
+
+        // Try to find the next arbitrator by scanning the list.
+        let mut offset = 0;
+        while offset < count {
+            let list = GovernanceContractClient::new(env, governance)
+                .list_arbitrators_page(&offset, &1);
+            if let Some(addr) = list.get(0) {
+                let addr = addr.clone();
+                if &addr != original_arbitrator {
+                    return Ok(addr);
+                }
+            }
+            offset += 1;
+        }
+
+        Err(Error::NoAlternativeArbitrator)
     }
 
     fn require_admin(env: &Env, admin: &Address) -> Result<(), Error> {
@@ -532,6 +785,7 @@ mod tests {
     use super::*;
     use soroban_sdk::{
         contractimpl,
+        symbol_short,
         testutils::{Address as _, Events, Ledger, LedgerInfo},
         IntoVal, TryFromVal,
     };
@@ -581,6 +835,156 @@ mod tests {
         client.initialize(&admin, &escrow_contract);
         let escrow = EscrowContractClient::new(&env, &escrow_contract).get_escrow(&1);
         (env, admin, escrow.mentor, escrow.learner, client)
+    }
+
+    #[contract]
+    struct MockGovernance;
+
+    #[contractimpl]
+    impl MockGovernance {
+        pub fn initialize(env: Env, arbitrators: Vec<Address>) {
+            env.storage()
+                .persistent()
+                .set(&symbol_short!("ARBITS"), &arbitrators);
+            env.storage()
+                .persistent()
+                .set(&symbol_short!("ARB_COUNT"), &arbitrators.len());
+        }
+
+        pub fn select_arbitrator(env: Env, dispute_id: u64) -> Address {
+            let arbitrators: Vec<Address> = env
+                .storage()
+                .persistent()
+                .get(&symbol_short!("ARBITS"))
+                .expect("no arbitrators configured");
+            let count = arbitrators.len();
+            let idx = (dispute_id % (count as u64)) as u32;
+            arbitrators
+                .get(idx)
+                .expect("arbitrator index out of range")
+                .clone()
+        }
+
+        pub fn get_arbitrator_count(env: Env) -> u32 {
+            env.storage()
+                .persistent()
+                .get(&symbol_short!("ARB_COUNT"))
+                .unwrap_or(0)
+        }
+
+        pub fn list_arbitrators_page(env: Env, offset: u32, limit: u32) -> Vec<Address> {
+            let arbitrators: Vec<Address> = env
+                .storage()
+                .persistent()
+                .get(&symbol_short!("ARBITS"))
+                .unwrap_or(Vec::new(&env));
+            let mut out = Vec::new(&env);
+            let end = (offset + limit).min(arbitrators.len());
+            for i in offset..end {
+                out.push_back(arbitrators.get(i).unwrap().clone());
+            }
+            out
+        }
+    }
+
+    fn setup_disputed_with_governance(
+        env: &Env,
+        client: &DisputeEvidenceContractClient<'_>,
+        admin: &Address,
+    ) -> Address {
+        let governance_contract = env.register_contract(None, MockGovernance);
+        let governance_client = MockGovernanceClient::new(env, &governance_contract);
+        let arb1 = Address::generate(env);
+        let arb2 = Address::generate(env);
+        let arb3 = Address::generate(env);
+        let mut arbitrators = Vec::new(env);
+        arbitrators.push_back(arb1.clone());
+        arbitrators.push_back(arb2.clone());
+        arbitrators.push_back(arb3.clone());
+        governance_client.initialize(&arbitrators);
+        client
+            .set_governance_contract(admin, &governance_contract)
+            .unwrap();
+        governance_contract
+    }
+
+    #[test]
+    fn submit_appeal_creates_appeal_record_and_emits_event() {
+        let (env, admin, mentor, _learner, client) = setup_disputed();
+        let governance_contract = setup_disputed_with_governance(&env, &client, &admin);
+        let arb = Address::generate(&env);
+
+        client.record_dispute_opened(&1).unwrap();
+        advance_time(&env, MIN_RESOLUTION_DELAY_SECS + 1);
+        client
+            .submit_resolution(&1, &arb, &true, &Symbol::new(&env, "mentor_wins"))
+            .unwrap();
+
+        let appeal_reason = hash32(&env, 77);
+        let result = client.try_submit_appeal_for_dispute(&mentor, &1, &appeal_reason);
+        assert!(result.is_ok(), "appeal submission should succeed");
+
+        let appeal_arbitrator = client.get_appeal_arbitrator(&1).expect("appeal arbitrator set");
+        assert_ne!(appeal_arbitrator, arb, "appeal arbitrator must be different from original");
+        assert_eq!(client.get_appeal_reason_hash(&1).unwrap(), appeal_reason);
+        assert!(client.get_appeal_deadline(&1).is_some());
+
+        let events = env.events().all();
+        let last = events.last().unwrap();
+        assert_eq!(last.1, (Symbol::new(&env, "dispute_appealed"), 1u64).into_val(&env));
+    }
+
+    #[test]
+    fn submit_appeal_after_deadline_fails() {
+        let (env, admin, mentor, _learner, client) = setup_disputed();
+        let _governance_contract = setup_disputed_with_governance(&env, &client, &admin);
+        let arb = Address::generate(&env);
+
+        client.record_dispute_opened(&1).unwrap();
+        advance_time(&env, MIN_RESOLUTION_DELAY_SECS + 1);
+        client
+            .submit_resolution(&1, &arb, &true, &Symbol::new(&env, "mentor_wins"))
+            .unwrap();
+
+        let deadline = client.get_appeal_deadline(&1).unwrap();
+        advance_time(&env, deadline.saturating_sub(env.ledger().timestamp()) + 1);
+
+        let result = client.try_submit_appeal_for_dispute(&mentor, &1, &hash32(&env, 78));
+        assert!(result.is_err(), "appeal after deadline should fail");
+    }
+
+    #[test]
+    fn submit_appeal_without_governance_fails() {
+        let (env, _admin, mentor, _learner, client) = setup_disputed();
+        let arb = Address::generate(&env);
+
+        client.record_dispute_opened(&1).unwrap();
+        advance_time(&env, MIN_RESOLUTION_DELAY_SECS + 1);
+        client
+            .submit_resolution(&1, &arb, &true, &Symbol::new(&env, "mentor_wins"))
+            .unwrap();
+
+        let result = client.try_submit_appeal_for_dispute(&mentor, &1, &hash32(&env, 79));
+        assert!(result.is_err(), "appeal without governance contract should fail");
+    }
+
+    #[test]
+    fn second_appeal_submission_is_rejected() {
+        let (env, admin, mentor, _learner, client) = setup_disputed();
+        let _governance_contract = setup_disputed_with_governance(&env, &client, &admin);
+        let arb = Address::generate(&env);
+
+        client.record_dispute_opened(&1).unwrap();
+        advance_time(&env, MIN_RESOLUTION_DELAY_SECS + 1);
+        client
+            .submit_resolution(&1, &arb, &true, &Symbol::new(&env, "mentor_wins"))
+            .unwrap();
+
+        client
+            .submit_appeal_for_dispute(&mentor, &1, &hash32(&env, 80))
+            .unwrap();
+        let result = client.try_submit_appeal_for_dispute(&mentor, &1, &hash32(&env, 81));
+        assert!(result.is_err(), "second appeal submission must be rejected");
     }
 
     /// Build a distinct, non-zero 32-byte hash for tests, seeded by `seed`.
@@ -1040,5 +1444,113 @@ mod tests {
             dashboard_client.get_resolution_call(&1).unwrap();
         assert!(release_to_mentor);
         assert_eq!(resolution_time_secs, MIN_RESOLUTION_DELAY_SECS + 500);
+    }
+
+    // ─── #781: Merkle evidence root ───────────────────────────────────────
+
+    #[test]
+    fn evidence_root_is_zero_before_any_submission() {
+        let (_env, _admin, _mentor, _learner, client) = setup_disputed();
+        let root = client.get_evidence_root(&1);
+        assert_eq!(root, BytesN::from_array(&_env, &[0u8; 32]));
+    }
+
+    #[test]
+    fn evidence_root_changes_after_each_submission() {
+        let (env, admin, mentor, _learner, client) = setup_disputed();
+        client.set_cooldown_enabled(&admin, &false).unwrap();
+
+        let root0 = client.get_evidence_root(&1);
+
+        client
+            .submit_evidence(&1, &mentor, &hash32(&env, 1), &hash32(&env, 2), &None)
+            .unwrap();
+        let root1 = client.get_evidence_root(&1);
+        assert_ne!(root0, root1, "root must change after first submission");
+
+        client
+            .submit_evidence(&1, &mentor, &hash32(&env, 3), &hash32(&env, 4), &None)
+            .unwrap();
+        let root2 = client.get_evidence_root(&1);
+        assert_ne!(root1, root2, "root must change after second submission");
+    }
+
+    #[test]
+    fn verify_evidence_set_returns_true_for_exact_set() {
+        let (env, admin, mentor, learner, client) = setup_disputed();
+        client.set_cooldown_enabled(&admin, &false).unwrap();
+
+        client
+            .submit_evidence(&1, &mentor, &hash32(&env, 1), &hash32(&env, 2), &None)
+            .unwrap();
+        client
+            .submit_evidence(&1, &learner, &hash32(&env, 3), &hash32(&env, 4), &None)
+            .unwrap();
+
+        let items = client.get_evidence(&1);
+        assert!(client.verify_evidence_set(&1, &items));
+    }
+
+    #[test]
+    fn verify_evidence_set_returns_false_for_tampered_item() {
+        let (env, admin, mentor, learner, client) = setup_disputed();
+        client.set_cooldown_enabled(&admin, &false).unwrap();
+
+        client
+            .submit_evidence(&1, &mentor, &hash32(&env, 1), &hash32(&env, 2), &None)
+            .unwrap();
+        client
+            .submit_evidence(&1, &learner, &hash32(&env, 3), &hash32(&env, 4), &None)
+            .unwrap();
+
+        let mut items = client.get_evidence(&1);
+        // Tamper with the first item's content_hash.
+        let mut tampered = items.get(0).unwrap();
+        tampered.content_hash = hash32(&env, 99);
+        items.set(0, tampered);
+
+        assert!(
+            !client.verify_evidence_set(&1, &items),
+            "tampered evidence must fail verification"
+        );
+    }
+
+    #[test]
+    fn resolution_records_evidence_root_at_time_of_ruling() {
+        let (env, admin, mentor, _learner, client) = setup_disputed();
+        client.set_cooldown_enabled(&admin, &false).unwrap();
+
+        client
+            .submit_evidence(&1, &mentor, &hash32(&env, 1), &hash32(&env, 2), &None)
+            .unwrap();
+        let root_at_ruling = client.get_evidence_root(&1);
+
+        let arb = Address::generate(&env);
+        client.record_dispute_opened(&1).unwrap();
+        advance_time(&env, MIN_RESOLUTION_DELAY_SECS + 1);
+        client
+            .submit_resolution(&1, &arb, &true, &Symbol::new(&env, "ok"))
+            .unwrap();
+
+        let resolution = client.get_resolution(&1);
+        assert_eq!(
+            resolution.evidence_root, root_at_ruling,
+            "resolution must capture the evidence root at time of ruling"
+        );
+    }
+
+    #[test]
+    fn evidence_root_updated_event_emitted() {
+        let (env, _admin, mentor, _learner, client) = setup_disputed();
+        client
+            .submit_evidence(&1, &mentor, &hash32(&env, 1), &hash32(&env, 2), &None)
+            .unwrap();
+        let events = env.events().all();
+        // Look for the evidence_root_updated event (second event emitted)
+        let found = events.iter().any(|e| {
+            // Topics are (event_name, escrow_id, item_count)
+            e.1 == (Symbol::new(&env, "evidence_root_updated"), 1u64, 1u32).into_val(&env)
+        });
+        assert!(found, "evidence_root_updated event must be emitted");
     }
 }

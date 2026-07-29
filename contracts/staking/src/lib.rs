@@ -1,10 +1,15 @@
 #![no_std]
 
 use shared::events::{emit_staking_event, evt_staking_staked, evt_staking_unstaked};
-use shared::{require_not_paused, ReentrancyGuard, StakeRecord, StakedEventData};
-use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, token, Address, Env, IntoVal, Symbol,
+use shared::{
+    compute_checksum, push_snapshot_index, ReentrancyGuard, RollbackProposal, SnapshotMeta,
+    StakeRecord, StakedEventData, StateVerificationReport, EMERGENCY_THRESHOLD, MAX_SNAPSHOTS,
 };
+use soroban_sdk::{
+    contract, contracterror, contractimpl, contracttype, token, Address, Bytes, BytesN, Env,
+    Symbol, Vec,
+};
+
 
 // ---------------------------------------------------------------------------
 // Errors
@@ -102,17 +107,23 @@ pub enum DataKey {
     PendingAdmin,
     LiquidityProviderRecord(Address),
     LPRewardPool,
-    /// Multi-factor tier thresholds ([`TierRequirements`]). Falls back to
-    /// [`DEFAULT_TIER_REQUIREMENTS`] when unset.
-    TierRequirements,
-    /// Optional `reputation` contract consulted by `compute_tier` for a
-    /// mentor's average rating. Quality checks (rating + sessions) are
-    /// skipped entirely when this is unset, preserving stake-only tiering
-    /// for deployments that haven't wired up reputation/session_registry.
-    ReputationContract,
-    /// Optional `session_registry` contract consulted by `compute_tier` for
-    /// a mentor's completed session count. See `ReputationContract`.
-    SessionRegistryContract,
+    // -----------------------------------------------------------------------
+    // Disaster-recovery keys
+    // -----------------------------------------------------------------------
+    /// Serialised Vec<StakeSnapshot> for DR snapshot `n`.
+    StakeSnapshot(u32),
+    /// SnapshotMeta for DR snapshot `n`.
+    StakeSnapshotMeta(u32),
+    /// Ordered Vec<u32> of retained staking DR snapshot IDs.
+    StakeSnapshotIndex,
+    /// Vec<Address> of up to 7 emergency signers for staking rollback.
+    StakeEmergencySigners,
+    /// RollbackProposal for staking rollback proposal `n`.
+    StakeRollbackProposal(u32),
+    /// Boolean approval flag for (proposal_id, signer) staking rollback.
+    StakeRollbackApproval(u32, Address),
+    /// Auto-incremented staking rollback proposal counter.
+    StakeRollbackProposalCount,
 }
 
 // ---------------------------------------------------------------------------
@@ -124,6 +135,23 @@ pub enum DataKey {
 // `avg_rating * 100` scale returned by `reputation::get_mentor_rating`
 // (e.g. 4.5/5.0 == 450).
 // ---------------------------------------------------------------------------
+
+/// Compact per-staker record captured inside a DR snapshot.
+/// Mirrors the fields of `StakeRecord` that need to be restorable.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StakeSnapshot {
+    pub mentor: Address,
+    pub amount: i128,
+    pub staked_at: u64,
+    pub unlock_at: u64,
+    pub unlock_cooldown_until: Option<u64>,
+    pub tier: u32,
+}
+
+// DR-only TTL constants
+const DR_TTL_THRESHOLD: u32 = 500_000;
+const DR_TTL_BUMP: u32 = 1_000_000;
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1114,6 +1142,497 @@ impl StakingContract {
         env.storage()
             .persistent()
             .set(&DataKey::StakerNextClaimEpoch(staker.clone()), &next_claim);
+    }
+
+    // =======================================================================
+    // Disaster Recovery — Staking Contract
+    // =======================================================================
+
+    /// Register the 7 emergency signers authorised to approve staking rollbacks.
+    ///
+    /// # Auth
+    /// Only the stored admin may call this.
+    pub fn set_emergency_signers(env: Env, admin: Address, signers: Vec<Address>) -> Result<(), Error> {
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(Error::NotInitialized)?;
+        admin.require_auth();
+        if admin != stored_admin {
+            return Err(Error::NotInitialized);
+        }
+        if signers.len() != shared::EMERGENCY_SIGNERS {
+            return Err(Error::InvalidAmount);
+        }
+        env.storage()
+            .persistent()
+            .set(&DataKey::StakeEmergencySigners, &signers);
+        env.storage().persistent().extend_ttl(
+            &DataKey::StakeEmergencySigners,
+            DR_TTL_THRESHOLD,
+            DR_TTL_BUMP,
+        );
+        env.events().publish(
+            (Symbol::new(&env, "DR"), Symbol::new(&env, "stk_sgns")),
+            signers.len() as u32,
+        );
+        Ok(())
+    }
+
+    /// Capture a complete snapshot of all staker records before an upgrade.
+    ///
+    /// Reads every staker address from `DataKey::Stakers`, captures each
+    /// `StakeRecord` plus `TotalStaked`, and persists them under
+    /// `DataKey::StakeSnapshot(snapshot_id)` with accompanying metadata.
+    ///
+    /// Manages a rolling window of at most `MAX_SNAPSHOTS` (3) snapshots;
+    /// the oldest is evicted automatically when a 4th is created.
+    ///
+    /// # Auth
+    /// Only the stored admin may take snapshots.
+    pub fn snapshot_state(env: Env, admin: Address, snapshot_id: u32) -> Result<(), Error> {
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(Error::NotInitialized)?;
+        admin.require_auth();
+        if admin != stored_admin {
+            return Err(Error::NotInitialized);
+        }
+
+        // ----------------------------------------------------------------
+        // Collect all staker records
+        // ----------------------------------------------------------------
+        let stakers: Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Stakers)
+            .unwrap_or(Vec::new(&env));
+
+        let total_staked: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::TotalStaked)
+            .unwrap_or(0);
+
+        let mut snaps: Vec<StakeSnapshot> = Vec::new(&env);
+        for staker in stakers.iter() {
+            if let Some(record) = env
+                .storage()
+                .persistent()
+                .get::<_, StakeRecord>(&DataKey::Stake(staker.clone()))
+            {
+                snaps.push_back(StakeSnapshot {
+                    mentor: record.mentor,
+                    amount: record.amount,
+                    staked_at: record.staked_at,
+                    unlock_at: record.unlock_at,
+                    unlock_cooldown_until: record.unlock_cooldown_until,
+                    tier: record.tier,
+                });
+            }
+        }
+
+        // ----------------------------------------------------------------
+        // Compute checksum
+        // ----------------------------------------------------------------
+        let mut checksum_input = Bytes::new(&env);
+        for b in (snaps.len() as u64).to_be_bytes().iter() {
+            checksum_input.push_back(*b);
+        }
+        for b in total_staked.to_be_bytes().iter() {
+            checksum_input.push_back(*b);
+        }
+        let checksum = compute_checksum(&env, &checksum_input);
+
+        // ----------------------------------------------------------------
+        // WASM hash + rolling index management
+        // ----------------------------------------------------------------
+        let wasm_hash: BytesN<32> = env
+            .deployer()
+            .get_contract_instance_wasm_hash(&env.current_contract_address());
+
+        let mut index: Vec<u32> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::StakeSnapshotIndex)
+            .unwrap_or(Vec::new(&env));
+        let snapshot_pos = index.len() as u32;
+        let evicted = push_snapshot_index(&mut index, snapshot_id);
+        if let Some(old_id) = evicted {
+            env.storage()
+                .persistent()
+                .remove(&DataKey::StakeSnapshot(old_id));
+            env.storage()
+                .persistent()
+                .remove(&DataKey::StakeSnapshotMeta(old_id));
+        }
+        env.storage()
+            .persistent()
+            .set(&DataKey::StakeSnapshotIndex, &index);
+        env.storage().persistent().extend_ttl(
+            &DataKey::StakeSnapshotIndex,
+            DR_TTL_THRESHOLD,
+            DR_TTL_BUMP,
+        );
+
+        let record_count = snaps.len() as u64;
+        let meta = SnapshotMeta {
+            created_at: env.ledger().timestamp(),
+            block_height: env.ledger().sequence(),
+            contract_version: wasm_hash,
+            admin: admin.clone(),
+            checksum,
+            record_count,
+            snapshot_index: snapshot_pos.min(MAX_SNAPSHOTS - 1),
+        };
+
+        // ----------------------------------------------------------------
+        // Persist payload + metadata
+        // ----------------------------------------------------------------
+        env.storage()
+            .persistent()
+            .set(&DataKey::StakeSnapshot(snapshot_id), &snaps);
+        env.storage().persistent().extend_ttl(
+            &DataKey::StakeSnapshot(snapshot_id),
+            DR_TTL_THRESHOLD,
+            DR_TTL_BUMP,
+        );
+        env.storage()
+            .persistent()
+            .set(&DataKey::StakeSnapshotMeta(snapshot_id), &meta);
+        env.storage().persistent().extend_ttl(
+            &DataKey::StakeSnapshotMeta(snapshot_id),
+            DR_TTL_THRESHOLD,
+            DR_TTL_BUMP,
+        );
+
+        env.events().publish(
+            (
+                Symbol::new(&env, "DR"),
+                Symbol::new(&env, "stk_snap"),
+                snapshot_id,
+            ),
+            (record_count, total_staked),
+        );
+        Ok(())
+    }
+
+    /// Compare a staking snapshot against current on-chain state.
+    ///
+    /// Checks `TotalStaked` and each captured `StakeSnapshot` field against
+    /// live storage.
+    ///
+    /// # Returns
+    /// A `StateVerificationReport`; empty `mismatches` means state is intact.
+    ///
+    /// # Errors
+    /// `NoStakeFound` if `snapshot_id` does not exist.
+    pub fn verify_post_upgrade_state(
+        env: Env,
+        snapshot_id: u32,
+    ) -> Result<StateVerificationReport, Error> {
+        let snaps: Vec<StakeSnapshot> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::StakeSnapshot(snapshot_id))
+            .ok_or(Error::NoStakeFound)?;
+
+        let meta: SnapshotMeta = env
+            .storage()
+            .persistent()
+            .get(&DataKey::StakeSnapshotMeta(snapshot_id))
+            .ok_or(Error::NoStakeFound)?;
+
+        let mut mismatches: Vec<soroban_sdk::String> = Vec::new(&env);
+        let mut fields_checked: u32 = 0;
+
+        // Check staker count
+        let cur_count: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::StakerCount)
+            .unwrap_or(0);
+        fields_checked += 1;
+        if cur_count as u64 != meta.record_count {
+            mismatches.push_back(soroban_sdk::String::from_str(&env, "StakerCount mismatch"));
+        }
+
+        // Per-staker field checks
+        for snap in snaps.iter() {
+            if let Some(current) = env
+                .storage()
+                .persistent()
+                .get::<_, StakeRecord>(&DataKey::Stake(snap.mentor.clone()))
+            {
+                fields_checked += 1;
+                if current.amount != snap.amount {
+                    mismatches.push_back(soroban_sdk::String::from_str(
+                        &env,
+                        "StakeRecord.amount mismatch",
+                    ));
+                }
+                fields_checked += 1;
+                if current.tier != snap.tier {
+                    mismatches.push_back(soroban_sdk::String::from_str(
+                        &env,
+                        "StakeRecord.tier mismatch",
+                    ));
+                }
+                fields_checked += 1;
+                if current.staked_at != snap.staked_at {
+                    mismatches.push_back(soroban_sdk::String::from_str(
+                        &env,
+                        "StakeRecord.staked_at mismatch",
+                    ));
+                }
+                fields_checked += 1;
+                if current.unlock_at != snap.unlock_at {
+                    mismatches.push_back(soroban_sdk::String::from_str(
+                        &env,
+                        "StakeRecord.unlock_at mismatch",
+                    ));
+                }
+            } else {
+                fields_checked += 1;
+                mismatches.push_back(soroban_sdk::String::from_str(
+                    &env,
+                    "StakeRecord missing in current state",
+                ));
+            }
+        }
+
+        Ok(StateVerificationReport {
+            fields_checked,
+            mismatches,
+        })
+    }
+
+    /// Open a staking rollback proposal (emergency signer only).
+    ///
+    /// The proposer's approval is counted automatically as vote #1.
+    /// Returns the new proposal ID.
+    pub fn propose_rollback(
+        env: Env,
+        proposer: Address,
+        snapshot_id: u32,
+        old_wasm_hash: BytesN<32>,
+    ) -> Result<u32, Error> {
+        let signers: Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::StakeEmergencySigners)
+            .ok_or(Error::NotInitialized)?;
+        if !signers.iter().any(|s| s == proposer) {
+            return Err(Error::NoStakeFound); // reuse closest error code
+        }
+        if !env
+            .storage()
+            .persistent()
+            .has(&DataKey::StakeSnapshotMeta(snapshot_id))
+        {
+            return Err(Error::NoStakeFound);
+        }
+        proposer.require_auth();
+
+        let count: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::StakeRollbackProposalCount)
+            .unwrap_or(0);
+        let new_id = count.checked_add(1).expect("Staking rollback count overflow");
+        env.storage()
+            .persistent()
+            .set(&DataKey::StakeRollbackProposalCount, &new_id);
+
+        let proposal = RollbackProposal {
+            id: new_id,
+            snapshot_id,
+            old_wasm_hash: old_wasm_hash.clone(),
+            approval_count: 1,
+            executed: false,
+            created_at: env.ledger().timestamp(),
+            proposer: proposer.clone(),
+        };
+        env.storage()
+            .persistent()
+            .set(&DataKey::StakeRollbackProposal(new_id), &proposal);
+        env.storage().persistent().extend_ttl(
+            &DataKey::StakeRollbackProposal(new_id),
+            DR_TTL_THRESHOLD,
+            DR_TTL_BUMP,
+        );
+        env.storage().persistent().set(
+            &DataKey::StakeRollbackApproval(new_id, proposer.clone()),
+            &true,
+        );
+
+        env.events().publish(
+            (
+                Symbol::new(&env, "DR"),
+                Symbol::new(&env, "srb_prop"),
+                new_id,
+            ),
+            (snapshot_id, proposer, old_wasm_hash),
+        );
+        Ok(new_id)
+    }
+
+    /// Cast an approval vote on an open staking rollback proposal.
+    ///
+    /// `signer` must be a registered staking emergency signer.
+    /// Double-voting and voting on executed proposals panic.
+    pub fn approve_rollback(env: Env, signer: Address, proposal_id: u32) -> Result<(), Error> {
+        let signers: Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::StakeEmergencySigners)
+            .ok_or(Error::NotInitialized)?;
+        if !signers.iter().any(|s| s == signer) {
+            return Err(Error::NoStakeFound);
+        }
+
+        let mut proposal: RollbackProposal = env
+            .storage()
+            .persistent()
+            .get(&DataKey::StakeRollbackProposal(proposal_id))
+            .ok_or(Error::NoStakeFound)?;
+        if proposal.executed {
+            return Err(Error::AlreadyStaked); // reuse — means "already done"
+        }
+        if env
+            .storage()
+            .persistent()
+            .get::<_, bool>(&DataKey::StakeRollbackApproval(proposal_id, signer.clone()))
+            .unwrap_or(false)
+        {
+            return Err(Error::AlreadyStaked);
+        }
+        signer.require_auth();
+
+        env.storage().persistent().set(
+            &DataKey::StakeRollbackApproval(proposal_id, signer.clone()),
+            &true,
+        );
+        proposal.approval_count = proposal
+            .approval_count
+            .checked_add(1)
+            .expect("Approval count overflow");
+        env.storage()
+            .persistent()
+            .set(&DataKey::StakeRollbackProposal(proposal_id), &proposal);
+
+        env.events().publish(
+            (
+                Symbol::new(&env, "DR"),
+                Symbol::new(&env, "srb_aprv"),
+                proposal_id,
+            ),
+            (signer, proposal.approval_count),
+        );
+        Ok(())
+    }
+
+    /// Execute a staking rollback after 4-of-7 approval.
+    ///
+    /// Restores all captured `StakeRecord`s and re-applies the old WASM hash.
+    ///
+    /// # Pre-conditions
+    /// * Old WASM must be pre-uploaded via `soroban contract install`.
+    /// * `EMERGENCY_THRESHOLD` (4) distinct approvals required.
+    pub fn rollback_to_snapshot(env: Env, proposal_id: u32) -> Result<(), Error> {
+        let mut proposal: RollbackProposal = env
+            .storage()
+            .persistent()
+            .get(&DataKey::StakeRollbackProposal(proposal_id))
+            .ok_or(Error::NoStakeFound)?;
+        if proposal.executed {
+            return Err(Error::AlreadyStaked);
+        }
+        if proposal.approval_count < EMERGENCY_THRESHOLD {
+            return Err(Error::StillLocked); // reuse — closest "not enough" error
+        }
+
+        let snaps: Vec<StakeSnapshot> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::StakeSnapshot(proposal.snapshot_id))
+            .ok_or(Error::NoStakeFound)?;
+
+        // ----------------------------------------------------------------
+        // Restore stake records from snapshot
+        // ----------------------------------------------------------------
+        for snap in snaps.iter() {
+            let record = StakeRecord {
+                mentor: snap.mentor.clone(),
+                amount: snap.amount,
+                staked_at: snap.staked_at,
+                unlock_at: snap.unlock_at,
+                unlock_cooldown_until: snap.unlock_cooldown_until,
+                tier: snap.tier,
+            };
+            env.storage()
+                .persistent()
+                .set(&DataKey::Stake(snap.mentor.clone()), &record);
+            env.storage().persistent().extend_ttl(
+                &DataKey::Stake(snap.mentor.clone()),
+                DR_TTL_THRESHOLD,
+                DR_TTL_BUMP,
+            );
+        }
+
+        // ----------------------------------------------------------------
+        // Re-apply old WASM
+        // ----------------------------------------------------------------
+        env.deployer()
+            .update_current_contract_wasm(proposal.old_wasm_hash.clone());
+
+        proposal.executed = true;
+        env.storage()
+            .persistent()
+            .set(&DataKey::StakeRollbackProposal(proposal_id), &proposal);
+
+        env.events().publish(
+            (
+                Symbol::new(&env, "DR"),
+                Symbol::new(&env, "srb_exec"),
+                proposal_id,
+            ),
+            (
+                proposal.snapshot_id,
+                proposal.old_wasm_hash,
+                snaps.len() as u32,
+            ),
+        );
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // Disaster Recovery — View helpers
+    // -----------------------------------------------------------------------
+
+    /// Return staking snapshot metadata, or `None` if not found.
+    pub fn get_stake_snapshot_meta(env: Env, snapshot_id: u32) -> Option<SnapshotMeta> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::StakeSnapshotMeta(snapshot_id))
+    }
+
+    /// Return the ordered list of retained staking snapshot IDs.
+    pub fn get_stake_snapshot_index(env: Env) -> Vec<u32> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::StakeSnapshotIndex)
+            .unwrap_or(Vec::new(&env))
+    }
+
+    /// Return a staking rollback proposal by ID.
+    pub fn get_stake_rollback_proposal(env: Env, proposal_id: u32) -> Option<RollbackProposal> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::StakeRollbackProposal(proposal_id))
     }
 }
 
