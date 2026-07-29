@@ -7,6 +7,10 @@ const BACKEND: Symbol = symbol_short!("BACKEND");
 const TTL_THRESHOLD: u32 = 500_000;
 const TTL_BUMP: u32 = 1_000_000;
 
+// ── Scheduling constants ──────────────────────────────────────────────────────
+const SLOT_SIZE_SECS: u64 = 1800; // 30-minute slots
+const SCHEDULING_BUFFER_SECS: u64 = 900; // 15-minute buffer between sessions
+
 // ── Types ─────────────────────────────────────────────────────────────────────
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -45,12 +49,21 @@ pub enum DataKey {
     LearnerSessionAt(Address, u32),
     SessionOracle,
     SessionMetadata(Symbol),
+    /// Maps (mentor, time_bucket) to session_id for conflict detection
+    MentorScheduleSlot(Address, u64),
 }
 
 // ── Errors ────────────────────────────────────────────────────────────────────
 // Errors are surfaced via panics to keep compatibility with SDK 21 contractimpl.
 // Error codes are documented here for reference:
 // NotInitialized = 1, Unauthorized = 2, SessionNotFound = 3, DuplicateSession = 4
+// SessionConflict = 5, InsufficientBuffer = 6
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SessionConflict {
+    pub conflicting_session_id: Symbol,
+}
 
 // ── Contract ──────────────────────────────────────────────────────────────────
 #[contract]
@@ -68,6 +81,7 @@ impl SessionRegistry {
     }
 
     /// Register a new session. Only callable by the platform backend.
+    /// Performs conflict detection and 15-minute buffer enforcement.
     pub fn register_session(
         env: Env,
         session_id: Symbol,
@@ -86,6 +100,9 @@ impl SessionRegistry {
             panic!("Duplicate session");
         }
 
+        // Check for scheduling conflicts and buffer enforcement
+        Self::check_scheduling_conflicts(&env, &mentor, scheduled_at, duration_mins);
+
         let record = SessionRecord {
             session_id: session_id.clone(),
             mentor: mentor.clone(),
@@ -102,6 +119,9 @@ impl SessionRegistry {
         env.storage()
             .persistent()
             .extend_ttl(&session_key, TTL_THRESHOLD, TTL_BUMP);
+
+        // Reserve all time buckets for this session
+        Self::reserve_time_buckets(&env, &mentor, scheduled_at, duration_mins, &session_id);
 
         // Index by mentor (indexed storage)
         let mentor_count_key = DataKey::MentorSessionCount(mentor.clone());
@@ -145,6 +165,7 @@ impl SessionRegistry {
     }
 
     /// Update session status. Only callable by the platform backend.
+    /// Releases time buckets when transitioning to Cancelled.
     pub fn update_status(env: Env, session_id: Symbol, status: SessionStatus) {
         let backend = Self::require_backend(&env);
         backend.require_auth();
@@ -157,6 +178,12 @@ impl SessionRegistry {
             .expect("Session not found");
 
         let old_status = record.status.clone();
+        
+        // Release time buckets if transitioning to Cancelled
+        if status == SessionStatus::Cancelled && old_status != SessionStatus::Cancelled {
+            Self::release_time_buckets(&env, &record.mentor, record.scheduled_at, record.duration_mins);
+        }
+        
         record.status = status.clone();
         env.storage().persistent().set(&session_key, &record);
         env.storage()
@@ -302,11 +329,94 @@ impl SessionRegistry {
             .unwrap_or(0)
     }
 
+    /// Get mentor availability slots.
+    /// Returns a vector of (slot_start_time, is_available) tuples.
+    /// Useful for UI/scheduling systems to find available time slots.
+    pub fn get_mentor_availability(
+        env: Env,
+        mentor: Address,
+        from: u64,
+        to: u64,
+    ) -> Vec<(u64, bool)> {
+        let mut result = Vec::new(&env);
+        
+        let start_bucket = from / SLOT_SIZE_SECS;
+        let end_bucket = (to + SLOT_SIZE_SECS - 1) / SLOT_SIZE_SECS;
+
+        for bucket in start_bucket..end_bucket {
+            let slot_start = bucket * SLOT_SIZE_SECS;
+            let slot_key = DataKey::MentorScheduleSlot(mentor.clone(), bucket);
+            let is_available = !env.storage().persistent().has(&slot_key);
+            result.push_back((slot_start, is_available));
+        }
+
+        result
+    }
+
     fn require_backend(env: &Env) -> Address {
         env.storage()
             .instance()
             .get(&BACKEND)
             .expect("Not initialized")
+    }
+
+    /// Check for scheduling conflicts and buffer enforcement.
+    /// Panics with "SessionConflict" if an overlap is detected.
+    fn check_scheduling_conflicts(env: &Env, mentor: &Address, scheduled_at: u64, duration_mins: u32) {
+        let session_duration_secs = (duration_mins as u64) * 60;
+        let session_end = scheduled_at + session_duration_secs;
+
+        // Check time buckets covered by the session including buffers
+        let check_start = if scheduled_at > SCHEDULING_BUFFER_SECS {
+            scheduled_at - SCHEDULING_BUFFER_SECS
+        } else {
+            0
+        };
+        let check_end = session_end + SCHEDULING_BUFFER_SECS;
+
+        let start_bucket = check_start / SLOT_SIZE_SECS;
+        let end_bucket = (check_end + SLOT_SIZE_SECS - 1) / SLOT_SIZE_SECS;
+
+        for bucket in start_bucket..end_bucket {
+            let slot_key = DataKey::MentorScheduleSlot(mentor.clone(), bucket);
+            if env.storage().persistent().has(&slot_key) {
+                let conflicting_id: Symbol = env.storage().persistent().get(&slot_key).unwrap();
+                panic!("SessionConflict");
+            }
+        }
+    }
+
+    /// Reserve all time buckets for a session.
+    fn reserve_time_buckets(env: &Env, mentor: &Address, scheduled_at: u64, duration_mins: u32, session_id: &Symbol) {
+        let session_duration_secs = (duration_mins as u64) * 60;
+        let session_end = scheduled_at + session_duration_secs;
+
+        let start_bucket = scheduled_at / SLOT_SIZE_SECS;
+        let end_bucket = (session_end + SLOT_SIZE_SECS - 1) / SLOT_SIZE_SECS;
+
+        for bucket in start_bucket..end_bucket {
+            let slot_key = DataKey::MentorScheduleSlot(mentor.clone(), bucket);
+            env.storage().persistent().set(&slot_key, session_id);
+            env.storage()
+                .persistent()
+                .extend_ttl(&slot_key, TTL_THRESHOLD, TTL_BUMP);
+        }
+    }
+
+    /// Release all time buckets for a session.
+    fn release_time_buckets(env: &Env, mentor: &Address, scheduled_at: u64, duration_mins: u32) {
+        let session_duration_secs = (duration_mins as u64) * 60;
+        let session_end = scheduled_at + session_duration_secs;
+
+        let start_bucket = scheduled_at / SLOT_SIZE_SECS;
+        let end_bucket = (session_end + SLOT_SIZE_SECS - 1) / SLOT_SIZE_SECS;
+
+        for bucket in start_bucket..end_bucket {
+            let slot_key = DataKey::MentorScheduleSlot(mentor.clone(), bucket);
+            if env.storage().persistent().has(&slot_key) {
+                env.storage().persistent().remove(&slot_key);
+            }
+        }
     }
 
     pub fn update_session_metadata(env: Env, session_id: Symbol, tags: soroban_sdk::Vec<soroban_sdk::String>) {
@@ -520,4 +630,196 @@ mod tests {
             &token,
         );
     }
-}
+
+    #[test]
+    fn test_overlapping_sessions_conflict() {
+        let (env, client, _backend) = setup();
+        let mentor = Address::generate(&env);
+        let learner1 = Address::generate(&env);
+        let learner2 = Address::generate(&env);
+        let token = dummy_token(&env);
+
+        // Register first session at 2:00 PM for 60 minutes
+        let session1 = Symbol::new(&env, "sess_overlap_1");
+        client.register_session(
+            &session1,
+            &mentor,
+            &learner1,
+            &2_000_000u64,
+            &60u32,
+            &100i128,
+            &token,
+        );
+
+        // Try to register overlapping session - should conflict
+        let session2 = Symbol::new(&env, "sess_overlap_2");
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            client.register_session(
+                &session2,
+                &mentor,
+                &learner2,
+                &2_010_000u64, // 30 mins into first session
+                &30u32,
+                &100i128,
+                &token,
+            );
+        }));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_non_overlapping_sessions_succeed() {
+        let (env, client, _backend) = setup();
+        let mentor = Address::generate(&env);
+        let learner1 = Address::generate(&env);
+        let learner2 = Address::generate(&env);
+        let token = dummy_token(&env);
+
+        // Register first session at 2:00 PM for 60 minutes
+        let session1 = Symbol::new(&env, "sess_nooverlap_1");
+        client.register_session(
+            &session1,
+            &mentor,
+            &learner1,
+            &2_000_000u64,
+            &60u32,
+            &100i128,
+            &token,
+        );
+
+        // Register non-overlapping session with proper buffer
+        // First session ends at 2_000_000 + 3600 = 2_003_600
+        // With 15-min buffer (900s), next can start at 2_003_600 + 900 = 2_004_500
+        let session2 = Symbol::new(&env, "sess_nooverlap_2");
+        let returned_id = client.register_session(
+            &session2,
+            &mentor,
+            &learner2,
+            &2_004_500u64,
+            &30u32,
+            &100i128,
+            &token,
+        );
+        assert_eq!(returned_id, session2);
+    }
+
+    #[test]
+    fn test_cancellation_releases_time_buckets() {
+        let (env, client, _backend) = setup();
+        let mentor = Address::generate(&env);
+        let learner1 = Address::generate(&env);
+        let learner2 = Address::generate(&env);
+        let token = dummy_token(&env);
+
+        // Register first session
+        let session1 = Symbol::new(&env, "sess_cancel_1");
+        client.register_session(
+            &session1,
+            &mentor,
+            &learner1,
+            &2_000_000u64,
+            &60u32,
+            &100i128,
+            &token,
+        );
+
+        // Cancel first session
+        client.update_status(&session1, &SessionStatus::Cancelled);
+
+        // Now should be able to book at same time with another learner
+        let session2 = Symbol::new(&env, "sess_cancel_2");
+        let returned_id = client.register_session(
+            &session2,
+            &mentor,
+            &learner2,
+            &2_000_000u64,
+            &60u32,
+            &100i128,
+            &token,
+        );
+        assert_eq!(returned_id, session2);
+    }
+
+    #[test]
+    fn test_get_mentor_availability() {
+        let (env, client, _backend) = setup();
+        let mentor = Address::generate(&env);
+        let learner = Address::generate(&env);
+        let token = dummy_token(&env);
+
+        // Register session at 2:00 PM for 60 minutes
+        let session1 = Symbol::new(&env, "sess_avail_1");
+        client.register_session(
+            &session1,
+            &mentor,
+            &learner,
+            &2_000_000u64,
+            &60u32,
+            &100i128,
+            &token,
+        );
+
+        // Check availability in the next 2 hours
+        let availability = client.get_mentor_availability(&mentor, &2_000_000u64, &2_007_200u64);
+        
+        // Should have at least 4 slots (2 hours / 30 min slots)
+        assert!(availability.len() >= 4);
+        
+        // First slots should be occupied, later ones should be available
+        let mut occupied_count = 0;
+        for (_, is_available) in availability.iter() {
+            if !is_available {
+                occupied_count += 1;
+            }
+        }
+        assert!(occupied_count > 0);
+    }
+
+    #[test]
+    fn test_buffer_enforcement_15_min() {
+        let (env, client, _backend) = setup();
+        let mentor = Address::generate(&env);
+        let learner1 = Address::generate(&env);
+        let learner2 = Address::generate(&env);
+        let token = dummy_token(&env);
+
+        // Register first session: 2:00 PM - 3:00 PM (3600 seconds)
+        let session1 = Symbol::new(&env, "sess_buffer_1");
+        client.register_session(
+            &session1,
+            &mentor,
+            &learner1,
+            &2_000_000u64,
+            &60u32,
+            &100i128,
+            &token,
+        );
+
+        // Try to book exactly when first ends (should fail due to 15-min buffer)
+        let session2 = Symbol::new(&env, "sess_buffer_2");
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            client.register_session(
+                &session2,
+                &mentor,
+                &learner2,
+                &2_003_600u64, // Exactly when first session ends
+                &30u32,
+                &100i128,
+                &token,
+            );
+        }));
+        assert!(result.is_err());
+
+        // Book with full buffer (15 min = 900 sec)
+        let session3 = Symbol::new(&env, "sess_buffer_3");
+        let returned_id = client.register_session(
+            &session3,
+            &mentor,
+            &learner2,
+            &2_004_500u64, // 15 min after first ends
+            &30u32,
+            &100i128,
+            &token,
+        );
+        assert_eq!(returned_id, session3);
+    }
