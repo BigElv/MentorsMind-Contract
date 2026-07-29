@@ -7,6 +7,7 @@ use soroban_sdk::contracterror;
 ///
 /// Centralizing these definitions keeps authorization and state-transition
 /// behavior aligned across contracts that make the same safety assumptions.
+pub mod disaster_recovery;
 pub mod escrow;
 pub mod events;
 pub mod pause_guard;
@@ -19,6 +20,10 @@ pub mod ttl_utils;
 pub mod interface_id;
 pub mod validation;
 
+pub use disaster_recovery::{
+    compute_checksum, push_snapshot_index, RollbackApproval, RollbackProposal, SnapshotMeta,
+    StateVerificationReport, EMERGENCY_SIGNERS, EMERGENCY_THRESHOLD, MAX_SNAPSHOTS,
+};
 pub use escrow::{EscrowRecord, EscrowStatus};
 pub use pause_guard::{ContractPaused, is_paused, require_not_paused};
 pub use reentrancy_guard::ReentrancyGuard;
