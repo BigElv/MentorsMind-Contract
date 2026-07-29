@@ -49,8 +49,7 @@ pub enum DataKey {
     LearnerSessionAt(Address, u32),
     SessionOracle,
     SessionMetadata(Symbol),
-    /// Maps (mentor, time_bucket) to session_id for conflict detection
-    MentorScheduleSlot(Address, u64),
+    SessionOracle,
 }
 
 // ── Errors ────────────────────────────────────────────────────────────────────
