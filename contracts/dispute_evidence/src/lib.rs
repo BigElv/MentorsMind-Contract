@@ -40,6 +40,10 @@ const SUBMISSION_COOLDOWN_SECS: u64 = 3_600;
 /// 24 hours.
 const MIN_RESOLUTION_DELAY_SECS: u64 = 24 * 60 * 60;
 
+/// Appeal period after an original resolution during which an appeal may be
+/// submitted and a second arbitrator may override the decision.
+const APPEAL_PERIOD_SECS: u64 = 72 * 3600;
+
 // ─── Domain types ─────────────────────────────────────────────────────────────
 
 #[contracttype]
@@ -131,11 +135,28 @@ pub enum DataKey {
     /// Merkle root of the evidence set for a given escrow. Updated on every
     /// evidence submission for tamper-evident integrity.
     EvidenceRoot(u64),
+    /// Address of the governance contract used to select appeal arbitrators.
+    GovernanceContract,
+    /// Appeal deadline for a dispute resolution.
+    AppealPeriodEnds(u64),
+    /// Number of appeals submitted for a dispute.
+    AppealCount(u64),
+    /// Selected appeal arbitrator for a dispute.
+    AppealArbitrator(u64),
+    /// Optional hash explaining why the appellant requested an appeal.
+    AppealReasonHash(u64),
 }
 
 #[contractclient(name = "EscrowContractClient")]
 pub trait EscrowContractTrait {
     fn get_escrow(env: Env, escrow_id: u64) -> Escrow;
+}
+
+#[contractclient(name = "GovernanceContractClient")]
+pub trait GovernanceContractTrait {
+    fn select_arbitrator(env: Env, dispute_id: u64) -> Address;
+    fn get_arbitrator_count(env: Env) -> u32;
+    fn list_arbitrators_page(env: Env, offset: u32, limit: u32) -> Vec<Address>;
 }
 
 #[contracterror]
@@ -160,6 +181,12 @@ pub enum Error {
     /// The same submitter already submitted this exact `content_hash` for
     /// this escrow — duplicate commitments are rejected.
     DuplicateContentHash     = 11,
+    /// An appeal deadline has already passed.
+    AppealPeriodExpired      = 12,
+    /// Only one appeal is allowed per dispute.
+    AppealAlreadySubmitted   = 13,
+    /// A governance contract has not been configured for appeal arbitration.
+    GovernanceContractNotConfigured = 14,
 }
 
 #[contract]
@@ -194,6 +221,18 @@ impl DisputeEvidenceContract {
         env.storage()
             .instance()
             .set(&DataKey::EscrowContract, &escrow_contract);
+        Ok(())
+    }
+
+    pub fn set_governance_contract(
+        env: Env,
+        admin: Address,
+        governance_contract: Address,
+    ) -> Result<(), Error> {
+        Self::require_admin(&env, &admin)?;
+        env.storage()
+            .instance()
+            .set(&DataKey::GovernanceContract, &governance_contract);
         Ok(())
     }
 
@@ -418,6 +457,7 @@ impl DisputeEvidenceContract {
         env: Env,
         escrow_id: u64,
         arbitrator: Address,
+        is_appeal: bool,
         release_to_mentor: bool,
         note: Symbol,
     ) -> Result<(), Error> {
@@ -445,19 +485,50 @@ impl DisputeEvidenceContract {
         }
 
         let key = DataKey::Resolution(escrow_id);
+        if is_appeal && !env.storage().persistent().has(&key) {
+            return Err(Error::InvalidEscrowState);
+        }
         if env.storage().persistent().has(&key) {
-            return Err(Error::AlreadyResolved);
+            if !is_appeal {
+                return Err(Error::AlreadyResolved);
+            }
+            let appeal_count: u32 = env
+                .storage()
+                .persistent()
+                .get(&DataKey::AppealCount(escrow_id))
+                .unwrap_or(0);
+            if appeal_count == 0 {
+                return Err(Error::InvalidEscrowState);
+            }
+            let appeal_arbitrator: Address = env
+                .storage()
+                .persistent()
+                .get(&DataKey::AppealArbitrator(escrow_id))
+                .expect("appeal arbitrator missing");
+            if appeal_arbitrator != arbitrator {
+                return Err(Error::Unauthorized);
+            }
+            let appeal_deadline: u64 = env
+                .storage()
+                .persistent()
+                .get(&DataKey::AppealPeriodEnds(escrow_id))
+                .expect("appeal deadline missing");
+            if env.ledger().timestamp() > appeal_deadline {
+                return Err(Error::AppealPeriodExpired);
+            }
         }
 
-        // Time-lock: enforce minimum deliberation period.
-        if let Some(opened_at) = env
-            .storage()
-            .persistent()
-            .get::<_, u64>(&DataKey::DisputeOpenedAt(escrow_id))
-        {
-            let earliest_resolution = opened_at.saturating_add(MIN_RESOLUTION_DELAY_SECS);
-            if env.ledger().timestamp() < earliest_resolution {
-                return Err(Error::ResolutionTimelockActive);
+        // Time-lock: enforce minimum deliberation period for original resolutions.
+        if !is_appeal {
+            if let Some(opened_at) = env
+                .storage()
+                .persistent()
+                .get::<_, u64>(&DataKey::DisputeOpenedAt(escrow_id))
+            {
+                let earliest_resolution = opened_at.saturating_add(MIN_RESOLUTION_DELAY_SECS);
+                if env.ledger().timestamp() < earliest_resolution {
+                    return Err(Error::ResolutionTimelockActive);
+                }
             }
         }
 
@@ -471,6 +542,14 @@ impl DisputeEvidenceContract {
             evidence_root,
         };
         env.storage().persistent().set(&key, &resolution);
+
+        if !is_appeal {
+            let appeal_deadline = resolution.resolved_at.saturating_add(APPEAL_PERIOD_SECS);
+            env.storage()
+                .persistent()
+                .set(&DataKey::AppealPeriodEnds(escrow_id), &appeal_deadline);
+        }
+
         env.events().publish(
             (Symbol::new(&env, "dispute_resolved"), escrow_id),
             resolution,
@@ -521,6 +600,24 @@ impl DisputeEvidenceContract {
             .unwrap_or_else(|| BytesN::from_array(&env, &[0u8; 32]))
     }
 
+    pub fn get_appeal_arbitrator(env: Env, escrow_id: u64) -> Option<Address> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::AppealArbitrator(escrow_id))
+    }
+
+    pub fn get_appeal_reason_hash(env: Env, escrow_id: u64) -> Option<BytesN<32>> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::AppealReasonHash(escrow_id))
+    }
+
+    pub fn get_appeal_deadline(env: Env, escrow_id: u64) -> Option<u64> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::AppealPeriodEnds(escrow_id))
+    }
+
     /// Recompute the Merkle root from the provided items and compare to the
     /// stored root. Returns `true` if they match, `false` otherwise.
     pub fn verify_evidence_set(
@@ -531,6 +628,110 @@ impl DisputeEvidenceContract {
         let stored_root = Self::get_evidence_root(env.clone(), escrow_id);
         let computed_root = Self::compute_evidence_root(&env, &items);
         stored_root == computed_root
+    }
+
+    pub fn submit_appeal_for_dispute(
+        env: Env,
+        appellant: Address,
+        escrow_id: u64,
+        reason_hash: BytesN<32>,
+    ) -> Result<(), Error> {
+        appellant.require_auth();
+
+        let escrow = Self::load_escrow(&env, escrow_id);
+        if escrow.status != EscrowStatus::Disputed {
+            return Err(Error::InvalidEscrowState);
+        }
+        if appellant != escrow.mentor && appellant != escrow.learner {
+            return Err(Error::Unauthorized);
+        }
+
+        let resolution: DisputeResolution = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Resolution(escrow_id))
+            .expect("resolution not found");
+
+        let appeal_deadline: u64 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::AppealPeriodEnds(escrow_id))
+            .expect("appeal deadline not set");
+        if env.ledger().timestamp() > appeal_deadline {
+            return Err(Error::AppealPeriodExpired);
+        }
+
+        let appeal_count: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::AppealCount(escrow_id))
+            .unwrap_or(0);
+        if appeal_count >= 1 {
+            return Err(Error::AppealAlreadySubmitted);
+        }
+
+        let governance: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::GovernanceContract)
+            .ok_or(Error::GovernanceContractNotConfigured)?;
+        let appeal_arbitrator = Self::select_appeal_arbitrator(&env, &governance, escrow_id, &resolution.arbitrator)?;
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::AppealCount(escrow_id), &1u32);
+        env.storage()
+            .persistent()
+            .set(&DataKey::AppealArbitrator(escrow_id), &appeal_arbitrator);
+        env.storage()
+            .persistent()
+            .set(&DataKey::AppealReasonHash(escrow_id), &reason_hash);
+
+        let appeal_deadline: u64 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::AppealPeriodEnds(escrow_id))
+            .expect("appeal deadline not set");
+
+        env.events().publish(
+            (Symbol::new(&env, "dispute_appealed"), escrow_id),
+            (appellant, appeal_arbitrator.clone(), appeal_deadline),
+        );
+        Ok(())
+    }
+
+    fn select_appeal_arbitrator(
+        env: &Env,
+        governance: &Address,
+        dispute_id: u64,
+        original_arbitrator: &Address,
+    ) -> Result<Address, Error> {
+        let mut candidate: Address = GovernanceContractClient::new(env, governance)
+            .select_arbitrator(&dispute_id);
+        if &candidate != original_arbitrator {
+            return Ok(candidate);
+        }
+
+        let count = GovernanceContractClient::new(env, governance).get_arbitrator_count();
+        if count <= 1 {
+            return Err(Error::NoAlternativeArbitrator);
+        }
+
+        // Try to find the next arbitrator by scanning the list.
+        let mut offset = 0;
+        while offset < count {
+            let list = GovernanceContractClient::new(env, governance)
+                .list_arbitrators_page(&offset, &1);
+            if let Some(addr) = list.get(0) {
+                let addr = addr.clone();
+                if &addr != original_arbitrator {
+                    return Ok(addr);
+                }
+            }
+            offset += 1;
+        }
+
+        Err(Error::NoAlternativeArbitrator)
     }
 
     fn require_admin(env: &Env, admin: &Address) -> Result<(), Error> {
@@ -563,6 +764,7 @@ mod tests {
     use super::*;
     use soroban_sdk::{
         contractimpl,
+        symbol_short,
         testutils::{Address as _, Events, Ledger, LedgerInfo},
         IntoVal, TryFromVal,
     };
@@ -612,6 +814,156 @@ mod tests {
         client.initialize(&admin, &escrow_contract).unwrap();
         let escrow = EscrowContractClient::new(&env, &escrow_contract).get_escrow(&1);
         (env, admin, escrow.mentor, escrow.learner, client)
+    }
+
+    #[contract]
+    struct MockGovernance;
+
+    #[contractimpl]
+    impl MockGovernance {
+        pub fn initialize(env: Env, arbitrators: Vec<Address>) {
+            env.storage()
+                .persistent()
+                .set(&symbol_short!("ARBITS"), &arbitrators);
+            env.storage()
+                .persistent()
+                .set(&symbol_short!("ARB_COUNT"), &arbitrators.len());
+        }
+
+        pub fn select_arbitrator(env: Env, dispute_id: u64) -> Address {
+            let arbitrators: Vec<Address> = env
+                .storage()
+                .persistent()
+                .get(&symbol_short!("ARBITS"))
+                .expect("no arbitrators configured");
+            let count = arbitrators.len();
+            let idx = (dispute_id % (count as u64)) as u32;
+            arbitrators
+                .get(idx)
+                .expect("arbitrator index out of range")
+                .clone()
+        }
+
+        pub fn get_arbitrator_count(env: Env) -> u32 {
+            env.storage()
+                .persistent()
+                .get(&symbol_short!("ARB_COUNT"))
+                .unwrap_or(0)
+        }
+
+        pub fn list_arbitrators_page(env: Env, offset: u32, limit: u32) -> Vec<Address> {
+            let arbitrators: Vec<Address> = env
+                .storage()
+                .persistent()
+                .get(&symbol_short!("ARBITS"))
+                .unwrap_or(Vec::new(&env));
+            let mut out = Vec::new(&env);
+            let end = (offset + limit).min(arbitrators.len());
+            for i in offset..end {
+                out.push_back(arbitrators.get(i).unwrap().clone());
+            }
+            out
+        }
+    }
+
+    fn setup_disputed_with_governance(
+        env: &Env,
+        client: &DisputeEvidenceContractClient<'_>,
+        admin: &Address,
+    ) -> Address {
+        let governance_contract = env.register_contract(None, MockGovernance);
+        let governance_client = MockGovernanceClient::new(env, &governance_contract);
+        let arb1 = Address::generate(env);
+        let arb2 = Address::generate(env);
+        let arb3 = Address::generate(env);
+        let mut arbitrators = Vec::new(env);
+        arbitrators.push_back(arb1.clone());
+        arbitrators.push_back(arb2.clone());
+        arbitrators.push_back(arb3.clone());
+        governance_client.initialize(&arbitrators);
+        client
+            .set_governance_contract(admin, &governance_contract)
+            .unwrap();
+        governance_contract
+    }
+
+    #[test]
+    fn submit_appeal_creates_appeal_record_and_emits_event() {
+        let (env, admin, mentor, _learner, client) = setup_disputed();
+        let governance_contract = setup_disputed_with_governance(&env, &client, &admin);
+        let arb = Address::generate(&env);
+
+        client.record_dispute_opened(&1).unwrap();
+        advance_time(&env, MIN_RESOLUTION_DELAY_SECS + 1);
+        client
+            .submit_resolution(&1, &arb, &true, &Symbol::new(&env, "mentor_wins"))
+            .unwrap();
+
+        let appeal_reason = hash32(&env, 77);
+        let result = client.try_submit_appeal_for_dispute(&mentor, &1, &appeal_reason);
+        assert!(result.is_ok(), "appeal submission should succeed");
+
+        let appeal_arbitrator = client.get_appeal_arbitrator(&1).expect("appeal arbitrator set");
+        assert_ne!(appeal_arbitrator, arb, "appeal arbitrator must be different from original");
+        assert_eq!(client.get_appeal_reason_hash(&1).unwrap(), appeal_reason);
+        assert!(client.get_appeal_deadline(&1).is_some());
+
+        let events = env.events().all();
+        let last = events.last().unwrap();
+        assert_eq!(last.1, (Symbol::new(&env, "dispute_appealed"), 1u64).into_val(&env));
+    }
+
+    #[test]
+    fn submit_appeal_after_deadline_fails() {
+        let (env, admin, mentor, _learner, client) = setup_disputed();
+        let _governance_contract = setup_disputed_with_governance(&env, &client, &admin);
+        let arb = Address::generate(&env);
+
+        client.record_dispute_opened(&1).unwrap();
+        advance_time(&env, MIN_RESOLUTION_DELAY_SECS + 1);
+        client
+            .submit_resolution(&1, &arb, &true, &Symbol::new(&env, "mentor_wins"))
+            .unwrap();
+
+        let deadline = client.get_appeal_deadline(&1).unwrap();
+        advance_time(&env, deadline.saturating_sub(env.ledger().timestamp()) + 1);
+
+        let result = client.try_submit_appeal_for_dispute(&mentor, &1, &hash32(&env, 78));
+        assert!(result.is_err(), "appeal after deadline should fail");
+    }
+
+    #[test]
+    fn submit_appeal_without_governance_fails() {
+        let (env, _admin, mentor, _learner, client) = setup_disputed();
+        let arb = Address::generate(&env);
+
+        client.record_dispute_opened(&1).unwrap();
+        advance_time(&env, MIN_RESOLUTION_DELAY_SECS + 1);
+        client
+            .submit_resolution(&1, &arb, &true, &Symbol::new(&env, "mentor_wins"))
+            .unwrap();
+
+        let result = client.try_submit_appeal_for_dispute(&mentor, &1, &hash32(&env, 79));
+        assert!(result.is_err(), "appeal without governance contract should fail");
+    }
+
+    #[test]
+    fn second_appeal_submission_is_rejected() {
+        let (env, admin, mentor, _learner, client) = setup_disputed();
+        let _governance_contract = setup_disputed_with_governance(&env, &client, &admin);
+        let arb = Address::generate(&env);
+
+        client.record_dispute_opened(&1).unwrap();
+        advance_time(&env, MIN_RESOLUTION_DELAY_SECS + 1);
+        client
+            .submit_resolution(&1, &arb, &true, &Symbol::new(&env, "mentor_wins"))
+            .unwrap();
+
+        client
+            .submit_appeal_for_dispute(&mentor, &1, &hash32(&env, 80))
+            .unwrap();
+        let result = client.try_submit_appeal_for_dispute(&mentor, &1, &hash32(&env, 81));
+        assert!(result.is_err(), "second appeal submission must be rejected");
     }
 
     /// Build a distinct, non-zero 32-byte hash for tests, seeded by `seed`.
