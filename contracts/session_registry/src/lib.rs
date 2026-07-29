@@ -6,6 +6,10 @@ use soroban_sdk::{contract, contractimpl, contracttype, symbol_short, Address, E
 const BACKEND: Symbol = symbol_short!("BACKEND");
 const TTL_THRESHOLD: u32 = 500_000;
 const TTL_BUMP: u32 = 1_000_000;
+/// Schedule occupancy is tracked in 30-minute buckets.
+const SLOT_SIZE_SECS: u64 = 1_800;
+/// Minimum free time required between consecutive sessions on the same mentor.
+const SCHEDULING_BUFFER_SECS: u64 = 900;
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 #[contracttype]
@@ -45,6 +49,8 @@ pub enum DataKey {
     LearnerSessionAt(Address, u32),
     SessionOracle,
     SessionMetadata(Symbol),
+    /// Maps (mentor, time_bucket) → session_id occupying that 30-minute slot.
+    MentorScheduleSlot(Address, u64),
 }
 
 // ── Errors ────────────────────────────────────────────────────────────────────
@@ -85,6 +91,14 @@ impl SessionRegistry {
         if env.storage().persistent().has(&session_key) {
             panic!("Duplicate session");
         }
+
+        // Occupied window includes the trailing scheduling buffer so the next
+        // session cannot start within SCHEDULING_BUFFER_SECS of this one ending.
+        let occupied_end = scheduled_at
+            .saturating_add((duration_mins as u64).saturating_mul(60))
+            .saturating_add(SCHEDULING_BUFFER_SECS);
+        Self::assert_schedule_available(&env, &mentor, scheduled_at, occupied_end);
+        Self::occupy_schedule_slots(&env, &mentor, &session_id, scheduled_at, occupied_end);
 
         let record = SessionRecord {
             session_id: session_id.clone(),
@@ -157,6 +171,16 @@ impl SessionRegistry {
             .expect("Session not found");
 
         let old_status = record.status.clone();
+        if matches!(status, SessionStatus::Cancelled)
+            && !matches!(old_status, SessionStatus::Cancelled)
+        {
+            Self::release_schedule_slots(
+                &env,
+                &record.mentor,
+                record.scheduled_at,
+                record.duration_mins,
+            );
+        }
         record.status = status.clone();
         env.storage().persistent().set(&session_key, &record);
         env.storage()
@@ -171,6 +195,40 @@ impl SessionRegistry {
             ),
             (old_status, status),
         );
+    }
+
+    /// Cancel a session and release its mentor schedule buckets for re-booking.
+    pub fn cancel_session(env: Env, session_id: Symbol) {
+        Self::update_status(env, session_id, SessionStatus::Cancelled);
+    }
+
+    /// Returns availability for each 30-minute slot in `[from, to)`.
+    /// Each entry is `(slot_start, is_available)`.
+    pub fn get_mentor_availability(
+        env: Env,
+        mentor: Address,
+        from: u64,
+        to: u64,
+    ) -> Vec<(u64, bool)> {
+        let mut result = Vec::new(&env);
+        if to <= from {
+            return result;
+        }
+        let mut bucket = from / SLOT_SIZE_SECS;
+        let end_bucket = (to + SLOT_SIZE_SECS - 1) / SLOT_SIZE_SECS;
+        while bucket < end_bucket {
+            let slot_start = bucket * SLOT_SIZE_SECS;
+            if slot_start >= to {
+                break;
+            }
+            if slot_start >= from {
+                let key = DataKey::MentorScheduleSlot(mentor.clone(), bucket);
+                let is_available = !env.storage().persistent().has(&key);
+                result.push_back((slot_start, is_available));
+            }
+            bucket = bucket.saturating_add(1);
+        }
+        result
     }
 
     pub fn set_session_oracle(env: Env, oracle: Address) {
@@ -205,6 +263,16 @@ impl SessionRegistry {
             .expect("Session not found");
 
         let old_status = record.status.clone();
+        if matches!(status, SessionStatus::Cancelled)
+            && !matches!(old_status, SessionStatus::Cancelled)
+        {
+            Self::release_schedule_slots(
+                &env,
+                &record.mentor,
+                record.scheduled_at,
+                record.duration_mins,
+            );
+        }
         record.status = status.clone();
         env.storage().persistent().set(&session_key, &record);
         env.events().publish(
@@ -307,6 +375,74 @@ impl SessionRegistry {
             .instance()
             .get(&BACKEND)
             .expect("Not initialized")
+    }
+
+    fn occupied_end(scheduled_at: u64, duration_mins: u32) -> u64 {
+        scheduled_at
+            .saturating_add((duration_mins as u64).saturating_mul(60))
+            .saturating_add(SCHEDULING_BUFFER_SECS)
+    }
+
+    fn assert_schedule_available(env: &Env, mentor: &Address, start: u64, end: u64) {
+        if end <= start {
+            return;
+        }
+        let mut bucket = start / SLOT_SIZE_SECS;
+        let last_bucket = (end - 1) / SLOT_SIZE_SECS;
+        while bucket <= last_bucket {
+            let key = DataKey::MentorScheduleSlot(mentor.clone(), bucket);
+            if let Some(conflicting) = env.storage().persistent().get::<_, Symbol>(&key) {
+                // Keep panic style consistent with the rest of this contract.
+                let _ = conflicting;
+                panic!("SessionConflict");
+            }
+            if bucket == u64::MAX {
+                break;
+            }
+            bucket += 1;
+        }
+    }
+
+    fn occupy_schedule_slots(
+        env: &Env,
+        mentor: &Address,
+        session_id: &Symbol,
+        start: u64,
+        end: u64,
+    ) {
+        if end <= start {
+            return;
+        }
+        let mut bucket = start / SLOT_SIZE_SECS;
+        let last_bucket = (end - 1) / SLOT_SIZE_SECS;
+        while bucket <= last_bucket {
+            let key = DataKey::MentorScheduleSlot(mentor.clone(), bucket);
+            env.storage().persistent().set(&key, session_id);
+            env.storage()
+                .persistent()
+                .extend_ttl(&key, TTL_THRESHOLD, TTL_BUMP);
+            if bucket == u64::MAX {
+                break;
+            }
+            bucket += 1;
+        }
+    }
+
+    fn release_schedule_slots(env: &Env, mentor: &Address, scheduled_at: u64, duration_mins: u32) {
+        let end = Self::occupied_end(scheduled_at, duration_mins);
+        if end <= scheduled_at {
+            return;
+        }
+        let mut bucket = scheduled_at / SLOT_SIZE_SECS;
+        let last_bucket = (end - 1) / SLOT_SIZE_SECS;
+        while bucket <= last_bucket {
+            let key = DataKey::MentorScheduleSlot(mentor.clone(), bucket);
+            env.storage().persistent().remove(&key);
+            if bucket == u64::MAX {
+                break;
+            }
+            bucket += 1;
+        }
     }
 
     pub fn update_session_metadata(env: Env, session_id: Symbol, tags: soroban_sdk::Vec<soroban_sdk::String>) {
@@ -439,11 +575,15 @@ mod tests {
                 2 => Symbol::new(&env, "s2"),
                 _ => Symbol::new(&env, "s3"),
             };
+            // Non-overlapping starts past the prior occupied buckets.
+            // 60-min + 15-min buffer ending 2_004_500 occupies through bucket
+            // ending at 2_005_200, so space sessions by 5_400s.
+            let start = 2_000_000u64 + ((i as u64 - 1) * 5_400);
             client.register_session(
                 &sid,
                 &mentor,
                 &learner,
-                &2_000_000u64,
+                &start,
                 &60u32,
                 &100i128,
                 &token,
@@ -519,5 +659,170 @@ mod tests {
             &100i128,
             &token,
         );
+    }
+
+    #[test]
+    #[should_panic(expected = "SessionConflict")]
+    fn test_overlapping_session_rejected() {
+        let (env, client, _backend) = setup();
+        let mentor = Address::generate(&env);
+        let learner_a = Address::generate(&env);
+        let learner_b = Address::generate(&env);
+        let token = dummy_token(&env);
+
+        client.register_session(
+            &Symbol::new(&env, "sess_a"),
+            &mentor,
+            &learner_a,
+            &2_000_000u64,
+            &60u32,
+            &100i128,
+            &token,
+        );
+        // Starts during the first session window.
+        client.register_session(
+            &Symbol::new(&env, "sess_b"),
+            &mentor,
+            &learner_b,
+            &2_001_800u64,
+            &30u32,
+            &100i128,
+            &token,
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "SessionConflict")]
+    fn test_scheduling_buffer_enforced() {
+        let (env, client, _backend) = setup();
+        let mentor = Address::generate(&env);
+        let learner_a = Address::generate(&env);
+        let learner_b = Address::generate(&env);
+        let token = dummy_token(&env);
+
+        // 60-minute session ending at 2_003_600; buffer occupies until 2_004_500.
+        client.register_session(
+            &Symbol::new(&env, "sess_a"),
+            &mentor,
+            &learner_a,
+            &2_000_000u64,
+            &60u32,
+            &100i128,
+            &token,
+        );
+        // Starts only 10 minutes after end — inside the 15-minute buffer.
+        client.register_session(
+            &Symbol::new(&env, "sess_b"),
+            &mentor,
+            &learner_b,
+            &2_004_200u64,
+            &30u32,
+            &100i128,
+            &token,
+        );
+    }
+
+    #[test]
+    fn test_non_overlapping_sessions_ok() {
+        let (env, client, _backend) = setup();
+        let mentor = Address::generate(&env);
+        let learner_a = Address::generate(&env);
+        let learner_b = Address::generate(&env);
+        let token = dummy_token(&env);
+
+        client.register_session(
+            &Symbol::new(&env, "sess_a"),
+            &mentor,
+            &learner_a,
+            &2_000_000u64,
+            &60u32,
+            &100i128,
+            &token,
+        );
+        // First ends 2_003_600 + buffer 900 => 2_004_500; bucket occupancy
+        // clears at the next slot boundary 2_005_200.
+        client.register_session(
+            &Symbol::new(&env, "sess_b"),
+            &mentor,
+            &learner_b,
+            &2_005_200u64,
+            &30u32,
+            &100i128,
+            &token,
+        );
+        assert_eq!(client.get_mentor_session_count(&mentor), 2);
+    }
+
+    #[test]
+    fn test_cancel_releases_schedule_for_rebooking() {
+        let (env, client, _backend) = setup();
+        let mentor = Address::generate(&env);
+        let learner_a = Address::generate(&env);
+        let learner_b = Address::generate(&env);
+        let token = dummy_token(&env);
+        let first = Symbol::new(&env, "sess_a");
+
+        client.register_session(
+            &first,
+            &mentor,
+            &learner_a,
+            &2_000_000u64,
+            &60u32,
+            &100i128,
+            &token,
+        );
+        client.cancel_session(&first);
+        assert_eq!(
+            client.get_session(&first).status,
+            SessionStatus::Cancelled
+        );
+
+        // Same slot can be booked again after cancel.
+        client.register_session(
+            &Symbol::new(&env, "sess_b"),
+            &mentor,
+            &learner_b,
+            &2_000_000u64,
+            &60u32,
+            &100i128,
+            &token,
+        );
+    }
+
+    #[test]
+    fn test_get_mentor_availability() {
+        let (env, client, _backend) = setup();
+        let mentor = Address::generate(&env);
+        let learner = Address::generate(&env);
+
+        client.register_session(
+            &Symbol::new(&env, "sess_a"),
+            &mentor,
+            &learner,
+            &2_000_000u64,
+            &60u32,
+            &100i128,
+            &dummy_token(&env),
+        );
+
+        let availability =
+            client.get_mentor_availability(&mentor, &1_999_800u64, &2_007_200u64);
+        assert!(availability.len() > 0);
+
+        let mut found_busy = false;
+        let mut found_free = false;
+        for entry in availability.iter() {
+            let (slot_start, is_available) = entry;
+            // Session occupies buckets covering [2_000_000, 2_004_500).
+            if slot_start <= 2_000_000 && slot_start + SLOT_SIZE_SECS > 2_000_000 {
+                assert!(!is_available);
+                found_busy = true;
+            }
+            if slot_start >= 2_005_400 && is_available {
+                found_free = true;
+            }
+        }
+        assert!(found_busy);
+        assert!(found_free);
     }
 }
