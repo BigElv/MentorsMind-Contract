@@ -21,7 +21,18 @@ mentorminds-reputation = { path = "../contracts/reputation", features = ["testut
 mentorminds-timelock = { path = "../contracts/timelock", features = ["testutils"] }
 mentorminds-credit-score = { path = "../contracts/credit_score", features = ["testutils"] }
 mentorminds-staking = { path = "../contracts/staking", features = ["testutils"] }
-mentorminds-delegation = { path = "../contracts/delegation", features = ["testutils"] }
+mentorminds-lending-pool = { path = "../contracts/lending_pool", features = ["testutils"] }
+mentorminds-upgrade-registry = { path = "../contracts/upgrade_registry", features = ["testutils"] }
+mentorminds-pause-guardian = { path = "../contracts/pause_guardian", features = ["testutils"] }
+mentorminds-dispute-evidence = { path = "../contracts/dispute_evidence", features = ["testutils"] }
+mentorminds-insurance = { path = "../contracts/insurance", features = ["testutils"] }
+mentorminds-referral = { path = "../contracts/referral", features = ["testutils"] }
+payment_router = { path = "../contracts/payment_router", features = ["testutils"] }
+mentorminds-snapshot = { path = "../contracts/snapshot", features = ["testutils"] }
+mentorminds-multisig = { path = "../multisig", features = ["testutils"] }
+mentorminds-rbac = { path = "../contracts/rbac", features = ["testutils"] }
+mentorminds-performance-bond = { path = "../contracts/performance_bond", features = ["testutils"] }
+mentorminds-subscription = { path = "../contracts/subscription", features = ["testutils"] }
 
 [dev-dependencies]
 
@@ -42,5 +53,41 @@ name = "economic_attacks"
 path = "economic_attacks.rs"
 
 [[test]]
-name = "fixture_factory_example"
-path = "fixture_factory_example.rs"
+name = "flash_loan_tests"
+path = "flash_loan_tests.rs"
+
+[[test]]
+name = "oracle_manipulation_tests"
+path = "oracle_manipulation_tests.rs"
+
+[[test]]
+name = "sig_validation_tests"
+path = "sig_validation_tests.rs"
+
+[[test]]
+name = "cancellation_tests"
+path = "cancellation/mod.rs"
+
+[[test]]
+name = "multi_mentor_tests"
+path = "multi_mentor/mod.rs"
+
+[[test]]
+name = "fee_precision_tests"
+path = "fee_precision_tests.rs"
+
+[[test]]
+name = "upgrade_safety_tests"
+path = "upgrade_safety_tests.rs"
+
+[[test]]
+name = "disaster_recovery"
+path = "disaster_recovery.rs"
+
+[[test]]
+name = "security_regression"
+path = "security_regression.rs"
+
+[[test]]
+name = "protocol_params_integration"
+path = "protocol_params_integration.rs"
