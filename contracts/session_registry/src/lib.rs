@@ -6,6 +6,10 @@ use soroban_sdk::{contract, contractimpl, contracttype, symbol_short, Address, E
 const BACKEND: Symbol = symbol_short!("BACKEND");
 const TTL_THRESHOLD: u32 = 500_000;
 const TTL_BUMP: u32 = 1_000_000;
+/// Schedule occupancy is tracked in 30-minute buckets.
+const SLOT_SIZE_SECS: u64 = 1_800;
+/// Minimum free time required between consecutive sessions on the same mentor.
+const SCHEDULING_BUFFER_SECS: u64 = 900;
 
 // ── Scheduling constants ──────────────────────────────────────────────────────
 const SLOT_SIZE_SECS: u64 = 1800; // 30-minute slots
@@ -199,6 +203,40 @@ impl SessionRegistry {
         );
     }
 
+    /// Cancel a session and release its mentor schedule buckets for re-booking.
+    pub fn cancel_session(env: Env, session_id: Symbol) {
+        Self::update_status(env, session_id, SessionStatus::Cancelled);
+    }
+
+    /// Returns availability for each 30-minute slot in `[from, to)`.
+    /// Each entry is `(slot_start, is_available)`.
+    pub fn get_mentor_availability(
+        env: Env,
+        mentor: Address,
+        from: u64,
+        to: u64,
+    ) -> Vec<(u64, bool)> {
+        let mut result = Vec::new(&env);
+        if to <= from {
+            return result;
+        }
+        let mut bucket = from / SLOT_SIZE_SECS;
+        let end_bucket = (to + SLOT_SIZE_SECS - 1) / SLOT_SIZE_SECS;
+        while bucket < end_bucket {
+            let slot_start = bucket * SLOT_SIZE_SECS;
+            if slot_start >= to {
+                break;
+            }
+            if slot_start >= from {
+                let key = DataKey::MentorScheduleSlot(mentor.clone(), bucket);
+                let is_available = !env.storage().persistent().has(&key);
+                result.push_back((slot_start, is_available));
+            }
+            bucket = bucket.saturating_add(1);
+        }
+        result
+    }
+
     pub fn set_session_oracle(env: Env, oracle: Address) {
         let backend = Self::require_backend(&env);
         backend.require_auth();
@@ -231,6 +269,16 @@ impl SessionRegistry {
             .expect("Session not found");
 
         let old_status = record.status.clone();
+        if matches!(status, SessionStatus::Cancelled)
+            && !matches!(old_status, SessionStatus::Cancelled)
+        {
+            Self::release_schedule_slots(
+                &env,
+                &record.mentor,
+                record.scheduled_at,
+                record.duration_mins,
+            );
+        }
         record.status = status.clone();
         env.storage().persistent().set(&session_key, &record);
         env.events().publish(
@@ -548,11 +596,15 @@ mod tests {
                 2 => Symbol::new(&env, "s2"),
                 _ => Symbol::new(&env, "s3"),
             };
+            // Non-overlapping starts past the prior occupied buckets.
+            // 60-min + 15-min buffer ending 2_004_500 occupies through bucket
+            // ending at 2_005_200, so space sessions by 5_400s.
+            let start = 2_000_000u64 + ((i as u64 - 1) * 5_400);
             client.register_session(
                 &sid,
                 &mentor,
                 &learner,
-                &2_000_000u64,
+                &start,
                 &60u32,
                 &100i128,
                 &token,
