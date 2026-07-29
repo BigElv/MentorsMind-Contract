@@ -67,6 +67,8 @@ fn run_all_suites() -> Vec<BenchResult> {
     all.extend(suites::staking::run());
     all.extend(suites::governance::run());
     all.extend(suites::timelock::run());
+    all.extend(suites::upgrade_registry::run());
+    all.extend(suites::dispute_evidence::run());
     all
 }
 

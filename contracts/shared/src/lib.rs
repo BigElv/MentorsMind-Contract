@@ -1,4 +1,5 @@
 #![no_std]
+#![allow(deprecated)] // Temporarily allow deprecated Events::publish until we migrate to #[contractevent]
 
 use soroban_sdk::contracterror;
 
@@ -6,32 +7,37 @@ use soroban_sdk::contracterror;
 ///
 /// Centralizing these definitions keeps authorization and state-transition
 /// behavior aligned across contracts that make the same safety assumptions.
+pub mod disaster_recovery;
 pub mod escrow;
 pub mod events;
-pub mod params;
+pub mod gas_estimation;
+pub mod pause_guard;
 pub mod reentrancy_guard;
 pub mod sig_validation;
 pub mod state_machine;
 pub mod storage;
+pub mod staking;
 pub mod ttl_utils;
+pub mod interface_id;
+pub mod validation;
 
-pub use escrow::{EscrowRecord, EscrowStatus};
-pub use params::{
-    get_all_params, get_param, governance_admin_role, init_protocol_params, set_param,
-    key_cooldown_days, key_interest_rate_bps, key_min_bond, key_min_credit_score,
-    key_platform_fee_bps, key_sub_expiry_grace, key_tier_bronze, key_tier_gold, key_tier_silver,
-    DEFAULT_COOLDOWN_DAYS, DEFAULT_INTEREST_RATE_BPS, DEFAULT_MIN_BOND, DEFAULT_MIN_CREDIT_SCORE,
-    DEFAULT_PLATFORM_FEE_BPS, DEFAULT_SUB_EXPIRY_GRACE, DEFAULT_TIER_BRONZE, DEFAULT_TIER_GOLD,
-    DEFAULT_TIER_SILVER,
+pub use disaster_recovery::{
+    compute_checksum, push_snapshot_index, RollbackApproval, RollbackProposal, SnapshotMeta,
+    StateVerificationReport, EMERGENCY_SIGNERS, EMERGENCY_THRESHOLD, MAX_SNAPSHOTS,
 };
+pub use escrow::{EscrowRecord, EscrowStatus};
+pub use gas_estimation::GasEstimate;
+pub use pause_guard::{ContractPaused, is_paused, require_not_paused};
 pub use reentrancy_guard::ReentrancyGuard;
 pub use sig_validation::{
     current_nonce, is_deadline_valid, validate_and_consume_nonce, validate_deadline,
     MetaTxAction, MetaTxPayload, SigError, EXPIRY_TOLERANCE_SECS, MAX_DEADLINE_SECS,
 };
 pub use state_machine::StateMachine;
+pub use staking::{StakeRecord, StakedEventData};
 pub use storage::{EternalStorage, StorageType, InstanceKey, PersistentKey, TempKey};
 pub use ttl_utils::{next_bump_interval, should_bump_ttl};
+pub use validation::{Validator, ValidationError, require_auth_and_validate};
 
 /// Common error codes shared across all MentorsMind contracts.
 ///
@@ -61,4 +67,6 @@ pub enum SharedError {
     Overflow = 9,
     /// An arithmetic operation would underflow below zero.
     Underflow = 10,
+    /// Input validation failed (see `ValidationError` for field details).
+    ValidationError = 11,
 }

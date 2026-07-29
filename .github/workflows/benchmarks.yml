@@ -8,6 +8,8 @@ on:
       - 'contracts/staking/**'
       - 'contracts/governance/**'
       - 'contracts/timelock/**'
+      - 'contracts/upgrade_registry/**'
+      - 'contracts/dispute_evidence/**'
       - 'contracts/shared/**'
       - 'benchmarks/**'
       - '.github/workflows/benchmarks.yml'
@@ -18,6 +20,8 @@ on:
       - 'contracts/staking/**'
       - 'contracts/governance/**'
       - 'contracts/timelock/**'
+      - 'contracts/upgrade_registry/**'
+      - 'contracts/dispute_evidence/**'
       - 'contracts/shared/**'
       - 'benchmarks/**'
   # Nightly scheduled run on main to catch drift over time.
@@ -29,10 +33,21 @@ on:
         description: 'Write results as new baseline (overrides baselines.json)'
         required: false
         default: 'false'
+      run_optimization_validation:
+        description: 'Run optimization validation tests'
+        required: false
+        default: 'false'
 
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: '-D warnings'
+
+# Add permissions for GitHub token
+permissions:
+  contents: read
+  issues: write
+  pull-requests: write
+  actions: read
 
 jobs:
   benchmark:
@@ -54,8 +69,11 @@ jobs:
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: '1.85'
-          targets: wasm32-unknown-unknown
+          toolchain: '1.91'
+          targets: wasm32v1-none
+
+      - name: Add wasm32v1-none target
+        run: rustup target add wasm32v1-none
 
       # Layered caching: registry index, downloaded crates, compiled artifacts.
       - name: Cache cargo registry
@@ -82,12 +100,14 @@ jobs:
       - name: Build WASM binaries (release)
         run: |
           cargo build \
-            --target wasm32-unknown-unknown \
+            --target wasm32v1-none \
             --release \
             -p mentorminds-escrow \
             -p mentorminds-staking \
             -p mentorminds-governance \
-            -p mentorminds-timelock
+            -p mentorminds-timelock \
+            -p mentorminds-upgrade-registry \
+            -p mentorminds-dispute-evidence
 
       # Expose run metadata to the benchmark binary via env vars.
       - name: Set benchmark environment
@@ -101,20 +121,27 @@ jobs:
         id: bench
         run: cargo run -p mentorminds-benchmarks 2>&1 | tee benchmarks/results/bench.log
 
-      # Commit history record and (optionally) new baseline back to the repo.
-      # Only runs on pushes/schedules to main — not on PRs (read-only forks).
-      - name: Commit history record
-        if: >
-          github.event_name != 'pull_request' &&
-          (github.ref == 'refs/heads/main' || github.event_name == 'schedule')
-        uses: stefanzweifel/git-auto-commit-action@v5
-        with:
-          commit_message: 'chore(bench): record performance history [${{ github.sha }}]'
-          file_pattern: benchmarks/history/*.json
-          commit_user_name: 'github-actions[bot]'
-          commit_user_email: 'github-actions[bot]@users.noreply.github.com'
+      # Validate optimization targets are met (15% improvement)
+      - name: Validate optimization targets
+        if: github.event.inputs.run_optimization_validation == 'true'
+        id: validation
+        run: |
+          echo "Running optimization validation..."
+          if [ -f "benchmarks/baselines_before_optimization.json" ]; then
+            # Run validation script
+            ./performance_summary.ps1 > optimization_results.txt 2>&1 || true
+            echo "validation_completed=true" >> $GITHUB_OUTPUT
+            if grep -q "TARGET EXCEEDED" optimization_results.txt; then
+              echo "validation_passed=true" >> $GITHUB_OUTPUT
+            else
+              echo "validation_passed=false" >> $GITHUB_OUTPUT
+            fi
+          else
+            echo "No pre-optimization baselines found, skipping validation"
+            echo "validation_completed=false" >> $GITHUB_OUTPUT
+          fi
 
-      # On workflow_dispatch with update_baseline=true, commit the new baseline.
+      # On workflow_dispatch with update_baseline=true, commit the new baseline
       - name: Update baseline (manual trigger only)
         if: >
           github.event_name == 'workflow_dispatch' &&
@@ -144,6 +171,9 @@ jobs:
             benchmarks/results/report.json
             benchmarks/results/report.html
             benchmarks/results/bench.log
+            optimization_results.txt
+            performance_comparison_report.md
+            gas_optimization_analysis.md
           retention-days: 90
 
       # Post (or update) a summary table comment on the PR.
@@ -151,63 +181,82 @@ jobs:
         if: github.event_name == 'pull_request' && always()
         uses: actions/github-script@v7
         with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
           script: |
             const fs = require('fs');
             const reportPath = 'benchmarks/results/report.json';
+            
             if (!fs.existsSync(reportPath)) {
               console.log('No report.json found — skipping comment');
               return;
             }
 
-            const results = JSON.parse(fs.readFileSync(reportPath, 'utf8'));
-            const passed = '${{ steps.bench.outcome }}' === 'success';
-            const icon = passed ? '✅' : '❌';
-            const status = passed ? 'All metrics within baseline' : 'Performance regressions detected — see annotations';
+            try {
+              const results = JSON.parse(fs.readFileSync(reportPath, 'utf8'));
+              const passed = '${{ steps.bench.outcome }}' === 'success';
+              const icon = passed ? '✅' : '❌';
 
-            let table = '| Contract | Entry Point | CPU Instructions | Memory (bytes) | WASM Size |\n';
-            table    += '|----------|-------------|-----------------|---------------|----------|\n';
+              // Build markdown table
+              let table = '| Contract | Entry Point | CPU Instructions | Memory (bytes) | Storage R/W | WASM Size |\n';
+              table    += '|----------|-------------|-----------------|---------------|-------------|----------|\n';
 
-            let prevContract = '';
-            for (const r of results) {
-              const contractLabel = r.contract !== prevContract ? `**${r.contract}**` : '';
-              prevContract = r.contract;
-              const wasm = r.wasm_bytes > 0
-                ? (r.wasm_bytes > 65536 ? `⚠️ ${Math.round(r.wasm_bytes/1024)} KB` : `${Math.round(r.wasm_bytes/1024)} KB`)
-                : 'N/A';
-              table += `| ${contractLabel} | \`${r.entry_point}\` | ${r.cpu_instructions.toLocaleString()} | ${r.mem_bytes.toLocaleString()} | ${wasm} |\n`;
-            }
+              let prevContract = '';
+              for (const r of results) {
+                const sep = r.contract !== prevContract ? `**${r.contract}**` : '';
+                prevContract = r.contract;
+                const wasm = r.wasm_bytes > 0
+                  ? (r.wasm_bytes > 65536 ? `⚠️ ${Math.round(r.wasm_bytes/1024)} KB` : `${Math.round(r.wasm_bytes/1024)} KB`)
+                  : 'N/A';
+                const storage = `${r.storage_reads || 0}R/${r.storage_writes || 0}W`;
+                table += `| ${sep} | \`${r.entry_point}\` | ${r.cpu_instructions.toLocaleString()} | ${r.mem_bytes.toLocaleString()} | ${storage} | ${wasm} |\n`;
+              }
 
-            const body = `## ${icon} Soroban Benchmark Results
+              // Add optimization status if validation was run
+              let optimizationStatus = '';
+              const validationCompleted = '${{ steps.validation.outputs.validation_completed }}' === 'true';
+              const validationPassed = '${{ steps.validation.outputs.validation_passed }}' === 'true';
+              
+              if (validationCompleted) {
+                const validationIcon = validationPassed ? '🚀' : '⚠️';
+                const validationText = validationPassed ? 'Optimization targets exceeded (>15%)' : 'Optimization targets not met';
+                optimizationStatus = `\n\n### ${validationIcon} Gas Optimization Status\n${validationText}`;
+              }
 
-**Status:** ${status}
+              const body = `## ${icon} Soroban Benchmark Results
 
-${table}
+              ${table}
 
-> Baselines gated at **±10%**. WASM alert at **> 64 KB**.
-> [Full HTML report with trend charts](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})`;
+              > Baselines gated at **±10%**. WASM alert at **> 64 KB**.
+              > [Full HTML report](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})${optimizationStatus}
 
-            const { data: comments } = await github.rest.issues.listComments({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              issue_number: context.issue.number,
-            });
+              **📊 Coverage:** ${results.length} functions across ${[...new Set(results.map(r => r.contract))].length} contracts`;
 
-            const existing = comments.find(c =>
-              c.user.type === 'Bot' && c.body.includes('Soroban Benchmark Results')
-            );
-
-            if (existing) {
-              await github.rest.issues.updateComment({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                comment_id: existing.id,
-                body,
-              });
-            } else {
-              await github.rest.issues.createComment({
+              const { data: comments } = await github.rest.issues.listComments({
                 owner: context.repo.owner,
                 repo: context.repo.repo,
                 issue_number: context.issue.number,
-                body,
               });
+
+              const existing = comments.find(c =>
+                c.user.type === 'Bot' && c.body.includes('Soroban Benchmark Results')
+              );
+
+              if (existing) {
+                await github.rest.issues.updateComment({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  comment_id: existing.id,
+                  body,
+                });
+              } else {
+                await github.rest.issues.createComment({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: context.issue.number,
+                  body,
+                });
+              }
+            } catch (error) {
+              console.error('Failed to create PR comment:', error.message);
+              // Don't fail the workflow if comment creation fails
             }
