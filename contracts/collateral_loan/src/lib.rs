@@ -12,6 +12,7 @@ const PRICE_SCALE: i128 = 10_000;
 const DEFAULT_INTEREST_RATE_BPS: u32 = 1000; // 10% APR
 const SECONDS_PER_YEAR: i128 = 365 * 24 * 60 * 60;
 const MAX_PRICE_STALENESS_SECS: u64 = 3600; // 1 hour
+const AT_RISK_THRESHOLD_BPS: i128 = 14_000; // 140% (Issue #746)
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -35,6 +36,7 @@ pub enum DataKey {
     AccruedInterestVault,
     TotalBadDebt,
     MaxPriceStaleness,
+    HealthWatchList,
 }
 
 #[contractclient(name = "OracleClient")]
@@ -427,6 +429,37 @@ impl CollateralLoanContract {
         env.storage()
             .instance()
             .set(&DataKey::MaxPriceStaleness, &staleness_secs);
+    }
+
+    pub fn get_watchlist_count(env: Env) -> u32 {
+        let watchlist: soroban_sdk::Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::HealthWatchList)
+            .unwrap_or(soroban_sdk::Vec::new(&env));
+        watchlist.len()
+    }
+
+    pub fn check_at_risk_positions(env: Env, offset: u32, limit: u32) -> soroban_sdk::Vec<(Address, u32)> {
+        Self::require_initialized(&env);
+        let watchlist: soroban_sdk::Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::HealthWatchList)
+            .unwrap_or(soroban_sdk::Vec::new(&env));
+
+        let mut at_risk = soroban_sdk::Vec::new(&env);
+        let end = (offset.saturating_add(limit)).min(watchlist.len());
+        for i in offset..end {
+            if let Some(borrower) = watchlist.get(i) {
+                if let Ok(health) = Self::get_health_factor(env.clone(), borrower.clone()) {
+                    if (health as i128) < AT_RISK_THRESHOLD_BPS {
+                        at_risk.push_back((borrower, health));
+                    }
+                }
+            }
+        }
+        at_risk
     }
 
     pub fn is_oracle_fresh(env: Env) -> bool {
